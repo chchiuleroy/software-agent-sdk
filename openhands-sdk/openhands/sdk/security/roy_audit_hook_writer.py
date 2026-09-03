@@ -49,7 +49,7 @@ def main(argv: list[str]) -> int:
 
     event_type = str(event.get("event_type") or "unknown")
     record = {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "event_type": event_type,
         "session_id": event.get("session_id"),
         "working_dir": event.get("working_dir"),

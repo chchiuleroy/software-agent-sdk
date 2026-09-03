@@ -24,11 +24,14 @@ OpenAI 相容端點走的 ``ConversationSettings.create_request()``)有沒有自
    「已經有了」直接放行,真正的稽核永遠不會被加入。改成先移除任何同名項目
    再放回我們自己產生的那一份,同名假 hook 會被覆蓋而非被信任。
 3. **audit_dir 可能逃逸出雙引號造成 shell injection**:``DEFAULT_AUDIT_DIR``
-   若含雙引號字元,原本直接內插進雙引號包住的指令字串會提前結束引號、讓
-   後續內容被當成 shell 指令的一部分執行。合法的 Windows 路徑本來就不能
-   含雙引號,POSIX 路徑理論上可以但極不尋常——直接拒絕含雙引號的值,退回
-   安全預設路徑,不嘗試做通用的 shell escaping(cmd.exe 的引號規則太不
-   可靠,拒絕比硬轉義更安全)。
+   內插進雙引號包住的指令字串,``shell=True`` 執行。第一版修法只拒絕字面
+   雙引號,但小o 第二輪 review 抓到這不夠——POSIX shell 在雙引號**內部**
+   依然會展開 ``$(...)``、反引號、``$VAR``,一個含 ``$(touch pwned)`` 的值
+   完全不需要雙引號就能執行任意指令,原本的檢查測不到這個繞過。改成
+   **allowlist 而非 blocklist**:只接受字母/數字/空白與路徑常見符號
+   （``.``、``_``、``-``、``/``、反斜線、``:``）組成的值,不在這個集合內一律拒絕退回安全預設路徑,
+   不逐一列舉「這個 shell 的哪些字元危險」(cmd.exe 跟 POSIX shell 的危險
+   字元集不同且容易漏列,allowlist 對兩邊都成立)。
 
 同一輪 review 還抓到兩項**已知限制,本次刻意不修**(範圍超出「補一個治理
 hook」,屬於既有架構的既有邊界,見 project_openhands_governance_platform.md
@@ -62,6 +65,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 from openhands.sdk.hooks import HookConfig, HookDefinition, HookMatcher, HookType
@@ -71,16 +75,34 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SAFE_AUDIT_DIR = os.path.join(os.path.expanduser("~"), ".openhands", "audit")
 
-_configured_audit_dir = os.environ.get("ROY_GOVERNANCE_AUDIT_DIR")
-if _configured_audit_dir and '"' in _configured_audit_dir:
-    logger.warning(
-        "ROY_GOVERNANCE_AUDIT_DIR contains a double-quote character, which "
-        "could break out of the quoted hook command string; falling back to "
-        "the default audit directory instead of using this value."
-    )
-    _configured_audit_dir = None
+# Allowlist, not blocklist: a real filesystem path never needs `$ ` ` ; | & ( )
+# < > " ' \n etc., and those are exactly the characters a POSIX or cmd.exe
+# shell treats specially inside a double-quoted string (POSIX still expands
+# `$(...)`/backticks/`$VAR` inside double quotes; a bare `"` reject alone
+# — the first pass at this fix — missed that). Reject anything outside this
+# set instead of trying to enumerate every dangerous character for every
+# shell this could run under.
+_SAFE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9 ._\-/\\:]+$")
 
-DEFAULT_AUDIT_DIR = _configured_audit_dir or _DEFAULT_SAFE_AUDIT_DIR
+
+def _validated_audit_dir(candidate: str | None) -> str | None:
+    if not candidate:
+        return None
+    if not _SAFE_PATH_PATTERN.fullmatch(candidate):
+        logger.warning(
+            "ROY_GOVERNANCE_AUDIT_DIR contains characters outside the safe "
+            "path allowlist, which could be abused for shell injection in "
+            "the hook command string (shell=True); falling back to the "
+            "default audit directory instead of using this value."
+        )
+        return None
+    return candidate
+
+
+DEFAULT_AUDIT_DIR = (
+    _validated_audit_dir(os.environ.get("ROY_GOVERNANCE_AUDIT_DIR"))
+    or _DEFAULT_SAFE_AUDIT_DIR
+)
 
 AUDIT_HOOK_NAME = "roy-governance-session-start-audit"
 

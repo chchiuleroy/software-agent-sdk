@@ -361,9 +361,7 @@ def test_start_conversation_request_hook_config_not_duplicated_on_double_constru
     )
 
     session_start_hooks = [
-        hook
-        for matcher in request.hook_config.session_start
-        for hook in matcher.hooks
+        hook for matcher in request.hook_config.session_start for hook in matcher.hooks
     ]
     assert len(session_start_hooks) == 1
     assert session_start_hooks[0].name == AUDIT_HOOK_NAME
