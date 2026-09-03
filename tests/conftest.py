@@ -180,6 +180,19 @@ def suppress_logging(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_roy_governance_audit_dir(monkeypatch, tmp_path):
+    """Keep governance audit writes (set_confirmation_policy/
+    set_security_analyzer, respond_to_confirmation, and anything else that
+    calls roy_admin_audit.record_*) out of the developer's real
+    ~/.openhands/audit directory. Tests that specifically assert on audit
+    file contents should still set ROY_GOVERNANCE_AUDIT_DIR to their own
+    tmp_path explicitly (this fixture only prevents accidental pollution
+    for everything else).
+    """
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(tmp_path / "roy-audit"))
+
+
+@pytest.fixture(autouse=True)
 def restore_observability_latch():
     """Keep one test's tracing setup from changing how every later test behaves.
 

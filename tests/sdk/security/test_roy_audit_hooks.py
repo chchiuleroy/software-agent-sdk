@@ -6,7 +6,6 @@ points at (``roy_audit_hook_writer.main``), which is what actually runs as a
 subprocess when OpenHands fires the hook.
 """
 
-import importlib
 import json
 import os
 import subprocess
@@ -111,38 +110,29 @@ def test_same_named_fake_hook_is_replaced_not_trusted() -> None:
 
 
 def test_audit_dir_with_double_quote_falls_back_to_safe_default(monkeypatch) -> None:
-    # Regression test for a real finding from Codex review (2026-09-03): an
-    # audit dir value containing `"` could break out of the quoted command
-    # string and inject arbitrary shell content, since the command is
-    # executed with shell=True.
+    # An audit dir value containing `"` could break out of the quoted
+    # command string and inject arbitrary shell content, since the command
+    # is executed with shell=True.
     monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", '"; echo pwned; "')
 
-    reloaded = importlib.reload(roy_audit_hooks_module)
-    try:
-        assert reloaded.DEFAULT_AUDIT_DIR == reloaded._DEFAULT_SAFE_AUDIT_DIR
-    finally:
-        monkeypatch.delenv("ROY_GOVERNANCE_AUDIT_DIR", raising=False)
-        importlib.reload(roy_audit_hooks_module)
+    assert (
+        roy_audit_hooks_module.default_audit_dir()
+        == roy_audit_hooks_module._DEFAULT_SAFE_AUDIT_DIR
+    )
 
 
 def test_audit_dir_with_command_substitution_falls_back_to_safe_default(
     monkeypatch,
 ) -> None:
-    # Regression test for the follow-up finding from Codex review
-    # (2026-09-03, second pass): the first fix only rejected a literal `"`,
-    # but a POSIX shell expands `$(...)` / backticks / `$VAR` *inside*
-    # double quotes too — a value like `$(touch pwned)` needs no quote
-    # character at all to execute arbitrary commands under shell=True. The
-    # allowlist-based validation must reject this even though it contains
-    # no `"`.
+    # A POSIX shell expands `$(...)` / backticks / `$VAR` *inside* double
+    # quotes too — a value like `$(touch pwned)` needs no quote character
+    # at all to execute arbitrary commands under shell=True.
     monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", "$(touch /tmp/pwned)")
 
-    reloaded = importlib.reload(roy_audit_hooks_module)
-    try:
-        assert reloaded.DEFAULT_AUDIT_DIR == reloaded._DEFAULT_SAFE_AUDIT_DIR
-    finally:
-        monkeypatch.delenv("ROY_GOVERNANCE_AUDIT_DIR", raising=False)
-        importlib.reload(roy_audit_hooks_module)
+    assert (
+        roy_audit_hooks_module.default_audit_dir()
+        == roy_audit_hooks_module._DEFAULT_SAFE_AUDIT_DIR
+    )
 
 
 def test_audit_dir_with_plausible_path_is_accepted(monkeypatch, tmp_path) -> None:
@@ -152,12 +142,7 @@ def test_audit_dir_with_plausible_path_is_accepted(monkeypatch, tmp_path) -> Non
     safe_value = str(tmp_path / "custom audit-dir_2")
     monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", safe_value)
 
-    reloaded = importlib.reload(roy_audit_hooks_module)
-    try:
-        assert reloaded.DEFAULT_AUDIT_DIR == safe_value
-    finally:
-        monkeypatch.delenv("ROY_GOVERNANCE_AUDIT_DIR", raising=False)
-        importlib.reload(roy_audit_hooks_module)
+    assert roy_audit_hooks_module.default_audit_dir() == safe_value
 
 
 # --- roy_audit_hook_writer.main ---------------------------------------------
@@ -230,7 +215,7 @@ def test_real_subprocess_invocation_via_command_string(tmp_path) -> None:
     # invocation, so a future change to _audit_command()'s shape is caught
     # here instead of silently testing a stale invocation style.
     command = roy_audit_hooks_module._audit_command().replace(
-        roy_audit_hooks_module.DEFAULT_AUDIT_DIR, str(tmp_path)
+        roy_audit_hooks_module.default_audit_dir(), str(tmp_path)
     )
     event_json = json.dumps({"event_type": "SessionStart", "session_id": "s1"})
 
@@ -269,7 +254,7 @@ def test_real_subprocess_rejects_hostile_workspace_shadowing_openhands(
 
     audit_dir = tmp_path / "audit"
     command = roy_audit_hooks_module._audit_command().replace(
-        roy_audit_hooks_module.DEFAULT_AUDIT_DIR, str(audit_dir)
+        roy_audit_hooks_module.default_audit_dir(), str(audit_dir)
     )
     event_json = json.dumps({"event_type": "SessionStart", "session_id": "s1"})
 

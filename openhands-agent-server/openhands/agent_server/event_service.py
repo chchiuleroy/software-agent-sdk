@@ -75,6 +75,7 @@ from openhands.sdk.llm.streaming import LLMStreamChunk
 from openhands.sdk.mcp.utils import MCPToolProvider
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
+from openhands.sdk.security.roy_admin_audit import record_user_approval_event
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.utils.files import atomic_write_text
@@ -1594,6 +1595,15 @@ class EventService:
             )
 
     async def respond_to_confirmation(self, request: ConfirmationResponseRequest):
+        pending_tool_names = []
+        if self._conversation is not None:
+            pending_tool_names = [
+                action.tool_name
+                for action in ConversationState.get_unmatched_actions(
+                    self._conversation.state.active_branch()
+                )
+            ]
+
         if request.accept:
             try:
                 await self.run()
@@ -1607,6 +1617,13 @@ class EventService:
                     raise
         else:
             await self.reject_pending_actions(request.reason)
+
+        record_user_approval_event(
+            conversation_id=str(self.stored.id),
+            accepted=request.accept,
+            reason=None if request.accept else request.reason,
+            tool_names=pending_tool_names,
+        )
 
     async def reject_pending_actions(self, reason: str):
         """Reject all pending actions and publish updated state."""

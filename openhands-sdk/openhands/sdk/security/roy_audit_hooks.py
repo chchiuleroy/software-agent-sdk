@@ -19,7 +19,7 @@ OpenAI 相容端點走的 ``ConversationSettings.create_request()``)有沒有自
 2. 冪等判斷會先移除任何同名(``AUDIT_HOOK_NAME``)既有項目,再放回自己
    產生的那一份——同名假 hook(呼叫端或插件塞入)不會被誤判成「已存在」
    而略過真正的稽核。
-3. ``DEFAULT_AUDIT_DIR`` 用 allowlist(僅接受字母/數字/空白/路徑常見符號)
+3. ``default_audit_dir()`` 用 allowlist(僅接受字母/數字/空白/路徑常見符號)
    而非 blocklist 驗證,避免內插進 ``shell=True`` 執行的指令字串時被
    ``$(...)``、反引號等 POSIX shell 展開語法利用。
 4. ``LocalConversation.__init__`` 在 ``self._pending_hook_config = ...``
@@ -81,10 +81,19 @@ def _validated_audit_dir(candidate: str | None) -> str | None:
     return candidate
 
 
-DEFAULT_AUDIT_DIR = (
-    _validated_audit_dir(os.environ.get("ROY_GOVERNANCE_AUDIT_DIR"))
-    or _DEFAULT_SAFE_AUDIT_DIR
-)
+def default_audit_dir() -> str:
+    """Re-reads and re-validates ``ROY_GOVERNANCE_AUDIT_DIR`` on every call.
+
+    Deliberately not a module-level constant: a constant would be computed
+    once at first import and never notice a later env var change (or a
+    test's ``monkeypatch.setenv``) — see ``roy_admin_audit.py`` for the same
+    reasoning applied to the admin_audit/user_approval writers.
+    """
+    return (
+        _validated_audit_dir(os.environ.get("ROY_GOVERNANCE_AUDIT_DIR"))
+        or _DEFAULT_SAFE_AUDIT_DIR
+    )
+
 
 AUDIT_HOOK_NAME = "roy-governance-session-start-audit"
 
@@ -94,7 +103,7 @@ _WRITER_SCRIPT_PATH = os.path.join(
 
 
 def _audit_command() -> str:
-    return f'"{sys.executable}" "{_WRITER_SCRIPT_PATH}" "{DEFAULT_AUDIT_DIR}"'
+    return f'"{sys.executable}" "{_WRITER_SCRIPT_PATH}" "{default_audit_dir()}"'
 
 
 def _build_audit_hook_config() -> HookConfig:

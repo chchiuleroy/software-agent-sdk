@@ -92,6 +92,7 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
 )
+from openhands.sdk.security.roy_admin_audit import record_admin_audit_event
 from openhands.sdk.security.roy_audit_hooks import build_governance_hook_config
 from openhands.sdk.security.roy_governance_lock import (
     apply_confirmation_policy_lock,
@@ -2552,6 +2553,11 @@ class LocalConversation(BaseConversation):
         with self._state:
             self._state.confirmation_policy = policy
         logger.info(f"Confirmation policy set to: {policy}")
+        record_admin_audit_event(
+            conversation_id=str(self._state.id),
+            field="confirmation_policy",
+            value=repr(policy),
+        )
 
     def set_token_callbacks(
         self, token_callbacks: list[ConversationTokenCallbackType] | None
@@ -2730,6 +2736,11 @@ class LocalConversation(BaseConversation):
         )
         with self._state:
             self._state.security_analyzer = analyzer
+        record_admin_audit_event(
+            conversation_id=str(self._state.id),
+            field="security_analyzer",
+            value=repr(analyzer),
+        )
 
     def close(self) -> None:
         """Close the conversation and clean up all tool executors."""
