@@ -212,3 +212,75 @@ def test_lock_applies_through_start_conversation_request_subclass(monkeypatch) -
     )
 
     assert isinstance(request.confirmation_policy, NeverConfirm)
+
+
+# --- LocalConversation setter enforcement ------------------------------------
+#
+# Regression tests for the review finding that the initial lock only
+# protected conversation *creation* (the request-model layer above): the
+# agent-server's runtime confirmation_policy/security_analyzer update REST
+# endpoints and the conversation resume path both call
+# LocalConversation.set_confirmation_policy()/set_security_analyzer()
+# directly, bypassing ConversationConfig's validator entirely. The fix
+# pushes the same apply_*_lock() functions into those setters themselves, so
+# every caller — REST endpoint, resume, or any future one — is protected
+# without needing to be individually patched.
+
+
+def _local_conversation(tmp_path):
+    from pydantic import SecretStr
+
+    from openhands.sdk.agent.agent import Agent
+    from openhands.sdk.conversation import Conversation
+    from openhands.sdk.llm import LLM
+
+    llm = LLM(model="gpt-4o", api_key=SecretStr("x"), usage_id="test")
+    agent = Agent(llm=llm, tools=[])
+    return Conversation(agent=agent, workspace=str(tmp_path))
+
+
+def test_set_confirmation_policy_enforces_lock(monkeypatch, tmp_path) -> None:
+    # Simulates the runtime REST endpoint / resume bypass the review found:
+    # this calls the setter directly, the same way
+    # agent_server/conversation_router.py's confirmation_policy endpoint and
+    # event_service.py's resume path do — not via ConversationConfig at all.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "true")
+    conversation = _local_conversation(tmp_path)
+
+    conversation.set_confirmation_policy(NeverConfirm())
+
+    assert isinstance(conversation.state.confirmation_policy, ConfirmRisky)
+
+
+def test_set_confirmation_policy_no_lock_is_unaffected(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", raising=False)
+    conversation = _local_conversation(tmp_path)
+
+    conversation.set_confirmation_policy(NeverConfirm())
+
+    assert isinstance(conversation.state.confirmation_policy, NeverConfirm)
+
+
+def test_set_security_analyzer_enforces_lock(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "none")
+    conversation = _local_conversation(tmp_path)
+
+    conversation.set_security_analyzer(RoyPathPayloadSecurityAnalyzer())
+
+    assert conversation.state.security_analyzer is None
+
+
+def test_set_security_analyzer_lock_discards_wide_workspace_root(
+    monkeypatch, tmp_path
+) -> None:
+    # The same workspace_root bypass the review found for the creation-time
+    # lock, exercised at the setter instead.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    conversation = _local_conversation(tmp_path)
+
+    conversation.set_security_analyzer(
+        RoyPathPayloadSecurityAnalyzer(workspace_root="/")
+    )
+
+    assert conversation.state.security_analyzer.workspace_root != "/"
+    assert conversation.state.security_analyzer.workspace_root == str(tmp_path)

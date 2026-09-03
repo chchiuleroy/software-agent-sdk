@@ -92,6 +92,10 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
 )
+from openhands.sdk.security.roy_governance_lock import (
+    apply_confirmation_policy_lock,
+    apply_security_analyzer_lock,
+)
 from openhands.sdk.skills import (
     Skill,
     load_available_skills,
@@ -2526,7 +2530,17 @@ class LocalConversation(BaseConversation):
             self._arun_task = None
 
     def set_confirmation_policy(self, policy: ConfirmationPolicyBase) -> None:
-        """Set the confirmation policy and store it in conversation state."""
+        """Set the confirmation policy and store it in conversation state.
+
+        Roy 的治理層(2026-09-03):套用機層鎖定(見
+        roy_governance_lock.py),不管呼叫端是誰——agent-server 的 runtime
+        更新 REST endpoint、對話 resume 路徑(把 persisted 值寫回這裡)、
+        或任何未來新入口——都會被同一份鎖定邏輯保護,不必逐一在每個呼叫端
+        補檢查。這是小o review 抓到的缺口:先前的鎖定只掛在
+        ConversationConfig 的 validator(對話建立當下),完全不涵蓋建立後
+        透過這個方法做的變更。
+        """
+        policy = apply_confirmation_policy_lock(policy)
         with self._state:
             self._state.confirmation_policy = policy
         logger.info(f"Confirmation policy set to: {policy}")
@@ -2698,7 +2712,15 @@ class LocalConversation(BaseConversation):
         logger.info(f"Added {len(secrets)} secrets to conversation")
 
     def set_security_analyzer(self, analyzer: SecurityAnalyzerBase | None) -> None:
-        """Set the security analyzer for the conversation."""
+        """Set the security analyzer for the conversation.
+
+        Roy 的治理層(2026-09-03):同 ``set_confirmation_policy()``,套用
+        機層鎖定,涵蓋 runtime 更新 REST endpoint、resume、與任何未來新
+        入口。
+        """
+        analyzer = apply_security_analyzer_lock(
+            analyzer, workspace_root=self.workspace.working_dir
+        )
         with self._state:
             self._state.security_analyzer = analyzer
 

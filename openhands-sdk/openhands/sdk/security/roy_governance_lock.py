@@ -20,11 +20,35 @@ feature flag 這樣合理,但對宣稱是 machine/org governance boundary 的設
 部署時打錯字會在完全沒有任何錯誤訊號的情況下悄悄解除保護。改成:未設定
 才是「不鎖」;已設定但無法辨識直接丟 ``ValueError``,讓第一個嘗試建立
 對話的請求就失敗,而不是靜默放行。
+
+**兩層防線,同一套正規化函式**:第一版只把鎖定套在 ``ConversationConfig``
+的 validator(對話「建立當下」),同一輪 review 抓到這只保護到 request
+model 層——``agent_server`` 的 runtime 更新端點
+(``conversation_router.py`` 的 confirmation_policy／security_analyzer
+setter)跟對話 resume 路徑(``event_service.py``)都直接呼叫
+``LocalConversation.set_confirmation_policy()``/``set_security_analyzer()``,
+完全繞過 validator。真正的修法是把鎖定邏輯下沉到這兩個 setter 本身
+(``local_conversation.py``),讓任何呼叫端(不論從 REST API、resume、
+還是未來任何新入口)都自動受保護,不必逐一補入口。``apply_confirmation
+_policy_lock()``/``apply_security_analyzer_lock()`` 這兩個函式因此被設計
+成冪等的純函式(輸入候選值,回傳鎖定後應該生效的值),``ConversationConfig``
+的 validator 與 ``LocalConversation`` 的 setter 共用同一份實作,而不是
+在兩處分別複製一樣的判斷邏輯。
 """
 
 from __future__ import annotations
 
 import os
+
+from openhands.sdk.security.analyzer import SecurityAnalyzerBase
+from openhands.sdk.security.confirmation_policy import (
+    AlwaysConfirm,
+    ConfirmationPolicyBase,
+    ConfirmRisky,
+    NeverConfirm,
+)
+from openhands.sdk.security.risk import SecurityRisk
+from openhands.sdk.security.roy_governance import RoyPathPayloadSecurityAnalyzer
 
 
 _TRUE_VALUES = frozenset({"true", "1", "yes"})
@@ -69,3 +93,57 @@ def locked_security_analyzer() -> str | None:
         f"ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER={raw!r} is not a recognized "
         f"value (expected one of {sorted(_SECURITY_ANALYZER_VALUES)})"
     )
+
+
+def apply_confirmation_policy_lock(
+    policy: ConfirmationPolicyBase,
+) -> ConfirmationPolicyBase:
+    """回傳鎖定後「真正應該生效」的 confirmation policy。
+
+    冪等的純函式:沒有鎖定就原樣回傳 ``policy``;有鎖定就依方向修正——
+    只在「目前不符合鎖定方向」時才動手改寫,不無條件重建物件:
+    - 鎖定要求 confirmation on 時,``AlwaysConfirm`` 視為明確更嚴格、
+      語意無歧義,予以保留;其他任何值(含 ``ConfirmRisky
+      (confirm_unknown=False)`` 這種類別對但行為偏弱的情況,或
+      ``NeverConfirm``)一律正規化成治理標準值 ``ConfirmRisky(HIGH)``——
+      不能只看類別名稱是不是 ``NeverConfirm``,因為類別相符不代表行為
+      上真的會確認。
+    - 鎖定要求 confirmation off 時,無條件正規化成 ``NeverConfirm()``。
+    """
+    lock_mode = locked_confirmation_mode()
+    if lock_mode is True:
+        if isinstance(policy, AlwaysConfirm):
+            return policy
+        return ConfirmRisky(threshold=SecurityRisk.HIGH)
+    if lock_mode is False:
+        if isinstance(policy, NeverConfirm):
+            return policy
+        return NeverConfirm()
+    return policy
+
+
+def apply_security_analyzer_lock(
+    analyzer: SecurityAnalyzerBase | None,
+    *,
+    workspace_root: str,
+) -> SecurityAnalyzerBase | None:
+    """回傳鎖定後「真正應該生效」的 security analyzer。
+
+    冪等的純函式。鎖定為 ``"llm"`` 時一律重建全新的
+    ``RoyPathPayloadSecurityAnalyzer``,``workspace_root`` 只接受呼叫端
+    傳入的 ``workspace_root`` 參數(通常是這個對話真正的 workspace)——
+    不接受候選 analyzer 物件裡可能帶著的、呼叫端自訂的 workspace_root,
+    因為那個欄位直接決定哪些路徑算「在工作區內」,保留呼叫端自訂值會讓
+    鎖定形同虛設。
+    """
+    lock_analyzer = locked_security_analyzer()
+    if lock_analyzer == "none":
+        return None
+    if lock_analyzer == "llm":
+        if (
+            isinstance(analyzer, RoyPathPayloadSecurityAnalyzer)
+            and analyzer.workspace_root == workspace_root
+        ):
+            return analyzer
+        return RoyPathPayloadSecurityAnalyzer(workspace_root=workspace_root)
+    return analyzer
