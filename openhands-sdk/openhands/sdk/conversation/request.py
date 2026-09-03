@@ -36,6 +36,7 @@ from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import SecretSource
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
+    AlwaysConfirm,
     ConfirmationPolicyBase,
     ConfirmRisky,
     NeverConfirm,
@@ -292,34 +293,47 @@ class ConversationConfig(BaseModel):
 
     @model_validator(mode="after")
     def _apply_roy_governance_config_locks(self) -> ConversationConfig:
-        # Roy 的治理層(2026-09-03):machine 層鎖定(見
+        # Roy 的治理層(2026-09-03,小o review 後修正):machine 層鎖定(見
         # roy_governance_lock.py)一旦設定,不管呼叫端(repo/workspace 層,
         # 包含 Agent Canvas GUI 傳入的請求體、OpenAI 相容端點經
-        # ConversationSettings 算出的值)傳了什麼,這裡都要強制修正——跟
-        # confirmation_policy/security_analyzer 既有的「Field 預設值只在
-        # 省略時生效」不同,鎖定是無條件覆寫,對應 Codex「project-local
-        # config 不能覆寫 machine-local」的設計原則。刻意只在「目前不符合
-        # 鎖定方向」時才動手改寫,不無條件重建物件——呼叫端若已經指定了
-        # 同方向但更嚴格的設定(如鎖定要求 confirmation on,呼叫端給的是
-        # AlwaysConfirm 而非預設的 ConfirmRisky),保留呼叫端的選擇。
+        # ConversationSettings 算出的值)傳了什麼,這裡都要強制修正——對應
+        # Codex「project-local config 不能覆寫 machine-local」的設計原則。
         #
-        # 這個 validator 必須排在 _bind_roy_analyzer_workspace 之前:若這裡
-        # 因鎖定重建了一個新的 RoyPathPayloadSecurityAnalyzer,要讓下一個
-        # validator 有機會幫它綁上這個對話真正的 workspace_root。
+        # 第一版(commit 7a3f554)只用 isinstance/「非 NeverConfirm」做判斷,
+        # 小o review 抓到兩個實質繞過:
+        # 1. 保留呼叫端自訂的 workspace_root——但 workspace_root 直接決定
+        #    哪些路徑算「在工作區內」,呼叫端可以設成磁碟根目錄之類過寬的
+        #    祖先目錄,讓鎖定形同虛設。改成鎖定時一律重建全新實例,
+        #    workspace_root 交給下面的 _bind_roy_analyzer_workspace 綁到
+        #    這個對話「真正」的 workspace,不接受呼叫端指定的值。
+        # 2. 「不是 NeverConfirm」不代表「confirmation 真的有效」——呼叫端
+        #    可以傳 ConfirmRisky(confirm_unknown=False) 或自訂
+        #    ConfirmationPolicyBase 子類,類別名稱通過檢查但行為上完全不
+        #    確認。改成鎖定 ON 時無條件套用治理標準值,只有明確更嚴格、
+        #    語意無歧義的 AlwaysConfirm 例外放行。
+        #
+        # 直接把這個對話真正的 workspace_root 綁進重建的實例,不依賴
+        # _bind_roy_analyzer_workspace 之後才執行——小o review 指出兩個
+        # 分開的 validator 靠宣告順序保正確性是脆弱的隱含契約,未來搬動
+        # 方法或改動繼承關係都可能悄悄破壞它。這裡自己綁好之後,
+        # _bind_roy_analyzer_workspace 檢查
+        # `"workspace_root" not in analyzer.model_fields_set` 會直接跳過
+        # (因為這裡顯式傳入了 workspace_root),兩個 validator 因此互不
+        # 依賴執行順序,各自都能獨立保證正確性。
         lock_analyzer = locked_security_analyzer()
-        if lock_analyzer == "none" and self.security_analyzer is not None:
+        if lock_analyzer == "none":
             self.security_analyzer = None
-        elif lock_analyzer == "llm" and not isinstance(
-            self.security_analyzer, RoyPathPayloadSecurityAnalyzer
-        ):
-            self.security_analyzer = RoyPathPayloadSecurityAnalyzer()
+        elif lock_analyzer == "llm":
+            # 一律重建,不信任呼叫端可能帶著過寬 workspace_root 的既有實例。
+            self.security_analyzer = RoyPathPayloadSecurityAnalyzer(
+                workspace_root=self.workspace.working_dir
+            )
 
         lock_mode = locked_confirmation_mode()
-        if lock_mode is True and isinstance(self.confirmation_policy, NeverConfirm):
-            self.confirmation_policy = ConfirmRisky(threshold=SecurityRisk.HIGH)
-        elif lock_mode is False and not isinstance(
-            self.confirmation_policy, NeverConfirm
-        ):
+        if lock_mode is True:
+            if not isinstance(self.confirmation_policy, AlwaysConfirm):
+                self.confirmation_policy = ConfirmRisky(threshold=SecurityRisk.HIGH)
+        elif lock_mode is False:
             self.confirmation_policy = NeverConfirm()
         return self
 

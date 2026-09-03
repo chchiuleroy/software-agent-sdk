@@ -9,6 +9,8 @@ is configured — regardless of what the caller (raw REST API, Agent Canvas
 GUI request body, or ConversationSettings-derived payload) supplies.
 """
 
+import pytest
+
 from openhands.sdk.conversation.request import (
     ConversationConfig,
     StartConversationRequest,
@@ -43,10 +45,13 @@ def test_locked_confirmation_mode_parses_false_variants(monkeypatch) -> None:
         assert roy_governance_lock.locked_confirmation_mode() is False
 
 
-def test_locked_confirmation_mode_unrecognized_value_returns_none(monkeypatch) -> None:
-    # An unparseable value must not be silently treated as either direction.
+def test_locked_confirmation_mode_unrecognized_value_raises(monkeypatch) -> None:
+    # A set-but-unparseable value must fail loudly, not be silently treated
+    # as "unlocked" — this is a governance boundary, and a deployment typo
+    # silently disabling protection is exactly the failure mode to avoid.
     monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "maybe")
-    assert roy_governance_lock.locked_confirmation_mode() is None
+    with pytest.raises(ValueError, match="ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE"):
+        roy_governance_lock.locked_confirmation_mode()
 
 
 def test_locked_security_analyzer_unset_returns_none(monkeypatch) -> None:
@@ -61,9 +66,10 @@ def test_locked_security_analyzer_parses_known_values(monkeypatch) -> None:
     assert roy_governance_lock.locked_security_analyzer() == "none"
 
 
-def test_locked_security_analyzer_unrecognized_value_returns_none(monkeypatch) -> None:
+def test_locked_security_analyzer_unrecognized_value_raises(monkeypatch) -> None:
     monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "some-other-analyzer")
-    assert roy_governance_lock.locked_security_analyzer() is None
+    with pytest.raises(ValueError, match="ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER"):
+        roy_governance_lock.locked_security_analyzer()
 
 
 # --- ConversationConfig enforcement ------------------------------------------
@@ -103,20 +109,26 @@ def test_lock_security_analyzer_llm_overrides_caller_supplied_none(
     assert isinstance(cfg.security_analyzer, RoyPathPayloadSecurityAnalyzer)
 
 
-def test_lock_security_analyzer_llm_preserves_caller_workspace_root_override(
+def test_lock_security_analyzer_llm_discards_caller_workspace_root_override(
     monkeypatch,
 ) -> None:
-    # The lock forces the *kind* of analyzer, not a specific instance — a
-    # caller-supplied RoyPathPayloadSecurityAnalyzer with an explicit
-    # workspace_root is a legitimate technical override (which directory
-    # counts as safe), not a governance bypass, and must survive.
+    # Regression test for a real finding from Codex review (2026-09-03):
+    # the first version preserved a caller-supplied workspace_root when the
+    # analyzer was already the right kind. But workspace_root directly
+    # decides which paths count as "inside the workspace" — a caller could
+    # set it to a disk root or other overly broad ancestor directory,
+    # making the analyzer classify everything as LOW risk and rendering
+    # the lock meaningless. The lock must always rebuild a fresh instance
+    # so workspace_root is only ever derived from the conversation's real
+    # workspace (via _bind_roy_analyzer_workspace below), never taken from
+    # the request body.
     monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
-    explicit = RoyPathPayloadSecurityAnalyzer(workspace_root="/explicit/root")
+    overly_broad = RoyPathPayloadSecurityAnalyzer(workspace_root="/")
 
-    cfg = _config(security_analyzer=explicit)
+    cfg = _config(security_analyzer=overly_broad)
 
-    assert cfg.security_analyzer is explicit
-    assert cfg.security_analyzer.workspace_root == "/explicit/root"
+    assert cfg.security_analyzer is not overly_broad
+    assert cfg.security_analyzer.workspace_root != "/"
 
 
 def test_lock_security_analyzer_llm_still_binds_workspace_root_when_defaulted(
@@ -142,6 +154,24 @@ def test_lock_confirmation_mode_on_upgrades_never_confirm(monkeypatch) -> None:
     cfg = _config(confirmation_policy=NeverConfirm())
 
     assert isinstance(cfg.confirmation_policy, ConfirmRisky)
+
+
+def test_lock_confirmation_mode_on_normalizes_weaker_confirm_risky(monkeypatch) -> None:
+    # Regression test for a real finding from Codex review (2026-09-03):
+    # "not NeverConfirm" is not the same as "confirmation is actually
+    # enforced" — a caller can pass a ConfirmRisky that is technically the
+    # right *class* but configured weaker than the governance baseline
+    # (confirm_unknown=False skips confirmation for UNKNOWN-risk actions).
+    # The lock must normalize any non-AlwaysConfirm policy to the canonical
+    # baseline rather than trusting the class name alone.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "true")
+    weaker = ConfirmRisky(confirm_unknown=False)
+
+    cfg = _config(confirmation_policy=weaker)
+
+    assert cfg.confirmation_policy is not weaker
+    assert isinstance(cfg.confirmation_policy, ConfirmRisky)
+    assert cfg.confirmation_policy.confirm_unknown is True
 
 
 def test_lock_confirmation_mode_on_preserves_stricter_caller_choice(
