@@ -471,7 +471,7 @@ def _default_llm_settings() -> LLM:
 _RequestT = TypeVar("_RequestT")
 
 AGENT_SETTINGS_SCHEMA_VERSION = 5
-CONVERSATION_SETTINGS_SCHEMA_VERSION = 1
+CONVERSATION_SETTINGS_SCHEMA_VERSION = 2
 
 
 class AgentSettingsBase(BaseModel):
@@ -972,6 +972,20 @@ def _migrate_conversation_settings_v0_to_v1(
     return migrated
 
 
+def _migrate_conversation_settings_v1_to_v2(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    # confirmation_mode is force-upgraded exactly once here because a
+    # persisted value is always explicit — a Field default only applies when
+    # the key is absent, so pre-existing payloads would otherwise never pick
+    # up a new default. Once migrated to v2, a user's explicit opt-out is
+    # preserved (this migration never runs again for that payload).
+    migrated = dict(payload)
+    migrated["schema_version"] = 2
+    migrated["confirmation_mode"] = True
+    return migrated
+
+
 _AGENT_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
     0: _migrate_agent_settings_v0_to_v1,
     1: _migrate_agent_settings_v1_to_v2,
@@ -981,6 +995,7 @@ _AGENT_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
 }
 _CONVERSATION_SETTINGS_MIGRATIONS: dict[int, PersistedSettingsMigrator] = {
     0: _migrate_conversation_settings_v0_to_v1,
+    1: _migrate_conversation_settings_v1_to_v2,
 }
 
 
@@ -1069,7 +1084,7 @@ class ConversationSettings(BaseModel):
         },
     )
     confirmation_mode: bool = Field(
-        default=False,
+        default=True,
         description="Require user confirmation before executing risky actions.",
         json_schema_extra={
             SETTINGS_METADATA_KEY: SettingsFieldMetadata(
@@ -1120,11 +1135,12 @@ class ConversationSettings(BaseModel):
             ConfirmRisky,
             NeverConfirm,
         )
+        from openhands.sdk.security.risk import SecurityRisk
 
         if not self.confirmation_mode:
             return NeverConfirm()
         if (self.security_analyzer or "").lower() == "llm":
-            return ConfirmRisky()
+            return ConfirmRisky(threshold=SecurityRisk.HIGH)
         return AlwaysConfirm()
 
     def _build_security_analyzer(self):
@@ -1132,9 +1148,15 @@ class ConversationSettings(BaseModel):
         if not analyzer_kind or analyzer_kind == "none":
             return None
         if analyzer_kind == "llm":
-            from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
+            from openhands.sdk.security.roy_governance import (
+                RoyPathPayloadSecurityAnalyzer,
+            )
 
-            return LLMSecurityAnalyzer()
+            if self.workspace is not None:
+                return RoyPathPayloadSecurityAnalyzer(
+                    workspace_root=self.workspace.working_dir
+                )
+            return RoyPathPayloadSecurityAnalyzer()
         return None
 
     def _start_request_kwargs(self, **kwargs: Any) -> dict[str, Any]:

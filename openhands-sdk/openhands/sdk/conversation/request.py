@@ -37,8 +37,10 @@ from openhands.sdk.secret import SecretSource
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
-    NeverConfirm,
+    ConfirmRisky,
 )
+from openhands.sdk.security.risk import SecurityRisk
+from openhands.sdk.security.roy_governance import RoyPathPayloadSecurityAnalyzer
 from openhands.sdk.subagent.schema import AgentDefinition
 from openhands.sdk.tool.client_tool import ClientToolSpec
 from openhands.sdk.utils.models import kind_of
@@ -128,13 +130,17 @@ class ConversationConfig(BaseModel):
             "parent must already exist and share this conversation's workspace."
         ),
     )
+    # Roy 的治理層(2026-09-01):這裡才是真正決定新對話 runtime 行為的
+    # request-time 預設值(agent_server/models.py 的 _ConversationInfoBase
+    # 只是回應/展示用的 info 表示法,改那邊對實際行為沒有影響——這是
+    # 用 DEBUG=true 直接對 API 重現問題才抓到的真正介入點)。
     confirmation_policy: ConfirmationPolicyBase = Field(
-        default=NeverConfirm(),
+        default_factory=lambda: ConfirmRisky(threshold=SecurityRisk.HIGH),
         description="Controls when the conversation will prompt the user before "
-        "continuing. Defaults to never.",
+        "continuing. Defaults to confirming HIGH-risk actions.",
     )
     security_analyzer: SecurityAnalyzerBase | None = Field(
-        default=None,
+        default_factory=RoyPathPayloadSecurityAnalyzer,
         description="Optional security analyzer to evaluate action risks.",
     )
     initial_message: SendMessageRequest | None = Field(
@@ -277,6 +283,26 @@ class ConversationConfig(BaseModel):
             "the agent's LLM."
         ),
     )
+
+    @model_validator(mode="after")
+    def _bind_roy_analyzer_workspace(self) -> ConversationConfig:
+        # Roy 的治理層(2026-09-01):RoyPathPayloadSecurityAnalyzer 的
+        # workspace_root 若不是呼叫端顯式指定的(用 model_fields_set 判斷,
+        # 而不是拿值去跟 DEFAULT_WORKSPACE_ROOT 比較——後者無法區分「欄位
+        # 真的被省略」跟「呼叫端剛好指定了同一個值」,小o code review 2026-09-01
+        # 抓到這個 sentinel-value 判斷方式不可靠),這裡改綁到這個對話「真正」的
+        # workspace,否則每個 conversation 都會拿同一個寫死路徑去判斷檔案路徑
+        # 是否在工作區內,只要對話的實際工作目錄跟那個寫死路徑不同,所有檔案
+        # 編輯都會被誤判成 HIGH risk。
+        analyzer = self.security_analyzer
+        if (
+            isinstance(analyzer, RoyPathPayloadSecurityAnalyzer)
+            and "workspace_root" not in analyzer.model_fields_set
+        ):
+            self.security_analyzer = analyzer.model_copy(
+                update={"workspace_root": self.workspace.working_dir}
+            )
+        return self
 
 
 class StartConversationRequest(ConversationConfig):

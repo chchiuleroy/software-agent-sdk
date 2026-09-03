@@ -27,7 +27,7 @@ from openhands.sdk.critic.impl.api import APIBasedCritic
 from openhands.sdk.mcp.config import MCPServer, coerce_mcp_config, dump_mcp_config
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.security.confirmation_policy import AlwaysConfirm, ConfirmRisky
-from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
+from openhands.sdk.security.roy_governance import RoyPathPayloadSecurityAnalyzer
 from openhands.sdk.settings import (
     AGENT_SETTINGS_SCHEMA_VERSION,
     CondenserSettings,
@@ -213,7 +213,7 @@ def test_conversation_settings_export_schema_groups_sections() -> None:
         "confirmation_mode",
         "security_analyzer",
     }
-    assert verification_fields["confirmation_mode"].default is False
+    assert verification_fields["confirmation_mode"].default is True
     assert (
         verification_fields["confirmation_mode"].prominence
         is SettingProminence.CRITICAL
@@ -268,7 +268,7 @@ def test_conversation_settings_create_request() -> None:
     assert request.workspace == workspace
     assert request.max_iterations == 77
     assert isinstance(request.confirmation_policy, ConfirmRisky)
-    assert isinstance(request.security_analyzer, LLMSecurityAnalyzer)
+    assert isinstance(request.security_analyzer, RoyPathPayloadSecurityAnalyzer)
 
     overridden_request = settings.create_request(
         StartConversationRequest,
@@ -914,13 +914,41 @@ def test_agent_settings_from_persisted_rejects_malformed_payload() -> None:
 def test_conversation_settings_from_persisted_migrates_v0_payload() -> None:
     settings = ConversationSettings.from_persisted({"max_iterations": 42})
 
-    assert settings.schema_version == 1
+    assert settings.schema_version == 2
     assert settings.max_iterations == 42
+    assert settings.confirmation_mode is True
+
+
+def test_conversation_settings_from_persisted_v1_confirmation_mode_false_upgrades_to_true() -> (
+    None
+):
+    # The v1->v2 migration must force-upgrade an *explicit* False, not merely
+    # rely on the field's new default — a payload that never mentions
+    # confirmation_mode would pass even without a working migration.
+    settings = ConversationSettings.from_persisted(
+        {"schema_version": 1, "confirmation_mode": False}
+    )
+
+    assert settings.schema_version == 2
+    assert settings.confirmation_mode is True
+
+
+def test_conversation_settings_from_persisted_v2_confirmation_mode_false_is_preserved() -> (
+    None
+):
+    # The migration must run at most once: a payload already at the current
+    # schema version that explicitly opted back out must stay opted out.
+    settings = ConversationSettings.from_persisted(
+        {"schema_version": 2, "confirmation_mode": False}
+    )
+
+    assert settings.schema_version == 2
+    assert settings.confirmation_mode is False
 
 
 def test_conversation_settings_from_persisted_rejects_newer_schema_version() -> None:
-    with pytest.raises(ValueError, match="newer than supported version 1"):
-        ConversationSettings.from_persisted({"schema_version": 2})
+    with pytest.raises(ValueError, match="newer than supported version 2"):
+        ConversationSettings.from_persisted({"schema_version": 3})
 
 
 # ---------------------------------------------------------------------------
@@ -1746,7 +1774,7 @@ def test_conversation_settings_create_request_for_llm_variant() -> None:
     assert request.workspace == workspace
     assert request.max_iterations == 77
     assert isinstance(request.confirmation_policy, ConfirmRisky)
-    assert isinstance(request.security_analyzer, LLMSecurityAnalyzer)
+    assert isinstance(request.security_analyzer, RoyPathPayloadSecurityAnalyzer)
 
 
 def test_conversation_settings_create_request_with_acp_agent_variant() -> None:

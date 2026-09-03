@@ -150,7 +150,9 @@ class _ConversationInfoBase(BaseModel):
     execution_status: ConversationExecutionStatus = Field(
         default=ConversationExecutionStatus.IDLE
     )
-    confirmation_policy: ConfirmationPolicyBase = Field(default=NeverConfirm())
+    confirmation_policy: ConfirmationPolicyBase = Field(
+        default_factory=NeverConfirm
+    )
     security_analyzer: SecurityAnalyzerBase | None = Field(
         default=None,
         description="Optional security analyzer to evaluate action risks.",
