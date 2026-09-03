@@ -38,10 +38,15 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
     ConfirmRisky,
+    NeverConfirm,
 )
 from openhands.sdk.security.risk import SecurityRisk
 from openhands.sdk.security.roy_audit_hooks import build_governance_hook_config
 from openhands.sdk.security.roy_governance import RoyPathPayloadSecurityAnalyzer
+from openhands.sdk.security.roy_governance_lock import (
+    locked_confirmation_mode,
+    locked_security_analyzer,
+)
 from openhands.sdk.subagent.schema import AgentDefinition
 from openhands.sdk.tool.client_tool import ClientToolSpec
 from openhands.sdk.utils.models import kind_of
@@ -284,6 +289,39 @@ class ConversationConfig(BaseModel):
             "the agent's LLM."
         ),
     )
+
+    @model_validator(mode="after")
+    def _apply_roy_governance_config_locks(self) -> ConversationConfig:
+        # Roy 的治理層(2026-09-03):machine 層鎖定(見
+        # roy_governance_lock.py)一旦設定,不管呼叫端(repo/workspace 層,
+        # 包含 Agent Canvas GUI 傳入的請求體、OpenAI 相容端點經
+        # ConversationSettings 算出的值)傳了什麼,這裡都要強制修正——跟
+        # confirmation_policy/security_analyzer 既有的「Field 預設值只在
+        # 省略時生效」不同,鎖定是無條件覆寫,對應 Codex「project-local
+        # config 不能覆寫 machine-local」的設計原則。刻意只在「目前不符合
+        # 鎖定方向」時才動手改寫,不無條件重建物件——呼叫端若已經指定了
+        # 同方向但更嚴格的設定(如鎖定要求 confirmation on,呼叫端給的是
+        # AlwaysConfirm 而非預設的 ConfirmRisky),保留呼叫端的選擇。
+        #
+        # 這個 validator 必須排在 _bind_roy_analyzer_workspace 之前:若這裡
+        # 因鎖定重建了一個新的 RoyPathPayloadSecurityAnalyzer,要讓下一個
+        # validator 有機會幫它綁上這個對話真正的 workspace_root。
+        lock_analyzer = locked_security_analyzer()
+        if lock_analyzer == "none" and self.security_analyzer is not None:
+            self.security_analyzer = None
+        elif lock_analyzer == "llm" and not isinstance(
+            self.security_analyzer, RoyPathPayloadSecurityAnalyzer
+        ):
+            self.security_analyzer = RoyPathPayloadSecurityAnalyzer()
+
+        lock_mode = locked_confirmation_mode()
+        if lock_mode is True and isinstance(self.confirmation_policy, NeverConfirm):
+            self.confirmation_policy = ConfirmRisky(threshold=SecurityRisk.HIGH)
+        elif lock_mode is False and not isinstance(
+            self.confirmation_policy, NeverConfirm
+        ):
+            self.confirmation_policy = NeverConfirm()
+        return self
 
     @model_validator(mode="after")
     def _bind_roy_analyzer_workspace(self) -> ConversationConfig:
