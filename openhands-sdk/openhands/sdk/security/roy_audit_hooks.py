@@ -24,11 +24,13 @@ OpenAI 相容端點走的 ``ConversationSettings.create_request()``)有沒有自
    ``$(...)``、反引號等 POSIX shell 展開語法利用。
 4. ``LocalConversation.__init__`` 在 ``self._pending_hook_config = ...``
    賦值時就套用本函式,涵蓋 fresh construction 與 resume(resume 呼叫的是
-   同一個建構子,只是 ``hook_config=self.stored.hook_config``)——不像
-   ``ConversationConfig``/``ConversationSettings`` 只保護請求模型層,這裡
-   是唯一的賦值點,沒有獨立的 runtime setter 或 REST endpoint 需要另外
-   補(跟 ``confirmation_policy``/``security_analyzer`` 需要額外處理
-   setter/resume 兩條路徑不同)。
+   同一個建構子,只是 ``hook_config=self.stored.hook_config``)。沒有獨立
+   的 runtime REST endpoint 或 public setter 可以在建構後整份替換
+   ``hook_config``(跟 ``confirmation_policy``/``security_analyzer`` 需要
+   額外處理 setter/resume 兩條路徑不同);``_merge_runtime_plugin_hooks()``
+   會在 runtime 動態載入 plugin 時再寫一次 ``_pending_hook_config``,但那是
+   在已含治理 hook 的既有值上疊加(``HookConfig.merge()``),不會清掉已經
+   合併進去的治理 hook。
 
 已知限制,刻意不修(範圍超出「補一個治理 hook」,見
 project_openhands_governance_platform.md「下一步」討論):

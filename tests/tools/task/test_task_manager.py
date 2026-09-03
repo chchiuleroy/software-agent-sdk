@@ -10,6 +10,7 @@ from openhands.sdk import LLM, Agent
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.hooks.config import HookConfig, HookDefinition, HookMatcher
+from openhands.sdk.security.roy_audit_hooks import AUDIT_HOOK_NAME
 from openhands.sdk.subagent.registry import (
     _reset_registry_for_tests,
     register_agent,
@@ -922,7 +923,9 @@ class TestTaskManagerHooks:
         assert sub_conv._pending_hook_config.pre_tool_use[0].matcher == "terminal"
 
     def test_create_task_no_hooks_passes_none(self, tmp_path):
-        """When the agent definition has no hooks, hook_config should be None."""
+        """When the agent definition has no hooks, only the governance
+        audit hook (always injected, see roy_audit_hooks.py) should be
+        present — no agent-definition hooks."""
         register_builtins_agents()
 
         manager, _ = _manager_with_parent(tmp_path)
@@ -933,7 +936,13 @@ class TestTaskManagerHooks:
 
         sub_conv = task.conversation
         assert sub_conv is not None
-        assert sub_conv._pending_hook_config is None
+        pending = sub_conv._pending_hook_config
+        assert pending is not None
+        assert [
+            hook.name for matcher in pending.session_start for hook in matcher.hooks
+        ] == [AUDIT_HOOK_NAME]
+        assert pending.pre_tool_use == []
+        assert pending.post_tool_use == []
 
     def test_resume_task_passes_hook_config(self, tmp_path):
         """_resume_task should pass hooks from the agent definition."""
@@ -999,7 +1008,8 @@ class TestTaskManagerHooks:
         assert conv._pending_hook_config.pre_tool_use[0].matcher == "file_editor"
 
     def test_get_conversation_without_hook_config(self, tmp_path):
-        """_get_conversation without hook_config should leave it as None."""
+        """_get_conversation without an explicit hook_config should still
+        carry only the governance audit hook, not None."""
         register_builtins_agents()
         manager, _ = _manager_with_parent(tmp_path)
 
@@ -1015,7 +1025,11 @@ class TestTaskManagerHooks:
             worker_agent=agent,
         )
 
-        assert conv._pending_hook_config is None
+        pending = conv._pending_hook_config
+        assert pending is not None
+        assert [
+            hook.name for matcher in pending.session_start for hook in matcher.hooks
+        ] == [AUDIT_HOOK_NAME]
 
 
 class TestTaskManagerPersistence:

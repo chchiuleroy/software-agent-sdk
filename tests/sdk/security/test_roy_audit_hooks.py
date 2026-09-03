@@ -291,12 +291,6 @@ def test_real_subprocess_rejects_hostile_workspace_shadowing_openhands(
     assert (audit_dir / "session_start.jsonl").exists()
 
 
-def _session_start_hook_names(hook_config) -> list[str]:
-    return [
-        hook.name for matcher in hook_config.session_start for hook in matcher.hooks
-    ]
-
-
 def test_fresh_conversation_gets_audit_hook_with_no_caller_hook_config(
     tmp_path,
 ) -> None:
@@ -340,15 +334,21 @@ def test_fresh_conversation_merges_audit_hook_with_caller_hook_config(
     assert merged.pre_tool_use[0].hooks[0].command == "echo hi"
 
 
-def test_resumed_conversation_gets_audit_hook(tmp_path) -> None:
-    # Mirrors event_service.py's resume path: LocalConversation(agent=None,
-    # hook_config=self.stored.hook_config, ...) against the same
-    # persistence_dir/conversation_id — the resume path goes through the
-    # same constructor assignment as fresh construction.
+def test_resumed_conversation_merges_audit_hook_with_stored_hook_config(
+    tmp_path,
+) -> None:
+    # event_service.py's resume path explicitly passes
+    # hook_config=self.stored.hook_config into the constructor — not the
+    # default of omitting it. Pass a distinguishable stored hook_config
+    # here too, so this actually proves stored hooks and the governance
+    # hook both survive resume, not just that omitting hook_config still
+    # defaults to the governance hook (already covered by the fresh-
+    # construction test above).
     from pydantic import SecretStr
 
     from openhands.sdk.agent.agent import Agent
     from openhands.sdk.conversation import LocalConversation
+    from openhands.sdk.hooks import HookConfig, HookDefinition, HookMatcher
     from openhands.sdk.llm import LLM
 
     persistence_dir = tmp_path / "persistence"
@@ -364,13 +364,20 @@ def test_resumed_conversation_gets_audit_hook(tmp_path) -> None:
     conversation_id = first.state.id
     first.close()
 
+    stored_hook_config = HookConfig(
+        pre_tool_use=[HookMatcher(hooks=[HookDefinition(command="echo stored")])]
+    )
     resumed = LocalConversation(
         agent=None,
         workspace=str(workspace_dir),
         persistence_dir=str(persistence_dir),
         conversation_id=conversation_id,
+        hook_config=stored_hook_config,
         visualizer=None,
     )
 
-    assert AUDIT_HOOK_NAME in _session_start_hook_names(resumed._pending_hook_config)
+    merged = resumed._pending_hook_config
+    assert AUDIT_HOOK_NAME in _session_start_hook_names(merged)
+    assert len(merged.pre_tool_use) == 1
+    assert merged.pre_tool_use[0].hooks[0].command == "echo stored"
     resumed.close()
