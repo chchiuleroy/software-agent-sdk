@@ -389,6 +389,16 @@ class LocalConversation(BaseConversation):
             cipher=cipher,
             tags=tags,
         )
+        # Governance lock applies to the initial state too, not just
+        # subsequent set_confirmation_policy()/set_security_analyzer() calls.
+        with self._state:
+            self._state.confirmation_policy = apply_confirmation_policy_lock(
+                self._state.confirmation_policy
+            )
+            self._state.security_analyzer = apply_security_analyzer_lock(
+                self._state.security_analyzer,
+                workspace_root=self.workspace.working_dir,
+            )
         # base_state.json is the source of truth for the agent. On resume with
         # ``agent=None`` the state holds the persisted agent; adopt it here so
         # ``self.agent`` and ``self._state.agent`` are the same object.
@@ -2532,13 +2542,8 @@ class LocalConversation(BaseConversation):
     def set_confirmation_policy(self, policy: ConfirmationPolicyBase) -> None:
         """Set the confirmation policy and store it in conversation state.
 
-        Roy 的治理層(2026-09-03):套用機層鎖定(見
-        roy_governance_lock.py),不管呼叫端是誰——agent-server 的 runtime
-        更新 REST endpoint、對話 resume 路徑(把 persisted 值寫回這裡)、
-        或任何未來新入口——都會被同一份鎖定邏輯保護,不必逐一在每個呼叫端
-        補檢查。這是小o review 抓到的缺口:先前的鎖定只掛在
-        ConversationConfig 的 validator(對話建立當下),完全不涵蓋建立後
-        透過這個方法做的變更。
+        Applies the machine-level governance lock (roy_governance_lock.py)
+        if one is configured, regardless of caller.
         """
         policy = apply_confirmation_policy_lock(policy)
         with self._state:
@@ -2714,9 +2719,8 @@ class LocalConversation(BaseConversation):
     def set_security_analyzer(self, analyzer: SecurityAnalyzerBase | None) -> None:
         """Set the security analyzer for the conversation.
 
-        Roy 的治理層(2026-09-03):同 ``set_confirmation_policy()``,套用
-        機層鎖定,涵蓋 runtime 更新 REST endpoint、resume、與任何未來新
-        入口。
+        Applies the machine-level governance lock (roy_governance_lock.py)
+        if one is configured, regardless of caller.
         """
         analyzer = apply_security_analyzer_lock(
             analyzer, workspace_root=self.workspace.working_dir

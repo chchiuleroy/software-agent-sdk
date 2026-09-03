@@ -284,3 +284,22 @@ def test_set_security_analyzer_lock_discards_wide_workspace_root(
 
     assert conversation.state.security_analyzer.workspace_root != "/"
     assert conversation.state.security_analyzer.workspace_root == str(tmp_path)
+
+
+def test_fresh_conversation_applies_lock_at_construction(monkeypatch, tmp_path) -> None:
+    # Regression test for a real finding from Codex review (2026-09-03,
+    # dynamically verified by the reviewer): a raw SDK Conversation(...)
+    # call never invokes set_confirmation_policy()/set_security_analyzer()
+    # at all, so ConversationState.create()'s own Pydantic defaults
+    # (NeverConfirm, no analyzer) were reaching the initial state
+    # unchanged even with both locks configured.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "true")
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+
+    conversation = _local_conversation(tmp_path)
+
+    assert isinstance(conversation.state.confirmation_policy, ConfirmRisky)
+    assert isinstance(
+        conversation.state.security_analyzer, RoyPathPayloadSecurityAnalyzer
+    )
+    assert conversation.state.security_analyzer.workspace_root == str(tmp_path)

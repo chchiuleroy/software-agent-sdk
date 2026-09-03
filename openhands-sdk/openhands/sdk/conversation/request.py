@@ -291,22 +291,8 @@ class ConversationConfig(BaseModel):
 
     @model_validator(mode="after")
     def _apply_roy_governance_config_locks(self) -> ConversationConfig:
-        # Roy 的治理層(2026-09-03,小o review 後修正):machine 層鎖定(見
-        # roy_governance_lock.py)一旦設定,不管呼叫端(repo/workspace 層,
-        # 包含 Agent Canvas GUI 傳入的請求體、OpenAI 相容端點經
-        # ConversationSettings 算出的值)傳了什麼,這裡都要強制修正——對應
-        # Codex「project-local config 不能覆寫 machine-local」的設計原則。
-        #
-        # 實際正規化邏輯(workspace_root 一律重建、confirmation_policy 用
-        # 行為語意而非類別名稱判斷)在 apply_confirmation_policy_lock()/
-        # apply_security_analyzer_lock() 裡——這裡跟
-        # LocalConversation.set_confirmation_policy()/set_security_analyzer()
-        # (見 conversation/impl/local_conversation.py)共用同一份實作,
-        # 而非各自複製一次判斷邏輯。這個 validator 只保護對話「建立當下」
-        # (request model 層);對話建立後的 runtime 更新(agent_server 的
-        # confirmation_policy/security_analyzer REST endpoint)跟 resume
-        # 都是直接呼叫上述兩個 setter,靠 setter 自己套用同一份鎖定邏輯來
-        # 保護,不依賴呼叫端有沒有經過這個 validator。
+        # Machine-level governance lock (roy_governance_lock.py), if
+        # configured, overrides whatever the caller supplied.
         self.security_analyzer = apply_security_analyzer_lock(
             self.security_analyzer, workspace_root=self.workspace.working_dir
         )

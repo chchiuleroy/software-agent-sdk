@@ -14,26 +14,19 @@ Agent Canvas GUI)一律不能覆寫。
 下,環境變數已經是這個 repo 一貫的「admin 層設定,不進使用者可改的
 settings.json」機制,不需要另外設計檔案格式與載入順序。
 
-小o code review(2026-09-03)抓到:第一版把「環境變數已設定但值無法辨識
-(例如打錯字)」跟「環境變數根本沒設定」都當成「不鎖」處理,對一般
-feature flag 這樣合理,但對宣稱是 machine/org governance boundary 的設定,
-部署時打錯字會在完全沒有任何錯誤訊號的情況下悄悄解除保護。改成:未設定
-才是「不鎖」;已設定但無法辨識直接丟 ``ValueError``,讓第一個嘗試建立
-對話的請求就失敗,而不是靜默放行。
+未設定環境變數代表不鎖;已設定但值無法辨識會丟 ``ValueError``——這是治理
+邊界設定,打錯字不該悄悄變成「沒鎖」。
 
-**兩層防線,同一套正規化函式**:第一版只把鎖定套在 ``ConversationConfig``
-的 validator(對話「建立當下」),同一輪 review 抓到這只保護到 request
-model 層——``agent_server`` 的 runtime 更新端點
-(``conversation_router.py`` 的 confirmation_policy／security_analyzer
-setter)跟對話 resume 路徑(``event_service.py``)都直接呼叫
-``LocalConversation.set_confirmation_policy()``/``set_security_analyzer()``,
-完全繞過 validator。真正的修法是把鎖定邏輯下沉到這兩個 setter 本身
-(``local_conversation.py``),讓任何呼叫端(不論從 REST API、resume、
-還是未來任何新入口)都自動受保護,不必逐一補入口。``apply_confirmation
-_policy_lock()``/``apply_security_analyzer_lock()`` 這兩個函式因此被設計
-成冪等的純函式(輸入候選值,回傳鎖定後應該生效的值),``ConversationConfig``
-的 validator 與 ``LocalConversation`` 的 setter 共用同一份實作,而不是
-在兩處分別複製一樣的判斷邏輯。
+``apply_confirmation_policy_lock()``/``apply_security_analyzer_lock()`` 是
+冪等的純函式(輸入候選值,回傳鎖定後應該生效的值),供所有實際會改動這兩
+個欄位的地方共用同一份判斷邏輯,而非各自複製一份。
+
+已知邊界:這個鎖保護的是「透過 request model 或
+``LocalConversation.set_confirmation_policy()``/``set_security_analyzer()``
+變更狀態」這條路徑,不保護同一行程內直接改寫
+``LocalConversation.state.confirmation_policy``/``security_analyzer`` 這種
+mutable public state 的存取——那需要的是 Python 層的信任邊界,不是這個
+函式能解決的問題(同行程程式碼本來就能改環境變數本身)。
 """
 
 from __future__ import annotations
