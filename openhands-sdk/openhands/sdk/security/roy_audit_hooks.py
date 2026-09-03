@@ -22,19 +22,16 @@ OpenAI 相容端點走的 ``ConversationSettings.create_request()``)有沒有自
 3. ``DEFAULT_AUDIT_DIR`` 用 allowlist(僅接受字母/數字/空白/路徑常見符號)
    而非 blocklist 驗證,避免內插進 ``shell=True`` 執行的指令字串時被
    ``$(...)``、反引號等 POSIX shell 展開語法利用。
+4. ``LocalConversation.__init__`` 在 ``self._pending_hook_config = ...``
+   賦值時就套用本函式,涵蓋 fresh construction 與 resume(resume 呼叫的是
+   同一個建構子,只是 ``hook_config=self.stored.hook_config``)——不像
+   ``ConversationConfig``/``ConversationSettings`` 只保護請求模型層,這裡
+   是唯一的賦值點,沒有獨立的 runtime setter 或 REST endpoint 需要另外
+   補(跟 ``confirmation_policy``/``security_analyzer`` 需要額外處理
+   setter/resume 兩條路徑不同)。
 
 已知限制,刻意不修(範圍超出「補一個治理 hook」,見
 project_openhands_governance_platform.md「下一步」討論):
-4. **`Conversation(...)`/`LocalConversation` 直接建構會繞過本檔的治理**:
-   ``build_governance_hook_config()`` 只掛在 ``ConversationConfig``(見
-   conversation/request.py)跟 ``ConversationSettings``(見
-   settings/model.py 的 ``_build_hook_config()``)這兩個請求模型層;
-   ``LocalConversation.__init__`` 本身接受 ``hook_config`` 作為直接參數,
-   完全不套用任何預設值。任何繞過這兩個請求模型、直接呼叫
-   ``Conversation(...)``/``LocalConversation(...)`` 的 SDK 使用者(例如
-   sub-agent task manager)不會觸發稽核 hook。（`confirmation_policy`／
-   `security_analyzer` 的同類缺口已在 ``roy_governance_lock.py`` 補上,
-   本檔的 hook_config 尚未比照辦理。）
 5. **Plugin hook 合併發生在本檔之後,可能重複執行**:
    ``LocalConversation._ensure_plugins_loaded()`` 在拿到本檔已合併好的
    ``hook_config`` 之後,用 SDK 既有的 ``HookConfig.merge()``(單純串接,

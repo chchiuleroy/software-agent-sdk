@@ -289,3 +289,88 @@ def test_real_subprocess_rejects_hostile_workspace_shadowing_openhands(
         "the real audit hook writer"
     )
     assert (audit_dir / "session_start.jsonl").exists()
+
+
+def _session_start_hook_names(hook_config) -> list[str]:
+    return [
+        hook.name for matcher in hook_config.session_start for hook in matcher.hooks
+    ]
+
+
+def test_fresh_conversation_gets_audit_hook_with_no_caller_hook_config(
+    tmp_path,
+) -> None:
+    from pydantic import SecretStr
+
+    from openhands.sdk.agent.agent import Agent
+    from openhands.sdk.conversation import Conversation
+    from openhands.sdk.llm import LLM
+
+    llm = LLM(model="gpt-4o", api_key=SecretStr("x"), usage_id="test")
+    conversation = Conversation(agent=Agent(llm=llm, tools=[]), workspace=str(tmp_path))
+
+    assert AUDIT_HOOK_NAME in _session_start_hook_names(
+        conversation._pending_hook_config
+    )
+
+
+def test_fresh_conversation_merges_audit_hook_with_caller_hook_config(
+    tmp_path,
+) -> None:
+    from pydantic import SecretStr
+
+    from openhands.sdk.agent.agent import Agent
+    from openhands.sdk.conversation import Conversation
+    from openhands.sdk.hooks import HookConfig, HookDefinition, HookMatcher
+    from openhands.sdk.llm import LLM
+
+    llm = LLM(model="gpt-4o", api_key=SecretStr("x"), usage_id="test")
+    caller_hooks = HookConfig(
+        pre_tool_use=[HookMatcher(hooks=[HookDefinition(command="echo hi")])]
+    )
+    conversation = Conversation(
+        agent=Agent(llm=llm, tools=[]),
+        workspace=str(tmp_path),
+        hook_config=caller_hooks,
+    )
+
+    merged = conversation._pending_hook_config
+    assert AUDIT_HOOK_NAME in _session_start_hook_names(merged)
+    assert len(merged.pre_tool_use) == 1
+    assert merged.pre_tool_use[0].hooks[0].command == "echo hi"
+
+
+def test_resumed_conversation_gets_audit_hook(tmp_path) -> None:
+    # Mirrors event_service.py's resume path: LocalConversation(agent=None,
+    # hook_config=self.stored.hook_config, ...) against the same
+    # persistence_dir/conversation_id — the resume path goes through the
+    # same constructor assignment as fresh construction.
+    from pydantic import SecretStr
+
+    from openhands.sdk.agent.agent import Agent
+    from openhands.sdk.conversation import LocalConversation
+    from openhands.sdk.llm import LLM
+
+    persistence_dir = tmp_path / "persistence"
+    workspace_dir = tmp_path / "workspace"
+    llm = LLM(model="gpt-4o", api_key=SecretStr("x"), usage_id="test")
+
+    first = LocalConversation(
+        agent=Agent(llm=llm, tools=[]),
+        workspace=str(workspace_dir),
+        persistence_dir=str(persistence_dir),
+        visualizer=None,
+    )
+    conversation_id = first.state.id
+    first.close()
+
+    resumed = LocalConversation(
+        agent=None,
+        workspace=str(workspace_dir),
+        persistence_dir=str(persistence_dir),
+        conversation_id=conversation_id,
+        visualizer=None,
+    )
+
+    assert AUDIT_HOOK_NAME in _session_start_hook_names(resumed._pending_hook_config)
+    resumed.close()

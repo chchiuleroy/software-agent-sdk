@@ -92,6 +92,7 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
 )
+from openhands.sdk.security.roy_audit_hooks import build_governance_hook_config
 from openhands.sdk.security.roy_governance_lock import (
     apply_confirmation_policy_lock,
     apply_security_analyzer_lock,
@@ -318,7 +319,9 @@ class LocalConversation(BaseConversation):
         self._plugin_specs = plugins
         self._resolved_plugins = None
         self._plugins_loaded = False
-        self._pending_hook_config = hook_config  # Will be combined with plugin hooks
+        # Governance-mandated hooks are merged in regardless of caller input;
+        # combined with plugin hooks later in _ensure_plugins_loaded().
+        self._pending_hook_config = build_governance_hook_config(hook_config)
         self._agent_ready = False  # Agent initialized lazily after plugins loaded
         self._mcp_tool_provider = mcp_tool_provider or DefaultMCPToolProvider()
 
