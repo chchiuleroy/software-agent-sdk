@@ -144,9 +144,19 @@ async def test_start_conversation_without_plugin(conversation_service):
 
             await conversation_service.start_conversation(request)
 
-            # Verify hook_config is None when no plugin
+            # Even with no plugin and no caller-supplied hook_config, the
+            # governance layer (ConversationConfig's
+            # _apply_roy_governance_audit_hook validator) always merges in
+            # the mandatory SessionStart audit hook — hook_config is never
+            # None. See openhands.sdk.security.roy_audit_hooks.
             stored = mock_event_service_class.call_args.kwargs["stored"]
-            assert stored.hook_config is None
+            assert stored.hook_config is not None
+            audit_hook_names = {
+                hook.name
+                for matcher in stored.hook_config.session_start
+                for hook in matcher.hooks
+            }
+            assert "roy-governance-session-start-audit" in audit_hook_names
 
 
 # Tests for plugins list parameter

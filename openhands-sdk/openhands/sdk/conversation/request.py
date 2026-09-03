@@ -40,6 +40,7 @@ from openhands.sdk.security.confirmation_policy import (
     ConfirmRisky,
 )
 from openhands.sdk.security.risk import SecurityRisk
+from openhands.sdk.security.roy_audit_hooks import build_governance_hook_config
 from openhands.sdk.security.roy_governance import RoyPathPayloadSecurityAnalyzer
 from openhands.sdk.subagent.schema import AgentDefinition
 from openhands.sdk.tool.client_tool import ClientToolSpec
@@ -302,6 +303,17 @@ class ConversationConfig(BaseModel):
             self.security_analyzer = analyzer.model_copy(
                 update={"workspace_root": self.workspace.working_dir}
             )
+        return self
+
+    @model_validator(mode="after")
+    def _apply_roy_governance_audit_hook(self) -> ConversationConfig:
+        # Roy 的治理層(2026-09-03):不管呼叫端(raw REST API 或走這個
+        # class 的 StartConversationRequest 子類,涵蓋 Agent Canvas GUI 真正
+        # 建立對話的請求體)有沒有自帶 hook_config,都強制合併進治理稽核
+        # SessionStart hook——跟 confirmation_policy/security_analyzer 同一套
+        # 「治理關鍵欄位不能被繞過」原則,差別是這裡用 merge 而非覆蓋,呼叫端
+        # 自訂的 hook 不會被犧牲掉。
+        self.hook_config = build_governance_hook_config(self.hook_config)
         return self
 
 

@@ -24,9 +24,11 @@ from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.context.condenser import LLMSummarizingCondenser, NoOpCondenser
 from openhands.sdk.critic.base import IterativeRefinementConfig
 from openhands.sdk.critic.impl.api import APIBasedCritic
+from openhands.sdk.hooks import HookConfig, HookDefinition, HookMatcher
 from openhands.sdk.mcp.config import MCPServer, coerce_mcp_config, dump_mcp_config
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.security.confirmation_policy import AlwaysConfirm, ConfirmRisky
+from openhands.sdk.security.roy_audit_hooks import AUDIT_HOOK_NAME
 from openhands.sdk.security.roy_governance import RoyPathPayloadSecurityAnalyzer
 from openhands.sdk.settings import (
     AGENT_SETTINGS_SCHEMA_VERSION,
@@ -249,6 +251,11 @@ def test_conversation_settings_model_dump_roundtrip() -> None:
     assert restored == settings
 
 
+def _hook_names(hook_config: HookConfig, event: str = "session_start") -> set[str]:
+    matchers = getattr(hook_config, event)
+    return {hook.name for matcher in matchers for hook in matcher.hooks}
+
+
 def test_conversation_settings_create_request() -> None:
     settings = ConversationSettings(
         max_iterations=77,
@@ -269,6 +276,7 @@ def test_conversation_settings_create_request() -> None:
     assert request.max_iterations == 77
     assert isinstance(request.confirmation_policy, ConfirmRisky)
     assert isinstance(request.security_analyzer, RoyPathPayloadSecurityAnalyzer)
+    assert AUDIT_HOOK_NAME in _hook_names(request.hook_config)
 
     overridden_request = settings.create_request(
         StartConversationRequest,
@@ -282,6 +290,10 @@ def test_conversation_settings_create_request() -> None:
     assert overridden_request.max_iterations == 5
     assert isinstance(overridden_request.confirmation_policy, AlwaysConfirm)
     assert overridden_request.security_analyzer is None
+    # The governance audit hook is not a user-facing "confirmation" toggle:
+    # it must stay in effect even when confirmation_policy/security_analyzer
+    # are overridden.
+    assert AUDIT_HOOK_NAME in _hook_names(overridden_request.hook_config)
 
 
 def test_conversation_settings_create_request_with_acp_agent() -> None:
@@ -304,6 +316,57 @@ def test_conversation_settings_create_request_with_acp_agent() -> None:
     assert request.max_iterations == 77
     assert isinstance(request.confirmation_policy, AlwaysConfirm)
     assert request.security_analyzer is None
+    assert AUDIT_HOOK_NAME in _hook_names(request.hook_config)
+
+
+def test_conversation_settings_create_request_merges_user_hook_config() -> None:
+    # The governance audit hook must be additive, not exclusive: a caller
+    # supplying their own hook_config (e.g. a custom PreToolUse hook) should
+    # keep it, not have it silently dropped in favor of the audit hook.
+    user_hook_config = HookConfig(
+        pre_tool_use=[HookMatcher(hooks=[HookDefinition(command="echo hi")])]
+    )
+    settings = ConversationSettings(hook_config=user_hook_config)
+    workspace = LocalWorkspace(working_dir="/tmp")
+    agent = OpenHandsAgentSettings(llm=LLM(model="test-model")).create_agent()
+
+    request = settings.create_request(
+        StartConversationRequest,
+        agent=agent,
+        workspace=workspace,
+    )
+
+    assert len(request.hook_config.pre_tool_use) == 1
+    assert AUDIT_HOOK_NAME in _hook_names(request.hook_config)
+
+
+def test_start_conversation_request_hook_config_not_duplicated_on_double_construction() -> (  # noqa: E501
+    None
+):
+    # ConversationSettings.create_request() (used by the OpenAI-compatible
+    # endpoint) builds a payload via _build_hook_config() and then
+    # constructs StartConversationRequest(**payload) — which re-runs
+    # ConversationConfig's own _apply_roy_governance_audit_hook validator on
+    # a hook_config that already has the audit hook. This must not append a
+    # second copy (that would double-write every audit log line per
+    # conversation created through that surface).
+    settings = ConversationSettings()
+    workspace = LocalWorkspace(working_dir="/tmp")
+    agent = OpenHandsAgentSettings(llm=LLM(model="test-model")).create_agent()
+
+    request = settings.create_request(
+        StartConversationRequest,
+        agent=agent,
+        workspace=workspace,
+    )
+
+    session_start_hooks = [
+        hook
+        for matcher in request.hook_config.session_start
+        for hook in matcher.hooks
+    ]
+    assert len(session_start_hooks) == 1
+    assert session_start_hooks[0].name == AUDIT_HOOK_NAME
 
 
 def test_acp_create_request_lifts_context_secrets_into_request_secrets() -> None:
@@ -1775,6 +1838,7 @@ def test_conversation_settings_create_request_for_llm_variant() -> None:
     assert request.max_iterations == 77
     assert isinstance(request.confirmation_policy, ConfirmRisky)
     assert isinstance(request.security_analyzer, RoyPathPayloadSecurityAnalyzer)
+    assert AUDIT_HOOK_NAME in _hook_names(request.hook_config)
 
 
 def test_conversation_settings_create_request_with_acp_agent_variant() -> None:
@@ -1797,6 +1861,7 @@ def test_conversation_settings_create_request_with_acp_agent_variant() -> None:
     assert request.max_iterations == 77
     assert isinstance(request.confirmation_policy, AlwaysConfirm)
     assert request.security_analyzer is None
+    assert AUDIT_HOOK_NAME in _hook_names(request.hook_config)
 
 
 def test_conversation_settings_agent_settings_field_accepts_both_variants() -> None:

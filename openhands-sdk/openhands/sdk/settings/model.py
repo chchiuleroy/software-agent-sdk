@@ -1143,6 +1143,13 @@ class ConversationSettings(BaseModel):
             return ConfirmRisky(threshold=SecurityRisk.HIGH)
         return AlwaysConfirm()
 
+    def _build_hook_config(self):
+        from openhands.sdk.security.roy_audit_hooks import (
+            build_governance_hook_config,
+        )
+
+        return build_governance_hook_config(self.hook_config)
+
     def _build_security_analyzer(self):
         analyzer_kind = (self.security_analyzer or "").lower()
         if not analyzer_kind or analyzer_kind == "none":
@@ -1193,8 +1200,7 @@ class ConversationSettings(BaseModel):
             payload.setdefault("agent_definitions", self.agent_definitions)
         if self.plugins is not None:
             payload.setdefault("plugins", self.plugins)
-        if self.hook_config is not None:
-            payload.setdefault("hook_config", self.hook_config)
+        payload.setdefault("hook_config", self._build_hook_config())
         if self.observability_metadata is not None:
             payload.setdefault("observability_metadata", self.observability_metadata)
         if self.observability_tags is not None:
