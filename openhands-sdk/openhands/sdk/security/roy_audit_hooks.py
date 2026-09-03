@@ -9,56 +9,39 @@ OpenAI 相容端點走的 ``ConversationSettings.create_request()``)有沒有自
 ``confirmation_policy``/``security_analyzer`` 兩個既有生效點「治理關鍵欄位
 不能被呼叫端繞過」的同一套設計原則(見 roy_governance.py)。
 
-小o code review(2026-09-03)抓到的三個問題,均已修正:
-1. **不信任 workspace 遮蔽 writer 模組**:原本用 ``python -m
-   openhands.sdk.security.roy_audit_hook_writer`` 呼叫,但 executor 會用
-   對話的 workspace 當 ``cwd`` 執行這條指令,而 Python 的 ``-m`` 會把
-   *目前工作目錄* 加進 ``sys.path[0]``——只要 workspace 根目錄剛好有一個叫
-   ``openhands`` 的檔案/套件,就會在真正的 SDK 套件之前被匯入,等於任何人
-   都能讓「治理稽核」這個本該對 workspace 內容免疫的動作,執行 workspace
-   提供的任意 Python 程式碼。改成直接用這個模組自己的 ``__file__`` 組出
-   絕對路徑呼叫(``python <絕對路徑>``),讓 ``sys.path[0]`` 指向這個受信任
-   的原始碼目錄,不受 cwd 影響。
-2. **同名假 hook 可以繞過強制稽核**:原本冪等判斷只看名稱是否存在,若呼叫端
-   (或惡意插件)剛好塞一個同名但改成 no-op 指令的假 hook,合併邏輯會誤判
-   「已經有了」直接放行,真正的稽核永遠不會被加入。改成先移除任何同名項目
-   再放回我們自己產生的那一份,同名假 hook 會被覆蓋而非被信任。
-3. **audit_dir 可能逃逸出雙引號造成 shell injection**:``DEFAULT_AUDIT_DIR``
-   內插進雙引號包住的指令字串,``shell=True`` 執行。第一版修法只拒絕字面
-   雙引號,但小o 第二輪 review 抓到這不夠——POSIX shell 在雙引號**內部**
-   依然會展開 ``$(...)``、反引號、``$VAR``,一個含 ``$(touch pwned)`` 的值
-   完全不需要雙引號就能執行任意指令,原本的檢查測不到這個繞過。改成
-   **allowlist 而非 blocklist**:只接受字母/數字/空白與路徑常見符號
-   （``.``、``_``、``-``、``/``、反斜線、``:``）組成的值,不在這個集合內一律拒絕退回安全預設路徑,
-   不逐一列舉「這個 shell 的哪些字元危險」(cmd.exe 跟 POSIX shell 的危險
-   字元集不同且容易漏列,allowlist 對兩邊都成立)。
+安全性質:
+1. writer 一律以自己模組的 ``__file__`` 組出絕對路徑呼叫(而非
+   ``python -m openhands.sdk.security.roy_audit_hook_writer``)——executor
+   用對話 workspace 當 ``cwd`` 執行這條指令,``-m`` 會把 cwd 加進
+   ``sys.path[0]``,workspace 根目錄若剛好有同名 ``openhands`` 套件就會
+   搶先被匯入。絕對路徑呼叫讓 ``sys.path[0]`` 固定指向這個受信任目錄,不
+   受 cwd 影響。
+2. 冪等判斷會先移除任何同名(``AUDIT_HOOK_NAME``)既有項目,再放回自己
+   產生的那一份——同名假 hook(呼叫端或插件塞入)不會被誤判成「已存在」
+   而略過真正的稽核。
+3. ``DEFAULT_AUDIT_DIR`` 用 allowlist(僅接受字母/數字/空白/路徑常見符號)
+   而非 blocklist 驗證,避免內插進 ``shell=True`` 執行的指令字串時被
+   ``$(...)``、反引號等 POSIX shell 展開語法利用。
 
-同一輪 review 還抓到兩項**已知限制,本次刻意不修**(範圍超出「補一個治理
-hook」,屬於既有架構的既有邊界,見 project_openhands_governance_platform.md
-「下一步」討論,需要 Roy 決定是否／何時擴大範圍):
+已知限制,刻意不修(範圍超出「補一個治理 hook」,見
+project_openhands_governance_platform.md「下一步」討論):
 4. **`Conversation(...)`/`LocalConversation` 直接建構會繞過本檔的治理**:
-   本檔的 ``build_governance_hook_config()`` 只掛在 ``ConversationConfig``
-   (見 conversation/request.py 的 ``_apply_roy_governance_audit_hook``
-   validator)跟 ``ConversationSettings``(見 settings/model.py 的
-   ``_build_hook_config()``)這兩個「REST API / Settings 請求模型」層,對應
-   既有 ``confirmation_policy``/``security_analyzer`` 治理生效點的相同範圍
-   邊界。但 ``LocalConversation.__init__`` 本身接受 ``hook_config`` 作為
-   直接參數且完全不套用任何預設值——任何繞過這兩個請求模型、直接呼叫
+   ``build_governance_hook_config()`` 只掛在 ``ConversationConfig``(見
+   conversation/request.py)跟 ``ConversationSettings``(見
+   settings/model.py 的 ``_build_hook_config()``)這兩個請求模型層;
+   ``LocalConversation.__init__`` 本身接受 ``hook_config`` 作為直接參數,
+   完全不套用任何預設值。任何繞過這兩個請求模型、直接呼叫
    ``Conversation(...)``/``LocalConversation(...)`` 的 SDK 使用者(例如
-   ``poc/`` 下的測試腳本、或 task manager 建立 sub-agent 對話的路徑,見
-   ``openhands-tools`` 的 ``tests/tools/task/test_task_manager.py``
-   ``_pending_hook_config is None`` 案例)完全不會觸發稽核 hook。要補齊
-   需要在 ``LocalConversation.__init__`` 本身(或它呼叫的更底層共用點)
-   加治理預設值,是比本次「加一個 hook」更大的架構改動。
-5. **Plugin hook 合併發生在本檔之後,可能重複執行**:``LocalConversation.
-   _ensure_plugins_loaded()``(見 conversation/impl/local_conversation.py)
-   在 builder 完成、拿到本檔已合併好的 ``hook_config`` 之後,才用
-   ``HookConfig.merge()`` 把 plugin 自帶的 hooks 疊加進去——那次 merge是
-   SDK 既有邏輯,單純串接不做同名去重,若某個 plugin 剛好也定義一個叫
-   ``AUDIT_HOOK_NAME`` 的 SessionStart hook,會產生兩筆重複的
-   ``session_start`` 紀錄。這是 ``HookConfig.merge()`` 本身的既有行為
-   (不論疊加的是不是治理 hook 都一樣),不是本檔新增的問題,修正需要動
-   SDK 核心的 merge 邏輯本身,超出本次範圍。
+   sub-agent task manager)不會觸發稽核 hook。（`confirmation_policy`／
+   `security_analyzer` 的同類缺口已在 ``roy_governance_lock.py`` 補上,
+   本檔的 hook_config 尚未比照辦理。）
+5. **Plugin hook 合併發生在本檔之後,可能重複執行**:
+   ``LocalConversation._ensure_plugins_loaded()`` 在拿到本檔已合併好的
+   ``hook_config`` 之後,用 SDK 既有的 ``HookConfig.merge()``(單純串接,
+   不做同名去重)疊加 plugin 自帶的 hooks——若某個 plugin 剛好也定義一個
+   叫 ``AUDIT_HOOK_NAME`` 的 SessionStart hook,會產生重複紀錄。這是
+   ``HookConfig.merge()`` 本身的既有行為,修正需要動 SDK 核心邏輯,超出
+   本檔範圍。
 """
 
 from __future__ import annotations

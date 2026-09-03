@@ -112,16 +112,9 @@ def test_lock_security_analyzer_llm_overrides_caller_supplied_none(
 def test_lock_security_analyzer_llm_discards_caller_workspace_root_override(
     monkeypatch,
 ) -> None:
-    # Regression test for a real finding from Codex review (2026-09-03):
-    # the first version preserved a caller-supplied workspace_root when the
-    # analyzer was already the right kind. But workspace_root directly
-    # decides which paths count as "inside the workspace" — a caller could
-    # set it to a disk root or other overly broad ancestor directory,
-    # making the analyzer classify everything as LOW risk and rendering
-    # the lock meaningless. The lock must always rebuild a fresh instance
-    # so workspace_root is only ever derived from the conversation's real
-    # workspace (via _bind_roy_analyzer_workspace below), never taken from
-    # the request body.
+    # workspace_root decides which paths count as "inside the workspace" —
+    # an overly broad caller-supplied root would render the lock
+    # meaningless, so it must always be discarded and rederived.
     monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
     overly_broad = RoyPathPayloadSecurityAnalyzer(workspace_root="/")
 
@@ -157,13 +150,9 @@ def test_lock_confirmation_mode_on_upgrades_never_confirm(monkeypatch) -> None:
 
 
 def test_lock_confirmation_mode_on_normalizes_weaker_confirm_risky(monkeypatch) -> None:
-    # Regression test for a real finding from Codex review (2026-09-03):
-    # "not NeverConfirm" is not the same as "confirmation is actually
-    # enforced" — a caller can pass a ConfirmRisky that is technically the
-    # right *class* but configured weaker than the governance baseline
-    # (confirm_unknown=False skips confirmation for UNKNOWN-risk actions).
-    # The lock must normalize any non-AlwaysConfirm policy to the canonical
-    # baseline rather than trusting the class name alone.
+    # A ConfirmRisky with confirm_unknown=False is the right class but
+    # weaker than the governance baseline — the lock must normalize it,
+    # not just check the class name.
     monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "true")
     weaker = ConfirmRisky(confirm_unknown=False)
 
@@ -287,12 +276,9 @@ def test_set_security_analyzer_lock_discards_wide_workspace_root(
 
 
 def test_fresh_conversation_applies_lock_at_construction(monkeypatch, tmp_path) -> None:
-    # Regression test for a real finding from Codex review (2026-09-03,
-    # dynamically verified by the reviewer): a raw SDK Conversation(...)
-    # call never invokes set_confirmation_policy()/set_security_analyzer()
-    # at all, so ConversationState.create()'s own Pydantic defaults
-    # (NeverConfirm, no analyzer) were reaching the initial state
-    # unchanged even with both locks configured.
+    # A raw SDK Conversation(...) call never invokes
+    # set_confirmation_policy()/set_security_analyzer(), so the initial
+    # state must be canonicalized independently of those setters.
     monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "true")
     monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
 
@@ -303,3 +289,47 @@ def test_fresh_conversation_applies_lock_at_construction(monkeypatch, tmp_path) 
         conversation.state.security_analyzer, RoyPathPayloadSecurityAnalyzer
     )
     assert conversation.state.security_analyzer.workspace_root == str(tmp_path)
+
+
+def test_resumed_conversation_applies_lock_to_persisted_state(
+    monkeypatch, tmp_path
+) -> None:
+    # A conversation persisted before any lock was configured (weak
+    # NeverConfirm/no-analyzer state) must be canonicalized when resumed
+    # after a lock is turned on — not just at fresh construction.
+    from pydantic import SecretStr
+
+    from openhands.sdk.agent.agent import Agent
+    from openhands.sdk.conversation import LocalConversation
+    from openhands.sdk.llm import LLM
+
+    persistence_dir = tmp_path / "persistence"
+    workspace_dir = tmp_path / "workspace"
+    llm = LLM(model="gpt-4o", api_key=SecretStr("x"), usage_id="test")
+
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", raising=False)
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    first = LocalConversation(
+        agent=Agent(llm=llm, tools=[]),
+        workspace=str(workspace_dir),
+        persistence_dir=str(persistence_dir),
+        visualizer=None,
+    )
+    conversation_id = first.state.id
+    assert isinstance(first.state.confirmation_policy, NeverConfirm)
+    assert first.state.security_analyzer is None
+    first.close()
+
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "true")
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    resumed = LocalConversation(
+        agent=None,
+        workspace=str(workspace_dir),
+        persistence_dir=str(persistence_dir),
+        conversation_id=conversation_id,
+        visualizer=None,
+    )
+
+    assert isinstance(resumed.state.confirmation_policy, ConfirmRisky)
+    assert isinstance(resumed.state.security_analyzer, RoyPathPayloadSecurityAnalyzer)
+    resumed.close()
