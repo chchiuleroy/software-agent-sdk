@@ -3,9 +3,9 @@
 Covers the module directly (record_admin_audit_event/record_user_approval_
 event write correctly-shaped JSONL and fail open on write errors). See
 test_roy_governance_lock.py for set_confirmation_policy()/
-set_security_analyzer() writing through this module, and
-tests/agent_server/test_event_service.py for respond_to_confirmation()
-doing the same.
+set_security_analyzer() writing through this module (including the
+only-on-actual-change behavior), and test_roy_user_approval_audit.py for
+reject_pending_actions()/run()/arun() doing the same for user_approval.
 """
 
 import json
@@ -41,6 +41,7 @@ def test_record_user_approval_event_writes_expected_fields(monkeypatch, tmp_path
         accepted=False,
         reason="looked risky",
         tool_names=["terminal", "file_editor"],
+        tool_call_ids=["call_1", "call_2"],
     )
 
     record = json.loads(
@@ -50,6 +51,7 @@ def test_record_user_approval_event_writes_expected_fields(monkeypatch, tmp_path
     assert record["accepted"] is False
     assert record["reason"] == "looked risky"
     assert record["tool_names"] == ["terminal", "file_editor"]
+    assert record["tool_call_ids"] == ["call_1", "call_2"]
 
 
 def test_admin_and_user_events_go_to_separate_files(monkeypatch, tmp_path):
@@ -57,7 +59,11 @@ def test_admin_and_user_events_go_to_separate_files(monkeypatch, tmp_path):
 
     record_admin_audit_event(conversation_id="c", field="x", value="y")
     record_user_approval_event(
-        conversation_id="c", accepted=True, reason=None, tool_names=[]
+        conversation_id="c",
+        accepted=True,
+        reason=None,
+        tool_names=[],
+        tool_call_ids=[],
     )
 
     assert (tmp_path / "admin_audit.jsonl").exists()
@@ -85,5 +91,9 @@ def test_unwritable_audit_dir_does_not_raise(monkeypatch):
 
     record_admin_audit_event(conversation_id="c", field="f", value="v")
     record_user_approval_event(
-        conversation_id="c", accepted=True, reason=None, tool_names=[]
+        conversation_id="c",
+        accepted=True,
+        reason=None,
+        tool_names=[],
+        tool_call_ids=[],
     )

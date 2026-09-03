@@ -9,6 +9,8 @@ is configured — regardless of what the caller (raw REST API, Agent Canvas
 GUI request body, or ConversationSettings-derived payload) supplies.
 """
 
+import json
+
 import pytest
 
 from openhands.sdk.conversation.request import (
@@ -333,3 +335,123 @@ def test_resumed_conversation_applies_lock_to_persisted_state(
     assert isinstance(resumed.state.confirmation_policy, ConfirmRisky)
     assert isinstance(resumed.state.security_analyzer, RoyPathPayloadSecurityAnalyzer)
     resumed.close()
+
+
+# --- admin_audit content coverage --------------------------------------------
+#
+# Regression tests for the review finding that set_confirmation_policy()/
+# set_security_analyzer() (and the constructor's initial-state application)
+# wrote an admin_audit record unconditionally — even on a resume/init call
+# that re-applies an already-current value, which is not an admin changing
+# anything. The fix (_apply_and_audit_confirmation_policy/
+# _apply_and_audit_security_analyzer in local_conversation.py) only writes
+# when the effective value actually changed.
+
+
+def _read_admin_audit_records(audit_dir) -> list[dict]:
+    path = audit_dir / "admin_audit.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_set_confirmation_policy_writes_admin_audit_when_changed(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", raising=False)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    conversation = _local_conversation(tmp_path)
+
+    conversation.set_confirmation_policy(AlwaysConfirm())
+
+    records = [
+        r
+        for r in _read_admin_audit_records(audit_dir)
+        if r["field"] == "confirmation_policy"
+    ]
+    assert len(records) == 1
+    assert records[0]["value"] == repr(AlwaysConfirm())
+
+
+def test_set_confirmation_policy_skips_admin_audit_when_unchanged(
+    monkeypatch, tmp_path
+) -> None:
+    # Simulates the agent server's resume/init path, which always calls this
+    # setter with the persisted value — re-applying an unchanged value is not
+    # an admin action and must not produce a spurious record.
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", raising=False)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    conversation = _local_conversation(tmp_path)
+    default_policy = conversation.state.confirmation_policy
+
+    conversation.set_confirmation_policy(default_policy)
+
+    assert _read_admin_audit_records(audit_dir) == []
+
+
+def test_set_security_analyzer_writes_admin_audit_when_changed(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    conversation = _local_conversation(tmp_path)
+
+    conversation.set_security_analyzer(RoyPathPayloadSecurityAnalyzer())
+
+    records = [
+        r
+        for r in _read_admin_audit_records(audit_dir)
+        if r["field"] == "security_analyzer"
+    ]
+    assert len(records) == 1
+
+
+def test_set_security_analyzer_skips_admin_audit_when_unchanged(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    conversation = _local_conversation(tmp_path)
+
+    conversation.set_security_analyzer(None)  # SDK default is already None
+
+    assert _read_admin_audit_records(audit_dir) == []
+
+
+def test_fresh_conversation_with_lock_writes_admin_audit_at_construction(
+    monkeypatch, tmp_path
+) -> None:
+    # Regression guard for the review finding that raw SDK construction's
+    # initial lock application bypassed admin_audit entirely (it mutated
+    # self._state directly instead of going through an audited helper).
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", "true")
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+
+    _local_conversation(tmp_path)
+
+    records = [
+        r
+        for r in _read_admin_audit_records(audit_dir)
+        if r["field"] == "confirmation_policy"
+    ]
+    assert len(records) == 1
+
+
+def test_fresh_conversation_without_lock_writes_no_admin_audit(
+    monkeypatch, tmp_path
+) -> None:
+    # No lock configured means the constructor's lock application is a no-op
+    # (SDK default in, same value out) — must not look like an admin change.
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_CONFIRMATION_MODE", raising=False)
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+
+    _local_conversation(tmp_path)
+
+    assert _read_admin_audit_records(audit_dir) == []

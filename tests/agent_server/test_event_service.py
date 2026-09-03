@@ -1463,11 +1463,8 @@ class TestEventServiceRespondToConfirmation:
     """Test cases for confirmation responses and rejection handling."""
 
     @pytest.mark.asyncio
-    async def test_respond_to_confirmation_accept_calls_run(
-        self, event_service, monkeypatch, tmp_path
-    ):
+    async def test_respond_to_confirmation_accept_calls_run(self, event_service):
         """Accepting confirmation should trigger run and not rejection."""
-        monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(tmp_path))
         event_service._conversation = MagicMock()
         event_service.run = AsyncMock()
         event_service.reject_pending_actions = AsyncMock()
@@ -1480,11 +1477,8 @@ class TestEventServiceRespondToConfirmation:
         event_service.reject_pending_actions.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_respond_to_confirmation_rejects_actions(
-        self, event_service, monkeypatch, tmp_path
-    ):
+    async def test_respond_to_confirmation_rejects_actions(self, event_service):
         """Rejecting confirmation should call reject_pending_actions with reason."""
-        monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(tmp_path))
         event_service._conversation = MagicMock()
         event_service.run = AsyncMock()
         event_service.reject_pending_actions = AsyncMock()
@@ -1497,48 +1491,9 @@ class TestEventServiceRespondToConfirmation:
         event_service.reject_pending_actions.assert_awaited_once_with(reason)
         event_service.run.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_respond_to_confirmation_writes_user_approval_audit_record(
-        self, event_service, monkeypatch, tmp_path
-    ):
-        """respond_to_confirmation should record which pending action(s) were
-        accepted or rejected, not just call the accept/reject methods."""
-        from openhands.sdk.event.llm_convertible import ActionEvent
-        from openhands.sdk.llm import MessageToolCall, TextContent
-        from openhands.tools.terminal import TerminalAction
-
-        monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(tmp_path))
-
-        pending_action = ActionEvent(
-            source="agent",
-            thought=[TextContent(text="running a command")],
-            action=TerminalAction(command="ls"),
-            tool_name="terminal",
-            tool_call_id="call_1",
-            tool_call=MessageToolCall(
-                id="call_1",
-                name="terminal",
-                arguments='{"command": "ls"}',
-                origin="completion",
-            ),
-            llm_response_id="response_1",
-        )
-        event_service._conversation = MagicMock()
-        event_service._conversation.state.active_branch.return_value = [pending_action]
-        event_service.run = AsyncMock()
-        event_service.reject_pending_actions = AsyncMock()
-
-        await event_service.respond_to_confirmation(
-            ConfirmationResponseRequest(accept=False, reason="nope")
-        )
-
-        record = json.loads(
-            (tmp_path / "user_approval.jsonl").read_text(encoding="utf-8").strip()
-        )
-        assert record["accepted"] is False
-        assert record["reason"] == "nope"
-        assert record["tool_names"] == ["terminal"]
-        assert record["conversation_id"] == str(event_service.stored.id)
+    # The user_approval audit record itself is no longer written here — see
+    # LocalConversation.run()/arun()/reject_pending_actions() and
+    # tests/sdk/security/test_roy_user_approval_audit.py.
 
     @pytest.mark.asyncio
     async def test_reject_pending_actions_inactive_service(self, event_service):

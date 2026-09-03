@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import contextlib
 import copy
+import functools
 import json
 import uuid
 from collections.abc import Mapping, Sequence
@@ -92,7 +93,10 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
 )
-from openhands.sdk.security.roy_admin_audit import record_admin_audit_event
+from openhands.sdk.security.roy_admin_audit import (
+    record_admin_audit_event,
+    record_user_approval_event,
+)
 from openhands.sdk.security.roy_audit_hooks import build_governance_hook_config
 from openhands.sdk.security.roy_governance_lock import (
     apply_confirmation_policy_lock,
@@ -395,14 +399,12 @@ class LocalConversation(BaseConversation):
         )
         # Governance lock applies to the initial state too, not just
         # subsequent set_confirmation_policy()/set_security_analyzer() calls.
-        with self._state:
-            self._state.confirmation_policy = apply_confirmation_policy_lock(
-                self._state.confirmation_policy
-            )
-            self._state.security_analyzer = apply_security_analyzer_lock(
-                self._state.security_analyzer,
-                workspace_root=self.workspace.working_dir,
-            )
+        # Routed through the same audited helpers as the public setters so a
+        # lock that overrides the SDK default is recorded like any other
+        # governance change, instead of only being visible to callers that
+        # happen to go through set_confirmation_policy()/set_security_analyzer().
+        self._apply_and_audit_confirmation_policy(self._state.confirmation_policy)
+        self._apply_and_audit_security_analyzer(self._state.security_analyzer)
         # base_state.json is the source of truth for the agent. On resume with
         # ``agent=None`` the state holds the persisted agent; adopt it here so
         # ``self.agent`` and ``self._state.agent`` are the same object.
@@ -1989,6 +1991,21 @@ class LocalConversation(BaseConversation):
                         self._state.execution_status = (
                             ConversationExecutionStatus.RUNNING
                         )
+                        # Snapshot + audit right at the transition, under the
+                        # same lock, so this always matches what's actually
+                        # about to run and fires for any caller (REST or a
+                        # script calling run() on this SDK object directly) —
+                        # not just the agent server's confirmation endpoint.
+                        approved_actions = ConversationState.get_unmatched_actions(
+                            self._state.active_branch()
+                        )
+                        record_user_approval_event(
+                            conversation_id=str(self._state.id),
+                            accepted=True,
+                            reason=None,
+                            tool_names=[a.tool_name for a in approved_actions],
+                            tool_call_ids=[a.tool_call_id for a in approved_actions],
+                        )
 
                     # Mark the step as holding the state lock so state-mutating
                     # tools (e.g. switch_llm) running on worker threads skip
@@ -2136,6 +2153,16 @@ class LocalConversation(BaseConversation):
 
         iteration = 0
         _run_start_event_count = len(self._state.events)
+        # Futures for user_approval audit writes scheduled while WITHIN
+        # self._state's lock: they can't be awaited there (see the comment
+        # at the scheduling site — FIFOLock is thread- not task-reentrant,
+        # so awaiting anything else while holding it lets another task on
+        # this event-loop thread silently re-enter and corrupt history), so
+        # they're collected here and drained (via asyncio.shield(), see
+        # `finally` below) instead of being pure fire-and-forget — not an
+        # fsync-level durability guarantee, just that the write call itself
+        # gets to run rather than risking being discarded before it starts.
+        pending_audit_futures: list[asyncio.Future] = []
         try:
             while True:
                 logger.debug(f"Conversation arun iteration {iteration}")
@@ -2185,6 +2212,39 @@ class LocalConversation(BaseConversation):
                     ):
                         self._state.execution_status = (
                             ConversationExecutionStatus.RUNNING
+                        )
+                        # Snapshot under the lock (cheap, in-memory), but
+                        # schedule the actual write onto the executor without
+                        # awaiting it *here* — this lock is held across the
+                        # astep() await a few lines below on purpose (see
+                        # that comment: FIFOLock is thread- not
+                        # task-reentrant, so awaiting anything while holding
+                        # it lets another task on this event-loop thread
+                        # silently re-enter and corrupt history). The future
+                        # is collected in `pending_audit_futures` and drained
+                        # (shielded from further cancellation) in this
+                        # method's `finally` — see that comment for why this
+                        # is stronger than plain fire-and-forget but still
+                        # not an fsync-level durability guarantee.
+                        approved_actions = ConversationState.get_unmatched_actions(
+                            self._state.active_branch()
+                        )
+                        pending_audit_futures.append(
+                            asyncio.get_running_loop().run_in_executor(
+                                None,
+                                functools.partial(
+                                    record_user_approval_event,
+                                    conversation_id=str(self._state.id),
+                                    accepted=True,
+                                    reason=None,
+                                    tool_names=[
+                                        a.tool_name for a in approved_actions
+                                    ],
+                                    tool_call_ids=[
+                                        a.tool_call_id for a in approved_actions
+                                    ],
+                                ),
+                            )
                         )
 
                     if isinstance(self.agent, ACPAgent):
@@ -2536,6 +2596,48 @@ class LocalConversation(BaseConversation):
                 ),
             ) from e
         finally:
+            # Drain any user_approval audit writes scheduled during the loop
+            # (see where pending_audit_futures is populated) now that
+            # self._state's lock is no longer held — safe to await here, and
+            # runs on every exit path (normal return, exception, or
+            # cancellation) since this is `finally`.
+            #
+            # Wrapped in asyncio.shield(): a second interrupt() landing while
+            # this await is itself in flight (a supported case — see
+            # test_multiple_rapid_interrupts) would otherwise cancel the
+            # gather and propagate that cancellation into any of these
+            # futures that hadn't started running on the executor yet,
+            # discarding them before they ever ran (verified with a probe
+            # that saturates the executor, submits a write, cancels it while
+            # still queued, and confirms it never executes — cancelling an
+            # *already-running* executor call is harmless since the worker
+            # thread keeps running to completion regardless, but a *queued*
+            # one really is lost). shield() keeps the gather itself running
+            # in the background regardless of that second cancel.
+            if pending_audit_futures:
+                drain = asyncio.gather(*pending_audit_futures, return_exceptions=True)
+                try:
+                    results = await asyncio.shield(drain)
+                except asyncio.CancelledError:
+                    # Our own wait on the shielded drain got cancelled (the
+                    # drain itself did not — it keeps running in the
+                    # background). Like every other CancelledError in this
+                    # method (see the top-level except above), this is
+                    # intentionally NOT re-raised: arun() always returns
+                    # normally rather than propagating cancellation to its
+                    # caller, and that must hold here too — otherwise this
+                    # would also skip the cleanup two lines below.
+                    logger.info(
+                        "arun() cancelled again while draining user_approval "
+                        "audit writes; they continue in the background"
+                    )
+                else:
+                    for result in results:
+                        if isinstance(result, BaseException):
+                            logger.warning(
+                                "Background user_approval audit write failed",
+                                exc_info=result,
+                            )
             # A cancelled token must stay observable: interrupted tool calls run
             # in worker threads that can outlive arun() and still poll it. A
             # fresh token is created on the next run().
@@ -2543,21 +2645,46 @@ class LocalConversation(BaseConversation):
                 self._cancel_token = None
             self._arun_task = None
 
+    def _apply_and_audit_confirmation_policy(
+        self, policy: ConfirmationPolicyBase
+    ) -> None:
+        """Canonicalize, apply and (if it actually changed anything) audit.
+
+        Shared by the constructor's initial-state application and the public
+        setter so both paths produce the same admin_audit coverage, and so a
+        resume/init call that re-applies an unchanged persisted value does not
+        write a spurious "admin changed this" record.
+        """
+        policy = apply_confirmation_policy_lock(policy)
+        with self._state:
+            # Read-compare-assign-audit all in one critical section. Reading
+            # `previous` outside the lock let two concurrent callers compare
+            # against the same stale value; writing the audit record outside
+            # the lock (even with the compare fixed) let two concurrent
+            # callers apply state changes in one order but land their audit
+            # writes in the other, since disk I/O scheduling doesn't have to
+            # match lock-acquisition order. This method is synchronous
+            # (unlike arun()'s equivalent), so holding the lock across the
+            # write is safe — no await happens inside it — and it's the only
+            # way to guarantee the JSONL's write order matches the real
+            # order these values actually took effect in.
+            changed = policy != self._state.confirmation_policy
+            self._state.confirmation_policy = policy
+            if changed:
+                record_admin_audit_event(
+                    conversation_id=str(self._state.id),
+                    field="confirmation_policy",
+                    value=repr(policy),
+                )
+        logger.info(f"Confirmation policy set to: {policy}")
+
     def set_confirmation_policy(self, policy: ConfirmationPolicyBase) -> None:
         """Set the confirmation policy and store it in conversation state.
 
         Applies the machine-level governance lock (roy_governance_lock.py)
         if one is configured, regardless of caller.
         """
-        policy = apply_confirmation_policy_lock(policy)
-        with self._state:
-            self._state.confirmation_policy = policy
-        logger.info(f"Confirmation policy set to: {policy}")
-        record_admin_audit_event(
-            conversation_id=str(self._state.id),
-            field="confirmation_policy",
-            value=repr(policy),
-        )
+        self._apply_and_audit_confirmation_policy(policy)
 
     def set_token_callbacks(
         self, token_callbacks: list[ConversationTokenCallbackType] | None
@@ -2581,12 +2708,24 @@ class LocalConversation(BaseConversation):
 
         This is a non-invasive method to reject actions between run() calls.
         Also clears the agent_waiting_for_confirmation flag.
-        """
-        pending_actions = ConversationState.get_unmatched_actions(
-            self._state.active_branch()
-        )
 
+        Records a user_approval audit event here (rather than relying on
+        callers like the agent server's confirmation endpoint) so any caller
+        — REST or a script driving this SDK object directly — is covered, and
+        so the recorded tool names always match what this method actually
+        processed under ``self._state``'s lock instead of a separately
+        snapshotted (and potentially stale) list.
+        """
         with self._state:
+            # Snapshotted under the lock (like _emit_orphaned_action_errors()
+            # below) rather than before it — a snapshot taken before acquiring
+            # the lock could be stale by the time it's acquired, letting a
+            # concurrent accept/reject race reject actions that already have
+            # an observation, or reject a different set than what's recorded.
+            pending_actions = ConversationState.get_unmatched_actions(
+                self._state.active_branch()
+            )
+
             # Always clear the agent_waiting_for_confirmation flag
             if (
                 self._state.execution_status
@@ -2615,6 +2754,14 @@ class LocalConversation(BaseConversation):
                 )
                 self._on_event(rejection_event)
                 logger.info(f"Rejected pending action: {action_event} - {reason}")
+
+        record_user_approval_event(
+            conversation_id=str(self._state.id),
+            accepted=False,
+            reason=reason,
+            tool_names=[a.tool_name for a in pending_actions],
+            tool_call_ids=[a.tool_call_id for a in pending_actions],
+        )
 
     def _emit_orphaned_action_errors(self) -> None:
         """Emit ``AgentErrorEvent`` for actions that have no observation.
@@ -2725,22 +2872,37 @@ class LocalConversation(BaseConversation):
         secret_registry.update_secrets(secrets)
         logger.info(f"Added {len(secrets)} secrets to conversation")
 
+    def _apply_and_audit_security_analyzer(
+        self, analyzer: SecurityAnalyzerBase | None
+    ) -> None:
+        """Canonicalize, apply and (if it actually changed anything) audit.
+
+        Shared by the constructor's initial-state application and the public
+        setter — see ``_apply_and_audit_confirmation_policy`` for why.
+        """
+        analyzer = apply_security_analyzer_lock(
+            analyzer, workspace_root=self.workspace.working_dir
+        )
+        with self._state:
+            # See _apply_and_audit_confirmation_policy for why the compare,
+            # assignment, and audit write all happen inside the same
+            # critical section rather than the write happening after it.
+            changed = analyzer != self._state.security_analyzer
+            self._state.security_analyzer = analyzer
+            if changed:
+                record_admin_audit_event(
+                    conversation_id=str(self._state.id),
+                    field="security_analyzer",
+                    value=repr(analyzer),
+                )
+
     def set_security_analyzer(self, analyzer: SecurityAnalyzerBase | None) -> None:
         """Set the security analyzer for the conversation.
 
         Applies the machine-level governance lock (roy_governance_lock.py)
         if one is configured, regardless of caller.
         """
-        analyzer = apply_security_analyzer_lock(
-            analyzer, workspace_root=self.workspace.working_dir
-        )
-        with self._state:
-            self._state.security_analyzer = analyzer
-        record_admin_audit_event(
-            conversation_id=str(self._state.id),
-            field="security_analyzer",
-            value=repr(analyzer),
-        )
+        self._apply_and_audit_security_analyzer(analyzer)
 
     def close(self) -> None:
         """Close the conversation and clean up all tool executors."""
