@@ -24,6 +24,8 @@ from openhands.sdk.event.llm_convertible import MessageEvent, SystemPromptEvent
 from openhands.sdk.llm import LLM, Message, TextContent
 from openhands.sdk.skills import KeywordTrigger, Skill
 
+from ..conftest import non_governance_audit_events
+
 
 class SendMessageDummyAgent(AgentBase):
     def __init__(self, agent_context: AgentContext | None = None):
@@ -63,7 +65,7 @@ def test_send_message_with_string_creates_correct_message():
     conversation.send_message(test_text)
 
     # Should have system prompt + user message
-    assert len(conversation.state.events) == 2
+    assert len(non_governance_audit_events(conversation.state.events)) == 2
 
     # Check the user message event
     user_event = conversation.state.events[-1]
@@ -123,7 +125,7 @@ def test_send_message_with_empty_string():
     conversation.send_message("")
 
     # Should have system prompt + user message
-    assert len(conversation.state.events) == 2
+    assert len(non_governance_audit_events(conversation.state.events)) == 2
 
     user_event = conversation.state.events[-1]
     assert isinstance(user_event, MessageEvent)
@@ -140,7 +142,7 @@ def test_send_message_with_multiline_string():
     conversation.send_message(test_text)
 
     # Should have system prompt + user message
-    assert len(conversation.state.events) == 2
+    assert len(non_governance_audit_events(conversation.state.events)) == 2
 
     user_event = conversation.state.events[-1]
     assert isinstance(user_event, MessageEvent)
@@ -158,7 +160,7 @@ def test_send_message_with_message_object():
     conversation.send_message(message)
 
     # Should have system prompt + user message
-    assert len(conversation.state.events) == 2
+    assert len(non_governance_audit_events(conversation.state.events)) == 2
 
     user_event = conversation.state.events[-1]
     assert isinstance(user_event, MessageEvent)
@@ -208,7 +210,11 @@ def test_acp_send_message_defers_initialization_until_run(tmp_path):
         assert (
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
-        assert conversation.state.events[-1] == user_event
+        # run() triggers agent-ready init, which now always fires the
+        # governance SessionStart audit hook — that appends a
+        # HookExecutionEvent after user_event, so user_event is no longer
+        # literally the last event, just the last non-infrastructure one.
+        assert non_governance_audit_events(conversation.state.events)[-1] == user_event
 
 
 @pytest.mark.asyncio
@@ -528,6 +534,17 @@ async def test_acp_arun_sends_stop_hook_feedback_to_acp(tmp_path):
     hook = MagicMock()
     hook.run_stop.side_effect = [(False, "please continue"), (True, None)]
     conversation._hook_processor = hook
+    # arun() itself calls _ensure_agent_ready() again; since the
+    # governance-mandated audit hook means hook_config is never empty, that
+    # would otherwise rebuild _hook_processor from scratch (see
+    # _ensure_plugins_loaded()) and silently discard the mock assigned
+    # above before this loop runs. Marking ready directly (matching the
+    # established pattern in test_acp_arun_rechecks_messages_before_finishing
+    # below) expresses the actual precondition — this test starts from an
+    # already-initialized conversation and is only exercising the run loop
+    # — without also skipping plugin loading/agent init for a reason that
+    # has nothing to do with what's being tested here.
+    conversation._agent_ready = True
     prompts_seen: list[str] = []
 
     def user_text(event: MessageEvent | None) -> str:

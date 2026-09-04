@@ -26,6 +26,8 @@ from openhands.sdk.llm.llm_registry import RegistryEvent
 from openhands.sdk.security.confirmation_policy import AlwaysConfirm
 from openhands.sdk.workspace import LocalWorkspace
 
+from ..conftest import non_governance_audit_events
+
 
 class _DifferentAgentForVerifyTest(AgentBase):
     """A different agent class used to test Agent.verify() rejects class mismatches.
@@ -372,8 +374,9 @@ def test_conversation_state_empty_filestore():
         # Agent initialization is lazy - trigger it to emit SystemPromptEvent
         conversation._ensure_agent_ready()
 
-        assert len(conversation._state.events) == 1  # System prompt event
-        assert isinstance(conversation._state.events[0], SystemPromptEvent)
+        events = non_governance_audit_events(conversation._state.events)
+        assert len(events) == 1  # System prompt event
+        assert isinstance(events[0], SystemPromptEvent)
 
 
 def test_conversation_state_missing_base_state():

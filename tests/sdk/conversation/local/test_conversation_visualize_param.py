@@ -22,6 +22,21 @@ def create_test_event(content: str = "Test event content") -> MessageEvent:
     )
 
 
+def assert_stamped_event_matches(actual: MessageEvent, expected: MessageEvent) -> None:
+    """Compare an event a callback actually received against the one passed
+    to on_event(), tolerating only the one field the callback chain is
+    expected to change.
+
+    The composed callback tree-stamps parent_id onto events before
+    callbacks see them (pointing at the governance SessionStart audit
+    hook's own event, since it's no longer the first event once that hook
+    has fired) — so the object a callback receives is a stamped copy, not
+    the original. Normalizing just that field keeps this able to catch any
+    other unintended mutation (content, source, timestamp, ...).
+    """
+    assert actual.model_copy(update={"parent_id": expected.parent_id}) == expected
+
+
 @pytest.fixture
 def mock_agent():
     """Create a real agent for testing."""
@@ -102,15 +117,28 @@ def test_conversation_with_custom_callbacks_and_default_visualizer(mock_agent):
         args, kwargs = mock_init_state.call_args
         on_event = kwargs["on_event"]
 
+        # _ensure_agent_ready() already ran the governance SessionStart audit
+        # hook through this same callback chain once (see roy_audit_hooks.py)
+        # — reset so the assertions below observe only the event triggered
+        # explicitly next.
+        custom_callback.reset_mock()
+
         # Create a test event
         test_event = create_test_event("Test event content")
         on_event(test_event)
 
-        # Custom callback should have been called
-        custom_callback.assert_called_once_with(test_event)
+        # Custom callback should have been called. Not
+        # assert_called_once_with(test_event) — see assert_stamped_event_
+        # matches()'s docstring for why the object that actually reaches
+        # custom_callback is a stamped copy, not test_event itself.
+        custom_callback.assert_called_once()
+        assert_stamped_event_matches(custom_callback.call_args.args[0], test_event)
 
         # Event should be in conversation state
-        assert test_event in conversation.state.events
+        stored_event = next(
+            e for e in conversation.state.events if e.id == test_event.id
+        )
+        assert_stamped_event_matches(stored_event, test_event)
 
 
 def test_conversation_with_custom_callbacks_and_visualize_false(mock_agent):
@@ -134,15 +162,26 @@ def test_conversation_with_custom_callbacks_and_visualize_false(mock_agent):
         args, kwargs = mock_init_state.call_args
         on_event = kwargs["on_event"]
 
+        # _ensure_agent_ready() already ran the governance SessionStart audit
+        # hook through this same callback chain once — reset so the
+        # assertions below observe only the event triggered explicitly next.
+        custom_callback.reset_mock()
+
         # Create a test event and trigger it
         test_event = create_test_event("Test event content")
         on_event(test_event)
 
-        # Custom callback should have been called
-        custom_callback.assert_called_once_with(test_event)
+        # Custom callback should have been called. Not
+        # assert_called_once_with(test_event) — see assert_stamped_event_
+        # matches()'s docstring for why.
+        custom_callback.assert_called_once()
+        assert_stamped_event_matches(custom_callback.call_args.args[0], test_event)
 
         # Event should be in conversation state
-        assert test_event in conversation.state.events
+        stored_event = next(
+            e for e in conversation.state.events if e.id == test_event.id
+        )
+        assert_stamped_event_matches(stored_event, test_event)
 
 
 def test_conversation_callback_order(mock_agent):
@@ -176,6 +215,11 @@ def test_conversation_callback_order(mock_agent):
         mock_init_state.assert_called_once()
         args, kwargs = mock_init_state.call_args
         on_event = kwargs["on_event"]
+
+        # _ensure_agent_ready() already ran the governance SessionStart audit
+        # hook through this same callback chain once — clear so the
+        # assertion below observes only the event triggered explicitly next.
+        call_order.clear()
 
         # Trigger an event
         test_event = create_test_event("Test event content")
@@ -289,16 +333,31 @@ def test_conversation_with_custom_visualizer_and_callbacks(mock_agent):
         args, kwargs = mock_init_state.call_args
         on_event = kwargs["on_event"]
 
+        # _ensure_agent_ready() already ran the governance SessionStart audit
+        # hook through this same callback chain once — reset so the
+        # assertions below observe only the event triggered explicitly next.
+        custom_visualizer.on_event.reset_mock()
+        custom_callback.reset_mock()
+
         # Create a test event and trigger it
         test_event = create_test_event("Test event content")
         on_event(test_event)
 
-        # Both custom visualizer and custom callback should have been called
-        custom_visualizer.on_event.assert_called_once_with(test_event)
-        custom_callback.assert_called_once_with(test_event)
+        # Both custom visualizer and custom callback should have been
+        # called. Not assert_called_once_with(test_event) — see
+        # assert_stamped_event_matches()'s docstring for why.
+        custom_visualizer.on_event.assert_called_once()
+        assert_stamped_event_matches(
+            custom_visualizer.on_event.call_args.args[0], test_event
+        )
+        custom_callback.assert_called_once()
+        assert_stamped_event_matches(custom_callback.call_args.args[0], test_event)
 
         # Event should be in conversation state
-        assert test_event in conversation.state.events
+        stored_event = next(
+            e for e in conversation.state.events if e.id == test_event.id
+        )
+        assert_stamped_event_matches(stored_event, test_event)
 
 
 def test_conversation_with_visualize_none(mock_agent):

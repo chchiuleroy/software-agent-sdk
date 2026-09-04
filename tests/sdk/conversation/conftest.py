@@ -2,6 +2,32 @@
 
 from unittest.mock import Mock
 
+from openhands.sdk.event import HookExecutionEvent
+from openhands.sdk.security.roy_audit_hooks import _WRITER_SCRIPT_PATH
+
+
+def non_governance_audit_events(events):
+    """Filter out the governance-mandated SessionStart audit hook's
+    HookExecutionEvent (see roy_audit_hooks.py, which fires that hook on
+    every conversation) from a conversation's event list.
+
+    Deliberately narrower than "every HookExecutionEvent": matches on the
+    writer script path embedded in this specific hook's command, so a
+    test's own PreToolUse/Stop/custom-SessionStart hook still shows up and
+    can be asserted on normally — only this one infrastructure event, which
+    predates most tests' own scenarios, gets filtered out. Not airtight: a
+    test that deliberately crafts a hook command containing this same path
+    as a substring (e.g. to test path-argument handling) would also get
+    filtered — not a concern for anything in this test suite today.
+    """
+    return [
+        e
+        for e in events
+        if not (
+            isinstance(e, HookExecutionEvent) and _WRITER_SCRIPT_PATH in e.hook_command
+        )
+    ]
+
 
 def create_mock_http_client(conversation_id: str | None = None):
     """Create a comprehensive mock HTTP client for RemoteConversation.

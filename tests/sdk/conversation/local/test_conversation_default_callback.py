@@ -10,6 +10,8 @@ from openhands.sdk.conversation.types import (
 from openhands.sdk.event.llm_convertible import MessageEvent, SystemPromptEvent
 from openhands.sdk.llm import LLM, Message, TextContent
 
+from ..conftest import non_governance_audit_events
+
 
 class ConversationDefaultCallbackDummyAgent(AgentBase):
     def __init__(self):
@@ -51,9 +53,10 @@ def test_default_callback_appends_on_init():
     # Agent initialization is lazy - trigger it to generate SystemPromptEvent
     conversation._ensure_agent_ready()
 
-    assert len(conversation.state.events) == 1
-    assert isinstance(conversation.state.events[0], SystemPromptEvent)
-    assert conversation.state.events[0].id in events_seen
+    events = non_governance_audit_events(conversation.state.events)
+    assert len(events) == 1
+    assert isinstance(events[0], SystemPromptEvent)
+    assert events[0].id in events_seen
 
 
 def test_send_message_appends_once():
@@ -68,7 +71,7 @@ def test_send_message_appends_once():
     conversation.send_message(Message(role="user", content=[TextContent(text="hi")]))
 
     # Now we should have two events: initial system prompt and the user message
-    assert len(conversation.state.events) == 2
+    assert len(non_governance_audit_events(conversation.state.events)) == 2
     assert isinstance(conversation.state.events[-1], MessageEvent)
 
     # Ensure the user message event is appended exactly once in state
