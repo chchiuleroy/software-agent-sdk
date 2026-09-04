@@ -400,6 +400,17 @@ class ConfirmationResponseRequest(BaseModel):
 
     accept: bool
     reason: str = "User rejected the action."
+    approver_identity: str | None = None
+    """Identity of the caller responding to this confirmation, if known.
+
+    Optional and ``None`` by default — Agent Canvas's GUI has no identity
+    input and never sends this field, so existing behavior is unaffected.
+    When provided on an ``accept=True`` request, it is compared against the
+    conversation's ``ROY_GOVERNANCE_IDENTITY`` requester identity (see
+    ``openhands.sdk.security.roy_self_approval``); a match responds with a
+    ``403`` (``SelfApprovalDeniedError``, mapped in ``api.py``) instead of
+    executing the pending action.
+    """
 
 
 class Success(BaseModel):

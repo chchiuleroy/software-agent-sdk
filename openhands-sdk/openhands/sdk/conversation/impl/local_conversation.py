@@ -102,6 +102,11 @@ from openhands.sdk.security.roy_governance_lock import (
     apply_confirmation_policy_lock,
     apply_security_analyzer_lock,
 )
+from openhands.sdk.security.roy_self_approval import (
+    SelfApprovalDeniedError,
+    check_not_self_approval,
+    requester_identity_for_conversation,
+)
 from openhands.sdk.skills import (
     Skill,
     load_available_skills,
@@ -327,6 +332,12 @@ class LocalConversation(BaseConversation):
         # Governance-mandated hooks are merged in regardless of caller input;
         # combined with plugin hooks later in _ensure_plugins_loaded().
         self._pending_hook_config = build_governance_hook_config(hook_config)
+        # Identity-aware self-approval (roy_self_approval.py): None unless
+        # ROY_GOVERNANCE_IDENTITY is set on this machine/process, in which
+        # case it's re-read fresh on every construction (including resume) —
+        # same "always re-derive from current environment" semantics as the
+        # governance lock above, not a persisted ConversationState field.
+        self._requester_identity = requester_identity_for_conversation()
         self._agent_ready = False  # Agent initialized lazily after plugins loaded
         self._mcp_tool_provider = mcp_tool_provider or DefaultMCPToolProvider()
 
@@ -1909,7 +1920,7 @@ class LocalConversation(BaseConversation):
             self._step_holds_state_lock = held_flag
 
     @observe(name="conversation.run")
-    def run(self) -> None:
+    def run(self, approver_identity: str | None = None) -> None:
         """Runs the conversation until the agent finishes.
 
         In confirmation mode:
@@ -1920,12 +1931,43 @@ class LocalConversation(BaseConversation):
         - Creates and executes actions immediately
 
         Can be paused between steps
+
+        Args:
+            approver_identity: Identity of the caller accepting pending
+                actions, if known (see roy_self_approval.py). Only relevant
+                when this call is the "second call" above, transitioning out
+                of WAITING_FOR_CONFIRMATION; ignored otherwise. ``None``
+                (the default — today's GUI never sends this) skips the
+                self-approval check entirely (fail-open, same as an unset
+                ``ROY_GOVERNANCE_IDENTITY`` requester side).
         """
         # Ensure agent is fully initialized (loads plugins and initializes agent)
         self._ensure_agent_ready()
         self._cancel_token = CancellationToken()
 
         with self._state:
+            # Checked here, before the main loop's try/except below, so a
+            # blocked self-approval raises straight out of run() instead of
+            # being caught by that handler and turned into a generic ERROR
+            # status — the conversation must stay WAITING_FOR_CONFIRMATION,
+            # not fall over.
+            if (
+                self._state.execution_status
+                == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            ):
+                try:
+                    check_not_self_approval(
+                        self._requester_identity, approver_identity
+                    )
+                except SelfApprovalDeniedError:
+                    # This check runs before the try/finally further below
+                    # that normally resets _cancel_token on every exit path
+                    # (review finding: a block here would otherwise leave a
+                    # stale token from the line above, even though nothing
+                    # was ever started) — reset it explicitly on this one
+                    # early-exit branch.
+                    self._cancel_token = None
+                    raise
             if self._state.execution_status in [
                 ConversationExecutionStatus.IDLE,
                 ConversationExecutionStatus.PAUSED,
@@ -2005,6 +2047,8 @@ class LocalConversation(BaseConversation):
                             reason=None,
                             tool_names=[a.tool_name for a in approved_actions],
                             tool_call_ids=[a.tool_call_id for a in approved_actions],
+                            requester_identity=self._requester_identity,
+                            approver_identity=approver_identity,
                         )
 
                     # Mark the step as holding the state lock so state-mutating
@@ -2095,7 +2139,7 @@ class LocalConversation(BaseConversation):
             self._cancel_token = None
 
     @observe(name="conversation.arun")
-    async def arun(self) -> None:
+    async def arun(self, approver_identity: str | None = None) -> None:
         """Async variant of :meth:`run`.
 
         Uses ``agent.astep()`` for non-blocking LLM I/O while keeping the
@@ -2112,6 +2156,10 @@ class LocalConversation(BaseConversation):
         ``CancelledError`` any ``ActionEvent`` without a matching
         observation is patched with a synthetic ``AgentErrorEvent`` so
         the LLM conversation history stays consistent.
+
+        Args:
+            approver_identity: See :meth:`run` — same self-approval check,
+                same fail-open default.
         """
         self._arun_task = asyncio.current_task()
         self._cancel_token = CancellationToken()
@@ -2125,6 +2173,27 @@ class LocalConversation(BaseConversation):
         await asyncio.to_thread(self._ensure_agent_ready)
 
         with self._state:
+            # See the equivalent check in run(): must happen before the main
+            # loop's try/except further below so a blocked self-approval
+            # raises straight out of arun() instead of being turned into a
+            # generic ERROR status.
+            if (
+                self._state.execution_status
+                == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            ):
+                try:
+                    check_not_self_approval(
+                        self._requester_identity, approver_identity
+                    )
+                except SelfApprovalDeniedError:
+                    # See the equivalent comment in run(): this runs before
+                    # the try/finally further below that normally resets
+                    # both of these on every exit path, so a block here
+                    # would otherwise leave them stale even though nothing
+                    # was ever started.
+                    self._cancel_token = None
+                    self._arun_task = None
+                    raise
             if isinstance(self.agent, ACPAgent) and self._state.execution_status in (
                 ConversationExecutionStatus.FINISHED,
                 ConversationExecutionStatus.IDLE,
@@ -2243,6 +2312,8 @@ class LocalConversation(BaseConversation):
                                     tool_call_ids=[
                                         a.tool_call_id for a in approved_actions
                                     ],
+                                    requester_identity=self._requester_identity,
+                                    approver_identity=approver_identity,
                                 ),
                             )
                         )
@@ -2703,7 +2774,11 @@ class LocalConversation(BaseConversation):
             else None
         )
 
-    def reject_pending_actions(self, reason: str = "User rejected the action") -> None:
+    def reject_pending_actions(
+        self,
+        reason: str = "User rejected the action",
+        approver_identity: str | None = None,
+    ) -> None:
         """Reject all pending actions from the agent.
 
         This is a non-invasive method to reject actions between run() calls.
@@ -2715,6 +2790,11 @@ class LocalConversation(BaseConversation):
         so the recorded tool names always match what this method actually
         processed under ``self._state``'s lock instead of a separately
         snapshotted (and potentially stale) list.
+
+        ``approver_identity`` is recorded for audit purposes only — unlike
+        :meth:`run`/:meth:`arun`, rejecting your own pending action isn't a
+        privilege escalation, so it is never blocked by
+        ``roy_self_approval.check_not_self_approval``.
         """
         with self._state:
             # Snapshotted under the lock (like _emit_orphaned_action_errors()
@@ -2761,6 +2841,8 @@ class LocalConversation(BaseConversation):
             reason=reason,
             tool_names=[a.tool_name for a in pending_actions],
             tool_call_ids=[a.tool_call_id for a in pending_actions],
+            requester_identity=self._requester_identity,
+            approver_identity=approver_identity,
         )
 
     def _emit_orphaned_action_errors(self) -> None:

@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -75,6 +76,7 @@ from openhands.sdk.llm.streaming import LLMStreamChunk
 from openhands.sdk.mcp.utils import MCPToolProvider
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
+from openhands.sdk.security.roy_self_approval import check_not_self_approval
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.utils.files import atomic_write_text
@@ -1185,7 +1187,11 @@ class EventService:
         # Publish initial state update
         await self._publish_state_update()
 
-    async def run(self, acp_internal_rerun_generation: int | None = None):
+    async def run(
+        self,
+        acp_internal_rerun_generation: int | None = None,
+        approver_identity: str | None = None,
+    ):
         """Run the conversation asynchronously in the background.
 
         This method starts the conversation run in a background task and returns
@@ -1196,8 +1202,32 @@ class EventService:
         ``astep()`` override), the synchronous ``run()`` is executed
         in the thread pool as before.
 
+        Args:
+            approver_identity: Forwarded to the conversation's own
+                ``run()``/``arun()`` (see ``roy_self_approval.py``). Checked
+                here too, synchronously, before scheduling the background
+                task — a block raised from *inside* that task would only
+                surface as a generic ERROR status + error event (see the
+                task's own backstop ``except Exception`` below), not as an
+                exception on this call, so the REST caller would never see
+                it as the specific rejection it is. Checking twice is
+                intentional: this call protects the REST-facing path (whose
+                ``SelfApprovalDeniedError`` a dedicated FastAPI handler in
+                ``api.py`` maps to a clean 403), the check inside
+                ``run()``/``arun()`` itself protects any caller that drives a
+                ``LocalConversation`` directly. There remains a narrow TOCTOU
+                window between this check and the background task actually
+                reaching ``LocalConversation``'s own check — see
+                ``roy_self_approval.py``'s known limitations for why that's
+                not fully closed yet (the block itself is never bypassed
+                either way; only which of the two call sites ends up raising
+                it, and thus whether the REST caller sees the clean 403 or a
+                generic ERROR status, is affected).
+
         Raises:
-            ValueError: If the service is inactive or conversation is already running.
+            ValueError: If the service is inactive, conversation is already
+                running, or ``approver_identity`` matches the conversation's
+                requester identity while a confirmation is pending.
         """
         if not self._conversation or self._closing:
             raise ValueError("inactive_service")
@@ -1209,6 +1239,14 @@ class EventService:
                 == ConversationExecutionStatus.RUNNING
             ):
                 raise ValueError("conversation_already_running")
+            if (
+                await self._get_execution_status()
+                == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            ):
+                check_not_self_approval(
+                    getattr(self._conversation, "_requester_identity", None),
+                    approver_identity,
+                )
             if self._closing:
                 raise ValueError("inactive_service")
             if (
@@ -1251,8 +1289,29 @@ class EventService:
                         and type(conversation).arun is not BaseConversation.arun
                         and type(conversation.agent).astep is not AgentBase.astep
                     )
+                    # approver_identity is a LocalConversation-specific
+                    # extension (roy_self_approval.py), not part of
+                    # BaseConversation's abstract signature — only thread it
+                    # through when the caller actually supplied one, so a
+                    # bare run()/arun() call still dispatches exactly as
+                    # before against any conversation-like object that
+                    # doesn't know this kwarg exists (e.g. test doubles
+                    # exercising this dispatch logic in isolation).
                     if has_native_arun:
-                        await conversation.arun()
+                        if approver_identity is not None:
+                            await conversation.arun(
+                                approver_identity=approver_identity
+                            )
+                        else:
+                            await conversation.arun()
+                    elif approver_identity is not None:
+                        await loop.run_in_executor(
+                            self._run_executor,
+                            functools.partial(
+                                conversation.run,
+                                approver_identity=approver_identity,
+                            ),
+                        )
                     else:
                         await loop.run_in_executor(self._run_executor, conversation.run)
                 except Exception as exc:
@@ -1606,7 +1665,7 @@ class EventService:
         """
         if request.accept:
             try:
-                await self.run()
+                await self.run(approver_identity=request.approver_identity)
             except ValueError as e:
                 # Treat "already running" as a no-op success
                 if str(e) == "conversation_already_running":
@@ -1616,16 +1675,34 @@ class EventService:
                 else:
                     raise
         else:
-            await self.reject_pending_actions(request.reason)
+            await self.reject_pending_actions(
+                request.reason, approver_identity=request.approver_identity
+            )
 
-    async def reject_pending_actions(self, reason: str):
+    async def reject_pending_actions(
+        self, reason: str, approver_identity: str | None = None
+    ):
         """Reject all pending actions and publish updated state."""
         if not self._conversation:
             raise ValueError("inactive_service")
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, self._conversation.reject_pending_actions, reason
-        )
+        # See the equivalent comment in run(): only thread approver_identity
+        # through when supplied, so a plain reject_pending_actions(reason)
+        # call still dispatches exactly as before against any
+        # conversation-like object that predates this kwarg.
+        if approver_identity is not None:
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._conversation.reject_pending_actions,
+                    reason,
+                    approver_identity=approver_identity,
+                ),
+            )
+        else:
+            await loop.run_in_executor(
+                None, self._conversation.reject_pending_actions, reason
+            )
 
     async def pause(self):
         if self._conversation:

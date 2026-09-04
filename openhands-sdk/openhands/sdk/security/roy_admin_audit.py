@@ -34,11 +34,16 @@ event loop(見下方已知限制第 3 點)。
 涵蓋)以外的簽章鏈,單純是分檔記錄,不做任何加密/簽章保證。
 
 已知限制:
-1. 目前系統沒有 per-request 呼叫端身份驗證機制(identity-aware
-   self-approval 仍是待完成的前置工作),``user_approval`` 記錄不到「誰」
-   核准,只能記錄「哪個對話」在「什麼時候」被某個呼叫端以 accept/reject
-   路徑核准/拒絕了「哪些動作」——SDK 直接呼叫跟 REST 使用者操作、真人核准
-   跟程式化/自動 resume,目前都無法區分。
+1. ``roy_self_approval.py`` 補上了 requester/approver 兩個身份欄位,但仍
+   是 opt-in、非完整的多人身份驗證:requester 是行程層級的
+   ``ROY_GOVERNANCE_IDENTITY`` 環境變數(整個 agent-server 行程共用同一個
+   值,不是每個對話各自登入),approver 要呼叫端顯式提供才有值(今天的
+   Agent Canvas GUI 沒有身份輸入介面,永遠不會帶這個欄位)。兩者任一為
+   ``None`` 時,``user_approval`` 記錄不到「誰」核准,只記錄「哪個對話」
+   在「什麼時候」被以 accept/reject 路徑核准/拒絕了「哪些動作」——SDK
+   直接呼叫跟 REST 使用者操作、真人核准跟程式化/自動 resume,沒有兩個
+   身份都明確提供時仍無法區分。真正的多人登入/RBAC 仍是待完成項(見 wiki
+   同節第 4 項)。
 2. 這套 audit 涵蓋的是 constructor 與兩個公開 setter/兩個核准決策入口本身,
    不是 ``ConversationState`` 的完整 mutation audit:直接改
    ``conversation.state.confirmation_policy``/``security_analyzer``、原地
@@ -142,12 +147,19 @@ def record_user_approval_event(
     reason: str | None,
     tool_names: list[str],
     tool_call_ids: list[str],
+    requester_identity: str | None = None,
+    approver_identity: str | None = None,
 ) -> None:
     """記錄一次核准/拒絕決策:哪個對話核准或拒絕了哪些待處理動作。
 
     ``tool_call_ids`` alongside ``tool_names`` so a record can be matched back
     to a specific action even when multiple pending actions share the same
     tool name.
+
+    ``requester_identity``/``approver_identity`` 是 ``roy_self_approval.py``
+    的欄位,兩者預設皆為 ``None``(未設定 ``ROY_GOVERNANCE_IDENTITY``、或呼叫
+    端沒帶 approver 身份時的既有行為)——見本檔模組 docstring 已知限制第 1
+    點:只有兩者都非 ``None`` 才代表這筆記錄真的知道「誰」核准了。
     """
     _write_record(
         "user_approval",
@@ -158,5 +170,7 @@ def record_user_approval_event(
             "reason": reason,
             "tool_names": tool_names,
             "tool_call_ids": tool_call_ids,
+            "requester_identity": requester_identity,
+            "approver_identity": approver_identity,
         },
     )

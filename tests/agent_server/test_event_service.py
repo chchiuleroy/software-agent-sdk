@@ -1473,7 +1473,9 @@ class TestEventServiceRespondToConfirmation:
 
         await event_service.respond_to_confirmation(request)
 
-        event_service.run.assert_awaited_once_with()
+        # approver_identity is threaded through even when the request didn't
+        # set one (None) — see roy_self_approval.py.
+        event_service.run.assert_awaited_once_with(approver_identity=None)
         event_service.reject_pending_actions.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1488,8 +1490,85 @@ class TestEventServiceRespondToConfirmation:
 
         await event_service.respond_to_confirmation(request)
 
-        event_service.reject_pending_actions.assert_awaited_once_with(reason)
+        event_service.reject_pending_actions.assert_awaited_once_with(
+            reason, approver_identity=None
+        )
         event_service.run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_self_approval_before_scheduling_background_task(
+        self, event_service
+    ):
+        """A blocked self-approval must raise synchronously from run() itself
+        — not from inside the background task it schedules. Anything raised
+        from *inside* that task is caught by its own backstop (see
+        test_run_exception_forces_error_status) and turned into a generic
+        ERROR status + error event instead of propagating to the REST
+        caller, which would silently swallow this specific rejection. This
+        is why EventService.run() checks eagerly rather than relying on the
+        equivalent check already inside LocalConversation.run()/arun()."""
+        conversation = MagicMock()
+        state = MagicMock()
+        state.execution_status = ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        state.__enter__ = MagicMock(return_value=state)
+        state.__exit__ = MagicMock(return_value=None)
+        conversation.state = state
+        conversation._state = state
+        conversation._requester_identity = "roy"
+        conversation.run = MagicMock()
+        conversation.arun = AsyncMock()
+
+        event_service._conversation = conversation
+
+        with pytest.raises(ValueError, match="self-approval not allowed"):
+            await event_service.run(approver_identity="roy")
+
+        assert event_service._run_task is None
+        conversation.run.assert_not_called()
+        conversation.arun.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_allows_different_approver_identity_via_event_service(
+        self, event_service
+    ):
+        conversation = MagicMock()
+        state = MagicMock()
+        state.execution_status = ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        state.__enter__ = MagicMock(return_value=state)
+        state.__exit__ = MagicMock(return_value=None)
+        conversation.state = state
+        conversation._state = state
+        conversation._requester_identity = "roy"
+        conversation.run = MagicMock()
+
+        event_service._conversation = conversation
+        event_service._publish_state_update = AsyncMock()
+
+        await event_service.run(approver_identity="test-approver")
+        assert event_service._run_task is not None
+        await event_service._run_task
+
+        conversation.run.assert_called_once_with(approver_identity="test-approver")
+
+    @pytest.mark.asyncio
+    async def test_respond_to_confirmation_propagates_self_approval_block(
+        self, event_service
+    ):
+        """The REST-facing entry point must not swallow a blocked
+        self-approval the way it swallows "conversation_already_running" —
+        the caller needs to see this was refused, not silently no-op'd."""
+        event_service._conversation = MagicMock()
+        event_service.run = AsyncMock(
+            side_effect=ValueError(
+                "self-approval not allowed: requester and approver are the "
+                "same identity ('roy')"
+            )
+        )
+
+        request = ConfirmationResponseRequest(accept=True, approver_identity="roy")
+
+        with pytest.raises(ValueError, match="self-approval not allowed"):
+            await event_service.respond_to_confirmation(request)
 
     # The user_approval audit record itself is no longer written here — see
     # LocalConversation.run()/arun()/reject_pending_actions() and
@@ -1520,9 +1599,40 @@ class TestEventServiceRespondToConfirmation:
 
             await event_service.reject_pending_actions("custom reason")
 
+            # No approver_identity supplied — dispatched exactly as before
+            # (bare method reference, no functools.partial wrapping) so any
+            # conversation-like object that predates this kwarg still works.
             mock_loop.run_in_executor.assert_called_once_with(
                 None, conversation.reject_pending_actions, "custom reason"
             )
+
+    @pytest.mark.asyncio
+    async def test_reject_pending_actions_forwards_approver_identity(
+        self, event_service
+    ):
+        """approver_identity passed to EventService.reject_pending_actions()
+        must reach LocalConversation.reject_pending_actions() — this is what
+        lets the audit record capture who rejected, and is recorded (never
+        blocked, unlike accept — see roy_self_approval.py) even when it
+        matches the requester identity."""
+        conversation = MagicMock()
+        conversation.reject_pending_actions = MagicMock()
+        event_service._conversation = conversation
+
+        async def _mock_executor(*_args, **_kwargs):
+            return None
+
+        with patch("asyncio.get_running_loop") as mock_get_loop:
+            mock_loop = MagicMock()
+            mock_get_loop.return_value = mock_loop
+            mock_loop.run_in_executor.return_value = _mock_executor()
+
+            await event_service.reject_pending_actions(
+                "custom reason", approver_identity="roy"
+            )
+
+            _executor_arg, dispatched = mock_loop.run_in_executor.call_args.args
+            assert dispatched.keywords == {"approver_identity": "roy"}
 
 
 class TestEventServiceIsOpen:

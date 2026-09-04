@@ -93,6 +93,7 @@ from openhands.agent_server.vscode_service import get_vscode_service
 from openhands.agent_server.workspace_router import workspace_router
 from openhands.agent_server.workspaces_router import workspaces_router
 from openhands.sdk.logger import DEBUG, get_logger
+from openhands.sdk.security.roy_self_approval import SelfApprovalDeniedError
 from openhands.sdk.utils.redact import sanitize_dict
 from openhands.tools.terminal.constants import TMUX_SOCKET_NAME
 
@@ -531,6 +532,21 @@ def _add_exception_handlers(api: FastAPI) -> None:
                 "detail": str(exc),
                 "retryable": True,
             },
+        )
+
+    @api.exception_handler(SelfApprovalDeniedError)
+    async def _self_approval_denied_handler(
+        _request: Request,
+        exc: SelfApprovalDeniedError,
+    ) -> JSONResponse:
+        """A blocked self-approval is an expected authorization outcome, not
+        a server fault — map it to 403 with a stable, machine-checkable
+        error_code instead of falling through to the generic 500 every
+        other unhandled ValueError gets (see roy_self_approval.py's known
+        limitations for the residual TOCTOU window this doesn't close)."""
+        return JSONResponse(
+            status_code=403,
+            content={"detail": str(exc), "error_code": "self_approval_denied"},
         )
 
     @api.exception_handler(RequestValidationError)

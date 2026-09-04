@@ -632,3 +632,41 @@ class TestHttpExceptionLogging:
         info_records = [r for r in api_records if r.levelno == logging.INFO]
         assert info_records, "Expected an INFO log line for a 4xx HTTPException"
         assert all(r.exc_info is None for r in info_records)
+
+
+class TestSelfApprovalDeniedHandler:
+    """A blocked self-approval (roy_self_approval.SelfApprovalDeniedError)
+    must reach an HTTP caller as a clean 403, not the generic 500 every
+    other unhandled ValueError falls through to — see the review finding
+    this closes: event_router.respond_to_confirmation() lets the exception
+    propagate, and without a dedicated handler api.py's catch-all
+    Exception handler would treat it as an opaque server fault.
+
+    Exercised through a real ASGI request (TestClient), not by calling the
+    handler function directly, so this also proves FastAPI actually
+    dispatches SelfApprovalDeniedError to this handler ahead of the
+    generic one.
+    """
+
+    def test_self_approval_denied_maps_to_403(self):
+        from openhands.sdk.security.roy_self_approval import (
+            SelfApprovalDeniedError,
+        )
+
+        config = Config(static_files_path=None)
+        app = create_app(config)
+
+        @app.get("/__test__/raise_self_approval_denied")
+        def _raise():
+            raise SelfApprovalDeniedError(
+                "self-approval not allowed: requester and approver are the "
+                "same identity ('roy')"
+            )
+
+        client = TestClient(app)
+        response = client.get("/__test__/raise_self_approval_denied")
+
+        assert response.status_code == 403
+        body = response.json()
+        assert body["error_code"] == "self_approval_denied"
+        assert "self-approval not allowed" in body["detail"]

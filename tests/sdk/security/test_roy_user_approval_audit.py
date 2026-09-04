@@ -11,6 +11,7 @@ test_roy_admin_audit.py.
 import asyncio
 import json
 
+import pytest
 from litellm import ChatCompletionMessageToolCall
 from litellm.types.utils import Function
 from pydantic import SecretStr
@@ -298,3 +299,154 @@ def test_arun_cancel_during_audit_drain_does_not_lose_queued_write(
     records = _read_user_approval_records(audit_dir)
     assert len(records) == 1
     assert records[0]["accepted"] is True
+
+
+def test_run_self_approval_blocked_when_requester_equals_approver(
+    monkeypatch, tmp_path
+):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("ROY_GOVERNANCE_IDENTITY", "roy")
+    conversation = _conversation(tmp_path)
+    conversation._on_event(_pending_action_event())
+    with conversation.state:
+        conversation.state.execution_status = (
+            ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+
+    step_calls = []
+    monkeypatch.setattr(
+        type(conversation.agent), "step", lambda *a, **k: step_calls.append(1)
+    )
+
+    with pytest.raises(ValueError, match="self-approval not allowed"):
+        conversation.run(approver_identity="roy")
+
+    # Blocked before the transition: still waiting, agent never stepped, and
+    # no audit record — a blocked attempt is not a decision that happened.
+    assert (
+        conversation.state.execution_status
+        == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+    )
+    assert step_calls == []
+    assert _read_user_approval_records(audit_dir) == []
+    # Review finding: the check runs before the try/finally that normally
+    # resets _cancel_token — must not leave a stale token behind from a run
+    # that never actually started.
+    assert conversation._cancel_token is None
+
+
+def test_run_allows_when_approver_identity_differs_from_requester(
+    monkeypatch, tmp_path
+):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("ROY_GOVERNANCE_IDENTITY", "roy")
+    conversation = _conversation(tmp_path)
+    conversation._on_event(_pending_action_event())
+    with conversation.state:
+        conversation.state.execution_status = (
+            ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+
+    def _finish_step(*args, **kwargs):
+        with conversation.state:
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
+
+    monkeypatch.setattr(type(conversation.agent), "step", _finish_step)
+
+    conversation.run(approver_identity="test-approver")
+
+    records = _read_user_approval_records(audit_dir)
+    assert len(records) == 1
+    assert records[0]["accepted"] is True
+    assert records[0]["requester_identity"] == "roy"
+    assert records[0]["approver_identity"] == "test-approver"
+
+
+def test_run_accept_with_approver_identity_but_no_requester_set_is_unaffected(
+    monkeypatch, tmp_path
+):
+    # ROY_GOVERNANCE_IDENTITY intentionally left unset — today's default.
+    # Even a caller that happens to pass approver_identity must not be
+    # blocked, since there's no requester identity to compare it against.
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    conversation = _conversation(tmp_path)
+    conversation._on_event(_pending_action_event())
+    with conversation.state:
+        conversation.state.execution_status = (
+            ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+
+    def _finish_step(*args, **kwargs):
+        with conversation.state:
+            conversation.state.execution_status = ConversationExecutionStatus.FINISHED
+
+    monkeypatch.setattr(type(conversation.agent), "step", _finish_step)
+
+    conversation.run(approver_identity="roy")
+
+    records = _read_user_approval_records(audit_dir)
+    assert len(records) == 1
+    assert records[0]["accepted"] is True
+    assert records[0]["requester_identity"] is None
+    assert records[0]["approver_identity"] == "roy"
+
+
+def test_arun_self_approval_blocked_when_requester_equals_approver(
+    monkeypatch, tmp_path
+):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("ROY_GOVERNANCE_IDENTITY", "roy")
+    conversation = _conversation(tmp_path)
+    conversation._on_event(_pending_action_event())
+    with conversation.state:
+        conversation.state.execution_status = (
+            ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+
+    astep_calls = []
+
+    async def _track_astep(*args, **kwargs):
+        astep_calls.append(1)
+
+    monkeypatch.setattr(type(conversation.agent), "astep", _track_astep)
+
+    with pytest.raises(ValueError, match="self-approval not allowed"):
+        asyncio.run(conversation.arun(approver_identity="roy"))
+
+    assert (
+        conversation.state.execution_status
+        == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+    )
+    assert astep_calls == []
+    assert _read_user_approval_records(audit_dir) == []
+    # Review finding: same as the sync run() case, but arun() also sets
+    # _arun_task before this check runs — both must be reset, not just the
+    # cancel token, or interrupt()/diagnostics would see a stale in-flight
+    # task that never actually started.
+    assert conversation._cancel_token is None
+    assert conversation._arun_task is None
+
+
+def test_reject_pending_actions_records_identities_without_blocking_self_reject(
+    monkeypatch, tmp_path
+):
+    # Rejecting your own pending action isn't a privilege escalation, so
+    # reject_pending_actions() must never raise here even though
+    # requester == approver — unlike run()/arun() above.
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("ROY_GOVERNANCE_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("ROY_GOVERNANCE_IDENTITY", "roy")
+    conversation = _conversation(tmp_path)
+    conversation._on_event(_pending_action_event())
+
+    conversation.reject_pending_actions("looked risky", approver_identity="roy")
+
+    records = _read_user_approval_records(audit_dir)
+    assert len(records) == 1
+    assert records[0]["accepted"] is False
+    assert records[0]["requester_identity"] == "roy"
+    assert records[0]["approver_identity"] == "roy"
