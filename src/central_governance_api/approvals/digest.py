@@ -37,6 +37,28 @@ approvals/state_machine.py and approvals/authorize.py design decisions.
 A stronger version (the approver's own client independently attesting
 what it rendered, not just trusting what this API returned) is a possible
 future strengthening, not implemented here.
+
+Threat-model limitation confirmed by code review, stated explicitly here
+rather than left implicit: this digest is computed over the fields THIS
+SERVICE stores (display + execution-binding *metadata*), never over the
+canonical payload itself — so it cannot prove the canonical payload a
+requester's device ultimately executes is the same one an approver's
+decision was based on. It only protects against THIS SERVICE'S OWN
+records diverging from what was originally submitted (the round-10 bug:
+a digest not tied to what gets displayed). A compromised or buggy
+requester device could, in principle, show an approver an innocuous
+summary, get it accepted, and then execute a different canonical payload
+at claim/report-result time — this module has no way to detect that,
+because it never sees canonical payloads on either side of that gap. This
+is an acceptable gap ONLY under this project's actual Track 1 ("分散執
+行、集中治理") architecture, where the requester and the execution
+endpoint are the same principal's own device by construction — the
+central API isn't brokering trust between two different parties for
+execution, only for the human-approval step. If a future deployment ever
+lets a *different* device execute on a requester's behalf, this
+assumption breaks and the stronger two-commitment scheme mentioned above
+(a separate, requester-attested execution digest, verified by whichever
+device actually executes) would stop being optional.
 """
 
 from __future__ import annotations

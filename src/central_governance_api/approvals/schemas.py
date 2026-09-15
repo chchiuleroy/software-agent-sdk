@@ -10,10 +10,25 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class CreateApprovalRequest(BaseModel):
+class _RequestModel(BaseModel):
+    """Base for every request body in this module. ``extra="forbid"``
+    (code-review Medium): Pydantic's default silently *drops* unknown
+    fields rather than rejecting them — for ``ReportResultRequest``
+    specifically, a client that typos both ``execution_attempt_id`` and
+    ``outcome`` would have both real fields end up unset, which
+    ``_both_or_neither`` (below) reads as a legitimate pre-claim abort
+    instead of the malformed request it actually is. Applying this to
+    every request model rather than just that one so the same silent-
+    typo failure mode can't recur elsewhere.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CreateApprovalRequest(_RequestModel):
     """``request_id`` is client-generated (models.py: "client-generated
     before create, so the requester can compute its envelope digest before
     the record exists server-side") and doubles as this create endpoint's
@@ -50,7 +65,7 @@ class ApprovalSummary(BaseModel):
     action_payload_digest: str
 
 
-class DecideRequest(BaseModel):
+class DecideRequest(_RequestModel):
     decision: Literal["accept", "reject"]
 
 
@@ -73,7 +88,7 @@ class ClaimResponse(BaseModel):
     action_payload_digest: str
 
 
-class ReportResultRequest(BaseModel):
+class ReportResultRequest(_RequestModel):
     """Two shapes in one model (v10/v11: report-result splits into
     pre-claim abort vs. an execution result report specifically because
     a pre-claim abort has no attempt id to attach):
@@ -119,7 +134,7 @@ class CancelResponse(BaseModel):
     status: str
 
 
-class ReconciliationFindingRequest(BaseModel):
+class ReconciliationFindingRequest(_RequestModel):
     finding_type: Literal["requester_assertion", "admin_verified", "late_report"]
     conclusion: (
         Literal["confirmed_not_executed", "confirmed_executed", "inconclusive"] | None

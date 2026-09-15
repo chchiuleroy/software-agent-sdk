@@ -24,18 +24,23 @@ README's "部署前置條件" section.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from central_governance_api.approvals.digest import compute_display_digest
 from central_governance_api.auth.dependencies import get_oidc_resolver
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.db import get_db_session
 from central_governance_api.main import create_app
-from central_governance_api.models import IdempotencyRecord, PendingApprovalRecord
+from central_governance_api.models import (
+    AdminAuditEvent,
+    IdempotencyRecord,
+    PendingApprovalRecord,
+)
 
 from .conftest import ISSUER
 from .test_app_auth import _sign
@@ -451,3 +456,163 @@ async def test_idempotency_record_written_in_same_transaction_as_mutation(
     )
     assert idem_row is not None
     assert idem_row.response_snapshot["status"] == "accepted"
+
+
+# --- Deadline enforcement (code-review High findings) -----------------------
+#
+# These don't need true concurrency — directly back-dating a deadline via
+# db_session is data setup, not a race, and exercises the exact predicate
+# code review found missing in decide/report-result's conditional UPDATE.
+
+
+async def test_decide_after_expiry_is_rejected_not_silently_accepted(
+    client, signing_key, db_session
+):
+    created = await _create_approval(client, signing_key, sub="alice")
+    approval_id = uuid.UUID(created["id"])
+
+    await db_session.execute(
+        update(PendingApprovalRecord)
+        .where(PendingApprovalRecord.id == approval_id)
+        .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    await db_session.flush()
+
+    approver_token = _sign(signing_key, sub="carol", roles=["agent.approver"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/decide",
+        json={"decision": "accept"},
+        headers=_auth(approver_token, "decide-after-expiry"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "concurrent_modification"
+
+    row = await db_session.get(PendingApprovalRecord, approval_id)
+    assert row.status == "pending"  # unchanged — the decision never applied
+
+
+async def test_report_result_after_lease_expiry_is_rejected(
+    client, signing_key, db_session
+):
+    """A result that arrives after the execution lease has expired (but
+    before the not-yet-implemented step-3 sweep gets to it) must not be
+    allowed to land on a definite outcome — that would defeat the "crash
+    後無法確認就 fail closed" invariant the lease exists to enforce."""
+    created = await _create_approval(client, signing_key, sub="alice")
+    approval_id = created["id"]
+    approver_token = _sign(signing_key, sub="carol", roles=["agent.approver"])
+    await client.post(
+        f"/api/v1/approvals/{approval_id}/decide",
+        json={"decision": "accept"},
+        headers=_auth(approver_token, "decide-lease-test"),
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    claim = await client.post(
+        f"/api/v1/approvals/{approval_id}/claim",
+        headers=_auth(requester_token, "claim-lease-test"),
+    )
+    attempt_id = claim.json()["execution_attempt_id"]
+
+    await db_session.execute(
+        update(PendingApprovalRecord)
+        .where(PendingApprovalRecord.id == uuid.UUID(approval_id))
+        .values(executing_lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    await db_session.flush()
+
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/report-result",
+        json={"execution_attempt_id": attempt_id, "outcome": "success"},
+        headers=_auth(requester_token, "report-after-lease-expiry"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "concurrent_modification"
+
+    row = await db_session.get(PendingApprovalRecord, uuid.UUID(approval_id))
+    assert row.status == "executing"  # unchanged — still stuck, not silently applied
+
+
+# --- Request body hygiene (code-review Medium finding) ----------------------
+
+
+async def test_report_result_rejects_unknown_fields(client, signing_key):
+    """A typo'd field name must not silently vanish and leave both real
+    fields looking unset (which `_both_or_neither` would otherwise read
+    as a legitimate pre-claim abort) — `extra="forbid"` turns that into a
+    422 instead."""
+    created = await _create_approval(client, signing_key, sub="alice")
+    approval_id = created["id"]
+    approver_token = _sign(signing_key, sub="carol", roles=["agent.approver"])
+    await client.post(
+        f"/api/v1/approvals/{approval_id}/decide",
+        json={"decision": "accept"},
+        headers=_auth(approver_token, "decide-typo-test"),
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    await client.post(
+        f"/api/v1/approvals/{approval_id}/claim",
+        headers=_auth(requester_token, "claim-typo-test"),
+    )
+
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/report-result",
+        json={"execution_attemp_id": "not-even-checked", "outcom": "success"},
+        headers=_auth(requester_token, "report-typo"),
+    )
+    assert resp.status_code == 422
+
+
+# --- Audit trail for the shared CANCELLED terminal status (code-review Medium) -
+
+
+async def test_cancel_and_pre_claim_abort_leave_distinguishable_audit_rows(
+    client, signing_key, db_session
+):
+    """Both events land on the same CANCELLED status — without an audit
+    row, a plain cancel and a give-up-after-acceptance would be
+    indistinguishable after the fact."""
+    cancelled = await _create_approval(client, signing_key, sub="alice")
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    await client.post(
+        f"/api/v1/approvals/{cancelled['id']}/cancel",
+        headers=_auth(requester_token, "audit-cancel"),
+    )
+
+    aborted = await _create_approval(client, signing_key, sub="alice")
+    approver_token = _sign(signing_key, sub="carol", roles=["agent.approver"])
+    await client.post(
+        f"/api/v1/approvals/{aborted['id']}/decide",
+        json={"decision": "accept"},
+        headers=_auth(approver_token, "audit-decide"),
+    )
+    await client.post(
+        f"/api/v1/approvals/{aborted['id']}/report-result",
+        json={},
+        headers=_auth(requester_token, "audit-abort"),
+    )
+
+    cancel_events = (
+        (
+            await db_session.execute(
+                select(AdminAuditEvent).where(
+                    AdminAuditEvent.approval_request_id == uuid.UUID(cancelled["id"])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    abort_events = (
+        (
+            await db_session.execute(
+                select(AdminAuditEvent).where(
+                    AdminAuditEvent.approval_request_id == uuid.UUID(aborted["id"])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    assert [e.event_type for e in cancel_events] == ["approval_cancelled"]
+    assert [e.event_type for e in abort_events] == ["approval_pre_claim_abort"]
