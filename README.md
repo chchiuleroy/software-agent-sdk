@@ -9,7 +9,7 @@ DB。設計全文見 `roy_km` wiki `project_openhands_governance_platform.md`
 自己的資料庫、自己的信任邊界，repo 根目錄的 `AGENTS.md` 也明講這類服務屬於
 「不同的 repo/service」，不歸 `openhands-agent-server` 管。
 
-## 目前狀態（v11 §11 第 2 步進行中）
+## 目前狀態（v11 §11 第 2 步已完成）
 
 已完成（第 1 步，骨架）：
 - FastAPI app 骨架（`src/central_governance_api/main.py`）
@@ -113,10 +113,36 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
 請求」，要驗證這兩條路徑得另外開一支犧牲隔離乾淨度的測試（真實 commit +
 第二個獨立連線），這次沒做。
 
-尚未開始（v11 §11 第 2 步剩餘部分，刻意留到下一輪）：
-devices-register／devices-revoke／audit-events（讀）／`wait`（第 3 步，
-LISTEN/NOTIFY）——相對單純的 CRUD 型端點，跟這輪較難的 state-machine／
-digest／idempotency 邏輯刻意分開，避免同一輪錯誤面過大。
+已完成（第 2 步剩餘部分，`routers/devices.py` + `routers/audit.py`）：
+- `POST /api/v1/devices/register`：任何已驗證身份皆可自行註冊（裝置清冊
+  本身不是安全控制，見 `models.DeviceRegistration` docstring，不需要角色
+  門檻），`owner_subject` 一律伺服器端塞入。`device_id` 全域唯一（非
+  per-owner），撞到既有 row（不論是否已撤銷，撤銷只是 soft-revoke，行永
+  遠佔著這個 `device_id`）回 409 `device_already_registered`
+- `POST /api/v1/devices/{device_id}/revoke`：owner 本人或 `governance.admin`
+  皆可撤銷（跟 `approvals` 的 CANCEL 同款 admin bypass 理由：撤銷不需要
+  代替誰執行任何動作）。成功後同一交易內寫入 `DeviceDenylistEntry`（防止
+  同一 `(owner, device_id)` 之後偷偷用 register 復活）+ `AdminAuditEvent`
+  （`event_type="device_revoked"`）
+- `GET /api/v1/audit-events`：`governance.admin` 限定，支援
+  `event_type`／`approval_request_id` 篩選 + offset/limit 分頁（多取 1
+  筆判斷 `next_offset`，不用額外 `COUNT(*)`）
+- 兩個小重構（第二輪委派審查前先做，避免新舊兩份重複程式碼各自漂移）：
+  `_commit_or_replay()` 從 `routers/approvals.py` 私有函式搬到
+  `approvals/idempotency.py` 變成公開的 `commit_or_replay()`（`devices.py`
+  需要一模一樣的邏輯）；`_now()` 搬到新檔案 `clock.py`（`now_utc()`），
+  兩個 router 共用同一份「用 app clock 不用 DB clock」的取捨說明；
+  `approvals/schemas.py` 的 `_RequestModel`（`extra="forbid"` 基底類別）
+  搬到新檔案 `schemas_base.py` 變成公開的 `RequestModel`，`devices.py`
+  的 request model 也繼承它。三個重構皆先跑過全測試確認無回歸，才繼續往
+  下寫新端點
+- 13 個新整合測試（`tests/test_devices_router.py` 10 個 + `tests/test_audit_router.py`
+  3 個），涵蓋 duplicate device_id／denylist 擋復活／owner vs admin vs
+  第三方三種撤銷授權／已撤銷再撤銷的 409／分頁
+
+**134 個測試全過**（100 純邏輯 + 34 真實 DB 整合），ruff/pyright 皆 0 issue。
+
+尚未開始：`wait`（第 3 步，LISTEN/NOTIFY）。
 
 **待 Roy 拍板**（審查發現，範圍會動到已 commit 的 schema，不是我能單方面決定的）：
 `requester_subject`／`decision_actor_subject`／`verifier_subject`／

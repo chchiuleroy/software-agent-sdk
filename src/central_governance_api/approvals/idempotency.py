@@ -33,6 +33,7 @@ import json
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from central_governance_api.models import IdempotencyRecord
@@ -129,3 +130,65 @@ def record_response(
             response_snapshot=response,
         )
     )
+
+
+async def commit_or_replay(
+    session: AsyncSession,
+    *,
+    principal_subject: str,
+    endpoint: str,
+    resource_id: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> dict[str, Any] | None:
+    """Commits the transaction the caller built. If the commit fails
+    specifically because a concurrent request already won the race to
+    insert this same idempotency key (or, for an endpoint like CREATE
+    whose ``resource_id`` is itself part of the request body, the same
+    resource_id), rolls back and returns the winner's stored response so
+    this request replays it instead of surfacing a raw 500 — this is the
+    race-recovery mechanism described above in this module's own
+    docstring.
+
+    Moved here (originally a private helper duplicated inline in
+    ``routers/approvals.py``) once a second router (``routers/devices.py``)
+    needed the exact same commit/replay-on-conflict logic — every write
+    endpoint in this service needs this, per the module docstring's
+    opening line, so it belongs with the rest of the idempotency
+    machinery rather than copied per router.
+
+    Code-review note (carried over from the original version of this
+    function): an earlier version of ``routers/approvals.py`` described
+    this race-recovery mechanism in ``idempotency.py``'s docstring without
+    implementing the catch-and-retry anywhere — every write endpoint just
+    called ``session.commit()`` directly, so a genuine concurrent retry
+    would have hit ``IdempotencyRecord``'s unique constraint and surfaced
+    an unhandled ``IntegrityError`` (500), not a replay. Caught by code
+    review, not by any test in this repo: the SAVEPOINT-isolated
+    integration tests (see ``tests/conftest.py``) run everything through
+    one session and can't produce a genuine concurrent commit, so this
+    specific race-recovery branch remains unverified by an automated test.
+
+    Returns the replay dict if a race was caught and resolved this way;
+    ``None`` if the commit simply succeeded (the normal, non-racing path)
+    and the caller should return the response it already built.
+    """
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        replayed = await find_replayed_response(
+            session,
+            principal_subject=principal_subject,
+            endpoint=endpoint,
+            resource_id=resource_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+        )
+        if replayed is None:
+            # Not the race this function exists to handle (e.g. a
+            # genuinely different constraint violation) — surface it
+            # rather than silently swallowing an unrelated failure.
+            raise
+        return replayed
+    return None

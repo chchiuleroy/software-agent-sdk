@@ -46,7 +46,12 @@ indent-style = "space"
 select = ["E", "F", "I", "UP", "ARG", "B006", "B008", "B039", "RUF012"]
 
 [tool.ruff.lint.flake8-bugbear]
-extend-immutable-calls = ["fastapi.Depends", "fastapi.params.Depends"]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.params.Depends",
+    "fastapi.Query",
+    "fastapi.params.Query",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ARG"]

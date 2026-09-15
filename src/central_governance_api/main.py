@@ -3,10 +3,11 @@
 Step 1 of v11 §11's implementation order wired up the FastAPI app, the
 OIDC principal resolver, and the DB engine/session factory. Step 2 adds
 the approval-workflow router (``routers/approvals.py``: create/decide/
-claim/report-result/cancel/reconciliation-findings) and the FastAPI
-exception handlers that map its pure-logic error types to HTTP responses
-— still not in this file: devices/register, audit-events, and ``/wait``
-(step 3, LISTEN/NOTIFY).
+claim/report-result/cancel/reconciliation-findings), the device inventory
+router (``routers/devices.py``: register/revoke), the audit-events read
+router (``routers/audit.py``), and the FastAPI exception handlers that
+map their pure-logic error types to HTTP responses — still not in this
+file: ``/wait`` (step 3, LISTEN/NOTIFY).
 """
 
 from __future__ import annotations
@@ -32,6 +33,15 @@ from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.config import Settings, get_settings
 from central_governance_api.db import create_engine, create_session_factory
 from central_governance_api.routers.approvals import router as approvals_router
+from central_governance_api.routers.audit import router as audit_router
+from central_governance_api.routers.devices import (
+    DeviceAlreadyRegisteredError,
+    DeviceAlreadyRevokedError,
+    DeviceAuthorizationDeniedError,
+    DeviceNotFoundError,
+    DeviceRevokedError,
+)
+from central_governance_api.routers.devices import router as devices_router
 from central_governance_api.routers.health import router as health_router
 
 
@@ -53,10 +63,15 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     RecordNotFoundError: (404, "record_not_found"),
     DigestMismatchError: (400, "digest_mismatch"),
     IdempotencyKeyReusedError: (422, "idempotency_key_reused"),
+    DeviceNotFoundError: (404, "device_not_found"),
+    DeviceAuthorizationDeniedError: (403, "authorization_denied"),
+    DeviceAlreadyRegisteredError: (409, "device_already_registered"),
+    DeviceRevokedError: (409, "device_revoked"),
+    DeviceAlreadyRevokedError: (409, "device_already_revoked"),
 }
 
 
-def _install_approval_exception_handlers(app: FastAPI) -> None:
+def _install_exception_handlers(app: FastAPI) -> None:
     for exc_type, (status_code, error_code) in _ERROR_STATUS.items():
 
         def _handler(
@@ -99,7 +114,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings or get_settings()
     app.include_router(health_router)
     app.include_router(approvals_router)
-    _install_approval_exception_handlers(app)
+    app.include_router(devices_router)
+    app.include_router(audit_router)
+    _install_exception_handlers(app)
     return app
 
 

@@ -15,3 +15,7 @@ wheels/
 # Test/tooling caches
 .pytest_cache/
 .ruff_cache/
+
+# recall skill: context.md is meant to be versioned alongside the code
+# it summarizes; history.md is the full session log, not for git.
+.recall/history.md

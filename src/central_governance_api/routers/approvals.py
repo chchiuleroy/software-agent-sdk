@@ -6,12 +6,13 @@ conditional-update SQL against ``PendingApprovalRecord``, plus digest
 verification (``approvals/digest.py``) and idempotency enforcement
 (``approvals/idempotency.py``).
 
-Endpoint scope this pass covers, matching todo.md's step-2 description:
+Endpoint scope this router covers, matching todo.md's step-2 description:
 create, decide, claim, report-result (both shapes), cancel,
-reconciliation-findings. NOT in this pass: devices register/revoke,
-audit-events (read), and ``/wait`` (step 3, LISTEN/NOTIFY) — simpler,
-lower-risk endpoints deliberately left for a follow-up rather than grown
-in the same pass as the harder state-machine/digest/idempotency wiring.
+reconciliation-findings — the harder state-machine/digest/idempotency
+wiring. Devices register/revoke and audit-events (read) live in
+``routers/devices.py``/``routers/audit.py`` (simpler, lower-risk,
+deliberately built in a separate follow-up pass). ``/wait`` (step 3,
+LISTEN/NOTIFY) is still not built anywhere.
 
 Pattern shared by every write endpoint below:
 
@@ -31,27 +32,28 @@ Pattern shared by every write endpoint below:
 7. Insert whatever side-effect row the action implies (``ApprovalDecision``,
    ``AdminAuditEvent``, ``ReconciliationFinding``) in the SAME transaction.
 8. Stage the idempotency record, in the SAME transaction.
-9. Commit once, via ``_commit_or_replay`` rather than a bare
+9. Commit once, via ``idempotency.commit_or_replay`` rather than a bare
    ``session.commit()`` — the single commit is what makes steps 6-8 land
    or fail together (the actual meaning of "conditional-update 邏輯...同
    一 DB transaction" from todo.md's step-2 description), and the helper
    additionally catches the specific case where a concurrent retry with
    the same idempotency key already committed first, replaying its
    response instead of surfacing the resulting ``IntegrityError`` as a
-   500 (see ``_commit_or_replay``'s own docstring — added after code
-   review caught that step 2's idempotency module documented this
-   recovery path without any router actually implementing it).
+   500 (see that function's own docstring — added after code review
+   caught that step 2's idempotency module documented this recovery path
+   without any router actually implementing it; originally a private
+   helper duplicated here, moved into ``approvals/idempotency.py`` once
+   ``routers/devices.py`` needed the identical logic).
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request
 from sqlalchemy import update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from central_governance_api.approvals.authorize import (
@@ -69,6 +71,7 @@ from central_governance_api.approvals.errors import (
     RecordNotTerminalError,
 )
 from central_governance_api.approvals.idempotency import (
+    commit_or_replay,
     find_replayed_response,
     fingerprint_request,
     record_response,
@@ -93,6 +96,7 @@ from central_governance_api.approvals.state_machine import (
 )
 from central_governance_api.auth.dependencies import get_current_principal
 from central_governance_api.auth.oidc import Principal
+from central_governance_api.clock import now_utc
 from central_governance_api.config import Settings
 from central_governance_api.db import get_db_session
 from central_governance_api.models import (
@@ -132,16 +136,6 @@ def _get_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def _now() -> datetime:
-    # App-clock timestamps throughout this router, not DB-server `now()`
-    # — a reasoned simplification (see config.py's TTL field docstrings),
-    # not something v11 specifies. Fine while the API process and its
-    # Postgres are co-located; a multi-app-server deployment would need
-    # this to move server-side to avoid clock-skew-induced early/late
-    # expiry.
-    return datetime.now(UTC)
-
-
 async def _load_record(
     session: AsyncSession, approval_id: uuid.UUID
 ) -> PendingApprovalRecord:
@@ -153,60 +147,6 @@ async def _load_record(
 
 def _ownership(record: PendingApprovalRecord) -> ApprovalOwnership:
     return ApprovalOwnership(requester_subject=record.requester_subject)
-
-
-async def _commit_or_replay(
-    session: AsyncSession,
-    *,
-    principal_subject: str,
-    endpoint: str,
-    resource_id: str,
-    idempotency_key: str,
-    request_fingerprint: str,
-) -> dict[str, Any] | None:
-    """Commits the transaction this request built. If the commit fails
-    specifically because a concurrent request already won the race to
-    insert this same idempotency key (or, for CREATE, the same
-    ``request_id``), rolls back and returns the winner's stored response
-    so this request replays it instead of surfacing a raw 500 — this is
-    the actual mechanism ``idempotency.py``'s module docstring describes.
-
-    Code-review note: an earlier version of this router described that
-    race-recovery mechanism in the docstring without implementing the
-    catch-and-retry here at all — every write endpoint just called
-    ``session.commit()`` directly, so a genuine concurrent retry would
-    have hit ``IdempotencyRecord``'s unique constraint and surfaced an
-    unhandled ``IntegrityError`` (500), not a replay. Caught by code
-    review, not by any test in this repo: the SAVEPOINT-isolated
-    integration tests (see ``tests/conftest.py``) run everything through
-    one session and can't produce a genuine concurrent commit, so this
-    specific race-recovery branch remains unverified by an automated test
-    in this pass — flagged as a known gap rather than silently closed.
-
-    Returns the replay dict if a race was caught and resolved this way;
-    ``None`` if the commit simply succeeded (the normal, non-racing path)
-    and the caller should return the response it already built.
-    """
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        replayed = await find_replayed_response(
-            session,
-            principal_subject=principal_subject,
-            endpoint=endpoint,
-            resource_id=resource_id,
-            idempotency_key=idempotency_key,
-            request_fingerprint=request_fingerprint,
-        )
-        if replayed is None:
-            # Not the race this function exists to handle (e.g. a
-            # genuinely different constraint violation, or a request_id
-            # collision under a different idempotency key) — surface it
-            # rather than silently swallowing an unrelated failure.
-            raise
-        return replayed
-    return None
 
 
 # --- CREATE --------------------------------------------------------------
@@ -251,7 +191,7 @@ async def create_approval(
             "action_summary/action_payload/digest_salt"
         )
 
-    now = _now()
+    now = now_utc()
     record = PendingApprovalRecord(
         request_id=body.request_id,
         requester_subject=principal.subject,
@@ -289,7 +229,7 @@ async def create_approval(
         request_fingerprint=fingerprint,
         response=response.model_dump(mode="json"),
     )
-    replayed = await _commit_or_replay(
+    replayed = await commit_or_replay(
         session,
         principal_subject=principal.subject,
         endpoint=_CREATE_ENDPOINT,
@@ -336,7 +276,7 @@ async def decide_approval(
     current = ApprovalStatus(record.status)
     target = next_status(current, event)
 
-    now = _now()
+    now = now_utc()
     values: dict[str, Any] = {"status": target.value}
     if event is ApprovalEvent.DECIDE_ACCEPT:
         values["execution_deadline"] = now + timedelta(
@@ -381,7 +321,7 @@ async def decide_approval(
         request_fingerprint=fingerprint,
         response=response.model_dump(mode="json"),
     )
-    replayed = await _commit_or_replay(
+    replayed = await commit_or_replay(
         session,
         principal_subject=principal.subject,
         endpoint=_DECIDE_ENDPOINT,
@@ -426,7 +366,7 @@ async def claim_approval(
     current = ApprovalStatus(record.status)
     next_status(current, ApprovalEvent.CLAIM)  # raises if illegal from here
 
-    now = _now()
+    now = now_utc()
     attempt_id = uuid.uuid4()
     lease_expires = now + timedelta(seconds=settings.approval_execution_lease_seconds)
 
@@ -476,7 +416,7 @@ async def claim_approval(
         request_fingerprint=fingerprint,
         response=response.model_dump(mode="json"),
     )
-    replayed = await _commit_or_replay(
+    replayed = await commit_or_replay(
         session,
         principal_subject=principal.subject,
         endpoint=_CLAIM_ENDPOINT,
@@ -519,7 +459,7 @@ async def report_result(
     authorize_on_record(principal, ApprovalAction.REPORT_RESULT, _ownership(record))
 
     current = ApprovalStatus(record.status)
-    now = _now()
+    now = now_utc()
 
     if body.is_pre_claim_abort:
         event = ApprovalEvent.REPORT_PRE_CLAIM_ABORT
@@ -594,7 +534,7 @@ async def report_result(
         request_fingerprint=fingerprint,
         response=response.model_dump(mode="json"),
     )
-    replayed = await _commit_or_replay(
+    replayed = await commit_or_replay(
         session,
         principal_subject=principal.subject,
         endpoint=_REPORT_RESULT_ENDPOINT,
@@ -671,7 +611,7 @@ async def cancel_approval(
         request_fingerprint=fingerprint,
         response=response.model_dump(mode="json"),
     )
-    replayed = await _commit_or_replay(
+    replayed = await commit_or_replay(
         session,
         principal_subject=principal.subject,
         endpoint=_CANCEL_ENDPOINT,
@@ -750,7 +690,7 @@ async def create_reconciliation_finding(
         request_fingerprint=fingerprint,
         response=response.model_dump(mode="json"),
     )
-    replayed = await _commit_or_replay(
+    replayed = await commit_or_replay(
         session,
         principal_subject=principal.subject,
         endpoint=_RECONCILE_ENDPOINT,
