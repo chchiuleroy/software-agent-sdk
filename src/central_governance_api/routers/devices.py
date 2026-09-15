@@ -41,6 +41,7 @@ UUID in the path, not the client-chosen ``request_id``).
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime
 
@@ -73,10 +74,13 @@ from central_governance_api.schemas_base import RequestModel
 
 # Non-empty, URL-safe (no `/`, `?`, `#`, whitespace, or control characters)
 # — code-review Medium: without this, an empty or path-unsafe device_id
-# could be written by register but never addressed by revoke's
-# `{device_id}` path segment, and would permanently occupy the per-owner
+# could be written by register but never addressed anywhere that expects a
+# clean path/display value, and would permanently occupy the per-owner
 # namespace (revoke never deletes the row — see DeviceRegistration's
-# docstring).
+# docstring). Revoke itself now addresses by server-issued registration_id
+# (UUID), not this string, but device_id still appears in audit records,
+# the denylist, and response bodies, so the format constraint still earns
+# its keep independent of revoke's addressing scheme.
 _DEVICE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,64}$"
 
 
@@ -92,6 +96,16 @@ def _display_subject(issuer: str, sub: str) -> str:
     layer did.
     """
     return f"{issuer}#{sub}"
+
+
+def _quota_lock_key(issuer: str, sub: str) -> int:
+    """A stable signed-64-bit key for ``pg_advisory_xact_lock``, derived
+    from the principal's ``(issuer, sub)`` — see that call site in
+    ``register_device`` for why this lock exists (code-review Medium: the
+    count-then-insert quota check below is not atomic on its own).
+    """
+    digest = hashlib.sha256(f"{issuer}\x00{sub}".encode()).digest()[:8]
+    return int.from_bytes(digest, byteorder="big", signed=True)
 
 
 # --- Errors (see module docstring on why these live here, not a shared module) --
@@ -230,6 +244,25 @@ async def register_device(
     )
     if denylisted is not None:
         raise DeviceRevokedError(device_id=body.device_id)
+
+    # Code-review Medium: a bare `SELECT count(*)` followed by a separate
+    # INSERT is not atomic under PostgreSQL's default Read Committed
+    # isolation — two concurrent registrations for the same principal
+    # (different device_id values, so the per-owner UNIQUE constraint
+    # doesn't help) can both read the same count, both pass the check, and
+    # both insert, overshooting the quota by more than "slightly". This is
+    # meant as a real per-principal resource-exhaustion bound (module
+    # docstring), not a soft statistic, so we serialize concurrent
+    # registrations for the same (issuer, sub) with a transaction-scoped
+    # advisory lock before counting — a blocking, self-releasing lock
+    # (held until this transaction commits or rolls back) rather than
+    # `SELECT ... FOR UPDATE`, since there's no existing row to lock when
+    # a principal has zero registrations yet.
+    await session.execute(
+        select(
+            func.pg_advisory_xact_lock(_quota_lock_key(principal.issuer, principal.sub))
+        )
+    )
 
     existing_count = await session.scalar(
         select(func.count())

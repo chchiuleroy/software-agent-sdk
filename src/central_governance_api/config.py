@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     device_denylist_enabled: bool = Field(default=True)
     device_registration_quota: int = Field(
         default=20,
+        gt=0,
         description="Max devices one principal may register in total "
         "(counts revoked rows too — device_id is per-owner unique but "
         "never freed by revocation, see DeviceRegistration's docstring, "
@@ -89,7 +90,9 @@ class Settings(BaseSettings):
         "merely theoretical. Default is a reasoned guess for the "
         "'internal small-scale validation' deployment this service "
         "currently targets, not a value attested anywhere in the "
-        "recovered v11 narrative.",
+        "recovered v11 narrative. Must be positive — zero or negative "
+        "would silently fail-closed every registration, a misconfiguration "
+        "outage rather than a deliberate quota (code-review Low).",
     )
 
     # --- Approval workflow deadlines (v11 §11 step 2) ---

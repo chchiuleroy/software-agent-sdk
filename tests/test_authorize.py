@@ -319,3 +319,68 @@ def test_create_via_authorize_on_record_raises_programmer_error():
     record = _record_owned_by(REQUESTER)
     with pytest.raises(ValueError):
         authorize_on_record(ADMIN, ApprovalAction.CREATE, record)
+
+
+# --- Issuer boundary (code-review Low, 2026-09-15) ----------------------
+#
+# Every test above uses a single issuer for every principal, so none of
+# them could actually catch a regression back to the old concatenated-
+# string comparison this dataclass/function pair replaced (see
+# authorize.py's ApprovalOwnership docstring) — a same-sub, different-
+# issuer principal must NOT be treated as the owner. This is the one
+# property the (issuer, sub) tuple split exists to guarantee that a single
+# `Principal.subject` string comparison could get wrong if the delimiter
+# ("#") ever appeared inside an issuer or sub value from two different
+# issuers.
+
+OTHER_ISSUER = "https://keycloak.example.invalid/realms/other-tenant"
+
+
+def test_same_sub_different_issuer_is_not_owner():
+    """The core regression this module's (issuer, sub) split exists to
+    prevent: two principals can share a `sub` value across issuers (OIDC
+    only guarantees `sub` is unique *within* one issuer), so a same-sub
+    principal from a different issuer must be denied ownership-gated
+    actions exactly like any other non-owner."""
+    requester = _principal("alice", "agent.operator")
+    record = _record_owned_by(requester)
+    impostor = Principal(
+        issuer=OTHER_ISSUER,
+        sub="alice",
+        display_name="alice",
+        roles=frozenset({"agent.operator"}),
+        azp=None,
+    )
+    with pytest.raises(AuthorizationDeniedError) as exc_info:
+        authorize_on_record(impostor, ApprovalAction.CLAIM, record)
+    assert "owner" in exc_info.value.reason
+
+
+def test_concatenated_subject_collision_does_not_confer_ownership():
+    """A concrete case where the OLD `f"{issuer}#{sub}"`-string comparison
+    this module replaced would have gotten this wrong: two distinct
+    (issuer, sub) pairs whose concatenated strings collide because the
+    delimiter character appears inside one issuer's own value. Tuple
+    comparison must treat these as different identities even though the
+    old string form would not have."""
+    owner = Principal(
+        issuer="https://keycloak.example.invalid/realms/team#a",
+        sub="alice",
+        display_name="alice",
+        roles=frozenset({"agent.operator"}),
+        azp=None,
+    )
+    record = ApprovalOwnership(requester_issuer=owner.issuer, requester_sub=owner.sub)
+    # Same concatenated `f"{issuer}#{sub}"` string ("...team#a#alice") as
+    # `owner`, but a genuinely different (issuer, sub) pair.
+    colliding = Principal(
+        issuer="https://keycloak.example.invalid/realms/team",
+        sub="a#alice",
+        display_name="a#alice",
+        roles=frozenset({"agent.operator"}),
+        azp=None,
+    )
+    assert owner.subject == colliding.subject  # the collision is real
+    with pytest.raises(AuthorizationDeniedError) as exc_info:
+        authorize_on_record(colliding, ApprovalAction.CLAIM, record)
+    assert "owner" in exc_info.value.reason

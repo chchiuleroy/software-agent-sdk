@@ -132,10 +132,10 @@ class ApprovalOwnership:
 def authorize_create(principal: Principal) -> None:
     """CREATE has no record yet, so there is nothing to own — governance.admin
     and agent.operator may both submit a new approval request. The
-    resulting row's ``requester_subject`` must always be set to
-    ``principal.subject`` server-side by the caller; this function does
-    not (and cannot) enforce that — it only answers "may this principal
-    create at all".
+    resulting row's ``requester_issuer``/``requester_sub`` must always be
+    set to ``principal.issuer``/``principal.sub`` server-side by the
+    caller; this function does not (and cannot) enforce that — it only
+    answers "may this principal create at all".
     """
     if "governance.admin" in principal.roles or "agent.operator" in principal.roles:
         return

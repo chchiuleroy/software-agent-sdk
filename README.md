@@ -119,7 +119,7 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
   門檻），`owner_subject` 一律伺服器端塞入。`device_id` 全域唯一（非
   per-owner），撞到既有 row（不論是否已撤銷，撤銷只是 soft-revoke，行永
   遠佔著這個 `device_id`）回 409 `device_already_registered`
-- `POST /api/v1/devices/{device_id}/revoke`：owner 本人或 `governance.admin`
+- `POST /api/v1/devices/{registration_id}/revoke`：owner 本人或 `governance.admin`
   皆可撤銷（跟 `approvals` 的 CANCEL 同款 admin bypass 理由：撤銷不需要
   代替誰執行任何動作）。成功後同一交易內寫入 `DeviceDenylistEntry`（防止
   同一 `(owner, device_id)` 之後偷偷用 register 復活）+ `AdminAuditEvent`
@@ -228,6 +228,48 @@ header 在所有 write 端點（含既有的 `approvals` 六端點）原本都�
 成功兩支、配額測試用自訂低配額的獨立 app instance、revoke 全面改用
 registration id）。**144 個測試全過**（100 純邏輯 + 44 真實 DB 整合），
 ruff/pyright 皆 0 issue。
+
+**委派小o 唯讀審查這批 identity-split/quota 變更，抓到 0 個 High + 2 個
+Medium + 4 個 Low，全部已修正**：
+1. **[Medium]** 配額檢查的 `SELECT count(*)` 與後續 INSERT 不是原子操作——
+   PostgreSQL 預設 Read Committed 隔離下，不同 `device_id` 的併發註冊請求
+   可能都讀到同一個計數、都通過檢查、都成功插入，超額幅度可能遠大於「略
+   微超過」。這是真正的資源上限（不是統計近似），已在 `register_device`
+   加上以 `(issuer, sub)` 為鍵的 transaction-scoped advisory lock
+   （`pg_advisory_xact_lock`，`devices.py` 的 `_quota_lock_key`），讓同一
+   principal 的併發註冊序列化而非互相競爭。新增
+   `test_register_quota_race_is_prevented_by_advisory_lock`
+   ——這支測試特意不用共用的 SAVEPOINT 隔離 `db_session` fixture（單一
+   session/連線本來就無法產生真正的併發 commit），改用自己的真實
+   engine/session-factory 對同一個測試資料庫發出 12 個真正併發的註冊請
+   求，驗證恰好只有配額筆數（5）成功、其餘全部 429，測試結束後自行清除
+   寫入的 row（不能依賴 fixture 的 rollback）
+2. **[Medium]** README（本檔案）revoke 端點路徑仍寫著舊的 `{device_id}`，
+   跟改成 `{registration_id}` 後的實作不一致——已修正
+3. **[Low]** 新增的 identity-split 測試全部只用單一 issuer，抓不到「拼接
+   字串比對」這個舊 bug 類型的迴歸——`test_authorize.py` 新增
+   `test_same_sub_different_issuer_is_not_owner`（同 sub 不同 issuer 不是
+   owner）與 `test_concatenated_subject_collision_does_not_confer_ownership`
+   （建構一組拼接字串會碰撞、但 tuple 不同的案例，證明新比對方式正確處
+   理舊比對方式會出錯的情境）；`test_devices_router.py` 新增
+   `test_revoke_same_sub_different_issuer_is_not_owner`（直接寫入一筆不同
+   issuer 的 DB row，因為這個部署的 OIDC resolver 只信任單一 issuer，
+   HTTP 層面產生不出第二個 issuer 的 principal）
+4. **[Low]** 配額測試原本只涵蓋循序 happy path——新增
+   `test_register_quota_isolated_per_owner`（不同 owner 配額互不影響）、
+   `test_register_quota_still_counts_revoked_devices`（撤銷不釋放配額，
+   驗證 config.py docstring 的既有宣稱）
+5. **[Low]** `authorize.py`／`devices.py`／`test_devices_router.py` 三處註
+   解仍描述舊欄位或舊路由語意（`requester_subject` 拼接字串寫法、revoke
+   仍用 `device_id` 定址的過時說明）——已更新成當前實作
+6. **[Low]** `config.device_registration_quota` 沒有正值限制，0 或負值會
+   讓所有註冊都被判定超額（fail-closed，安全但可能因設定錯誤導致誤觸發
+   的服務中斷）——已加 `Field(gt=0)`
+
+新增 6 個測試：`test_authorize.py` 2 個純邏輯 issuer 邊界測試、
+`test_devices_router.py` 4 個真實 DB 整合測試（issuer 邊界 1 個、配額隔離
+1 個、撤銷仍計入配額 1 個、配額併發競爭 1 個）。**150 個測試全過**（102
+純邏輯 + 48 真實 DB 整合），ruff/pyright 皆 0 issue。
 
 ## 開發
 
