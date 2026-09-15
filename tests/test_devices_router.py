@@ -3,6 +3,14 @@ Postgres database, same rationale as ``test_approvals_router.py``: the
 UNIQUE constraint on ``device_id``, the denylist's role in blocking
 re-registration, and the conditional revoke UPDATE are exactly the kind
 of thing a mocked session can't prove.
+
+Not covered here, same limitation as ``test_approvals_router.py``'s own
+module docstring: the ``check_replay_or_raise`` race-recovery branches in
+both ``register_device``'s ``except IntegrityError`` and
+``revoke_device``'s zero-rows-updated branch (code-review High) need a
+genuine concurrent request racing against itself to exercise — this
+file's SAVEPOINT-isolated single session structurally can't produce that
+(see ``tests/conftest.py``'s ``db_session`` fixture docstring).
 """
 
 from __future__ import annotations
@@ -156,15 +164,27 @@ async def test_revoke_by_admin_on_someone_elses_device_succeeds(client, signing_
     assert resp.json()["revoked_by_subject"].endswith("#dave")
 
 
-async def test_revoke_by_non_owner_non_admin_is_403(client, signing_key):
+async def test_revoke_by_non_owner_non_admin_is_masked_as_404(client, signing_key):
+    """Code-review Low: a non-owner, non-admin caller must not be able to
+    tell "this device doesn't exist" apart from "it exists but isn't
+    yours" — both have to come back as the same 404, or an authenticated
+    principal could enumerate the device inventory by probing IDs."""
     body = await _register(client, signing_key, sub="alice")
     other_token = _sign(signing_key, sub="bob", roles=["agent.operator"])
     resp = await client.post(
         f"/api/v1/devices/{body['device_id']}/revoke",
         headers=_auth(other_token, "revoke-denied"),
     )
-    assert resp.status_code == 403
-    assert resp.json()["error_code"] == "authorization_denied"
+    unknown_resp = await client.post(
+        "/api/v1/devices/some-other-unknown-device/revoke",
+        headers=_auth(other_token, "revoke-unknown"),
+    )
+    assert resp.status_code == unknown_resp.status_code == 404
+    assert (
+        resp.json()["error_code"]
+        == unknown_resp.json()["error_code"]
+        == ("device_not_found")
+    )
 
 
 async def test_revoke_unknown_device_is_404(client, signing_key):
@@ -213,3 +233,34 @@ async def test_register_after_revoke_is_denied_not_silently_reactivated(
     )
     assert resp.status_code == 409
     assert resp.json()["error_code"] == "device_revoked"
+
+
+# --- device_id format validation (code-review Medium) -----------------------
+
+
+@pytest.mark.parametrize(
+    "device_id",
+    [
+        "",
+        "   ",
+        "has a space",
+        "has/a/slash",
+        "has?a=query",
+        "has#a-fragment",
+        "a" * 65,  # one over the max
+    ],
+)
+async def test_register_rejects_malformed_device_id(client, signing_key, device_id):
+    """Empty, path-unsafe, or over-length device_id must be rejected at
+    the request-validation boundary — otherwise it could be written by
+    register but never addressed by revoke's `{device_id}` path segment,
+    and (device_id being globally unique and never deleted, see
+    DeviceRegistration's docstring) would permanently occupy that
+    namespace slot."""
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    resp = await client.post(
+        "/api/v1/devices/register",
+        json={"device_id": device_id},
+        headers=_auth(token, f"malformed-{uuid.uuid4()}"),
+    )
+    assert resp.status_code == 422

@@ -142,6 +142,50 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
 
 **134 個測試全過**（100 純邏輯 + 34 真實 DB 整合），ruff/pyright 皆 0 issue。
 
+**委派小o（`codex exec --sandbox read-only`）唯讀審查一輪，抓到 1 個
+High + 2 個 Medium + 2 個 Low，全部已修正**：
+1. **[High]** register／revoke 在相同 idempotency key 真正併發重送時，
+   會誤判成「device_id 已註冊」／「已撤銷」的衝突，而不是回放既有結果
+   ——PostgreSQL Read Committed 語意下，後到的請求會等前一個 transaction
+   commit 後才重新判斷 WHERE/UNIQUE constraint，此時看到的是「已存在」
+   而非「我自己的併發重試」。已在 `approvals/idempotency.py` 新增
+   `check_replay_or_raise()`（先查是否為同一 idempotency key 的既有回應
+   再決定要不要真的報衝突），register 的 `flush()` except 與 revoke 的
+   0-row 分支皆已套用；此路徑本身仍缺真正跨連線併發測試（跟
+   `commit_or_replay()` 當初的已知缺口同款限制，SAVEPOINT 隔離測不出真
+   併發）
+2. **[Medium]** `device_id` 沒有格式限制，空字串／含 `/`／`?`／`#`／空白
+   都能寫入且全域永久佔用 namespace，卻可能無法透過 revoke 的路徑參數定
+   址——已加 pattern 限制（非空、URL-safe 字元、上限 64 字元），register
+   的 schema 與 revoke 的路徑參數皆套用，新增
+   `test_register_rejects_malformed_device_id` 參數化測試 7 個案例驗證
+3. **[Medium]** 零角色即可註冊裝置的推論只處理了「是否授予能力」，沒處理
+   「資源濫用／namespace 搶占」——**這是真實安全面向的產品/政策決定，不
+   是機械式修法**，故意不在這輪單方面決定配額或改變 device_id 唯一性範
+   圍，已在 `routers/devices.py` module docstring 明確揭露此已知缺口留
+   給 Roy 判斷
+4. **[Low]** revoke 對「裝置不存在」與「裝置存在但不是你的」原本回不同
+   狀態碼（404 vs 403），任何已驗證身份都能藉此枚舉裝置清冊——已改成非
+   owner/非 admin 一律回 404（無法區分兩種情況），移除因此變成死代碼的
+   `DeviceAuthorizationDeniedError`，新增
+   `test_revoke_by_non_owner_non_admin_is_masked_as_404` 直接比對兩種情
+   況回應完全相同
+5. **[Low]** audit-events 分頁本身「多取 1 筆判斷 next_offset」邏輯沒有
+   off-by-one，但 offset-based 分頁在有新事件持續寫入時天生不穩定（不是
+   這次的 bug，是這個分頁方式的固有限制，已在 `audit.py` docstring 明講
+   取捨、未改用 cursor-based 分頁）；原本的分頁測試只驗證第一頁形狀、從
+   沒真的走訪下一頁，已改寫成真正走訪到 `next_offset is None` 為止並驗
+   證總數不重複不遺漏
+
+審查過程也**順便修正一個跟這批端點無關的既有缺口**：`Idempotency-Key`
+header 在所有 write 端點（含既有的 `approvals` 六端點）原本都沒有跟
+`IdempotencyRecord.idempotency_key`（`String(128)`）欄位對齊的長度限
+制，過長的 key 只會在 DB 寫入時炸開，不會在請求驗證階段乾淨拒絕——新增
+共用的 `http_params.py`（`IdempotencyKeyHeader` annotated 型別），
+`approvals.py`／`devices.py` 全部端點統一改用。
+
+**141 個測試全過**（100 純邏輯 + 41 真實 DB 整合），ruff/pyright 皆 0 issue。
+
 尚未開始：`wait`（第 3 步，LISTEN/NOTIFY）。
 
 **待 Roy 拍板**（審查發現，範圍會動到已 commit 的 schema，不是我能單方面決定的）：

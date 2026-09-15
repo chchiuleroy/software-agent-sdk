@@ -52,7 +52,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,6 +99,7 @@ from central_governance_api.auth.oidc import Principal
 from central_governance_api.clock import now_utc
 from central_governance_api.config import Settings
 from central_governance_api.db import get_db_session
+from central_governance_api.http_params import IdempotencyKeyHeader
 from central_governance_api.models import (
     AdminAuditEvent,
     ApprovalDecision,
@@ -157,7 +158,7 @@ _CREATE_ENDPOINT = "POST /approvals"
 @router.post("", response_model=ApprovalSummary, status_code=201)
 async def create_approval(
     body: CreateApprovalRequest,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(_get_settings),
@@ -251,7 +252,7 @@ _DECIDE_ENDPOINT = "POST /approvals/{id}/decide"
 async def decide_approval(
     approval_id: uuid.UUID,
     body: DecideRequest,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(_get_settings),
@@ -342,7 +343,7 @@ _CLAIM_ENDPOINT = "POST /approvals/{id}/claim"
 @router.post("/{approval_id}/claim", response_model=ClaimResponse)
 async def claim_approval(
     approval_id: uuid.UUID,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(_get_settings),
@@ -438,7 +439,7 @@ _REPORT_RESULT_ENDPOINT = "POST /approvals/{id}/report-result"
 async def report_result(
     approval_id: uuid.UUID,
     body: ReportResultRequest,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
 ) -> ReportResultResponse:
@@ -555,7 +556,7 @@ _CANCEL_ENDPOINT = "POST /approvals/{id}/cancel"
 @router.post("/{approval_id}/cancel", response_model=CancelResponse)
 async def cancel_approval(
     approval_id: uuid.UUID,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
 ) -> CancelResponse:
@@ -637,7 +638,7 @@ _RECONCILE_ENDPOINT = "POST /approvals/{id}/reconciliation-findings"
 async def create_reconciliation_finding(
     approval_id: uuid.UUID,
     body: ReconciliationFindingRequest,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
 ) -> ReconciliationFindingResponse:

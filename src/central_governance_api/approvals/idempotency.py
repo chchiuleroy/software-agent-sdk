@@ -103,6 +103,60 @@ async def find_replayed_response(
     return existing.response_snapshot
 
 
+async def check_replay_or_raise(
+    session: AsyncSession,
+    *,
+    principal_subject: str,
+    endpoint: str,
+    resource_id: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+    conflict_error: Exception,
+) -> dict[str, Any]:
+    """Before concluding some failure signal (a unique-constraint
+    violation on flush, a conditional UPDATE that matched zero rows) is a
+    genuine business conflict, check whether it's actually this exact
+    request racing against its own concurrent retry — in which case the
+    retry's response should be replayed, not turned into an error.
+
+    Code-review High (found reviewing ``routers/devices.py``, but the
+    same shape applies wherever a router does a pre-commit existence/
+    uniqueness check before ever reaching :func:`commit_or_replay`):
+    two concurrent requests carrying the *same* idempotency key can both
+    pass an initial :func:`find_replayed_response` call (neither has
+    committed yet) and both attempt the same mutation. Under Postgres's
+    default Read Committed isolation, the second one blocks on the first
+    at the unique index / row lock, then — once the first commits —
+    re-evaluates and fails (unique violation, or its own conditional
+    UPDATE matching zero rows because the first request already changed
+    the row). Without this check, that failure is indistinguishable from
+    a genuinely different conflict (someone else's device_id, an already-
+    revoked device from an unrelated request) and gets reported as one —
+    exactly backwards for what an idempotency key is supposed to
+    guarantee: a safe retry of one's own request should replay success,
+    not surface as a conflict.
+
+    Callers whose failure was an exception (e.g. ``IntegrityError`` from
+    ``session.flush()``) must roll back before calling this, same as
+    :func:`commit_or_replay` does — this function only reads.
+
+    Returns the replay dict if this was that race; raises
+    ``conflict_error`` (unmodified) if it wasn't — a genuinely different
+    conflict the caller must still report as one.
+    """
+    replayed = await find_replayed_response(
+        session,
+        principal_subject=principal_subject,
+        endpoint=endpoint,
+        resource_id=resource_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
+    )
+    if replayed is not None:
+        return replayed
+    raise conflict_error
+
+
 def record_response(
     session: AsyncSession,
     *,

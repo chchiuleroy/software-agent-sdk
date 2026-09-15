@@ -11,27 +11,43 @@ Schemas and error types live directly in this file rather than in a
 `devices/` subpackage mirroring `approvals/` — two endpoints and five
 small, single-purpose exception classes don't earn the extra structure
 yet (YAGNI); if this surface grows, splitting into a subpackage then is a
-mechanical refactor, same as `_commit_or_replay`/`_RequestModel` already
+mechanical refactor, same as `commit_or_replay`/`RequestModel` already
 were once a second consumer showed up (see `approvals/idempotency.py`
 and `schemas_base.py`).
 
 Both write endpoints follow the same idempotency-check -> ... -> single
 commit-or-replay shape as `routers/approvals.py` — see that module's
 docstring for the full rationale; not repeated here.
+
+Code-review disclosed gap, not fixed in this pass: any authenticated
+principal may self-register a device with no quota or rate limit (see
+`register_device`'s own docstring for the reasoning on why no *role* is
+required). Review confirmed this is a legitimate resource-exhaustion /
+namespace-squatting surface — an attacker with any valid token could
+register a large number of never-reused, permanently-occupied device_id
+values (see the DeviceRegistration table's own docstring: revoke never
+deletes a row) — not merely a theoretical nitpick. Mitigations review
+suggested (per-principal registration quota, unpredictable/system-
+generated device_id values instead of caller-chosen ones, or scoping
+device_id uniqueness per-owner instead of globally) are all real feature/
+policy decisions, not mechanical fixes, so they're deliberately left for
+Roy to weigh rather than picked here unilaterally.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Path
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from central_governance_api.approvals.idempotency import (
+    check_replay_or_raise,
     commit_or_replay,
     find_replayed_response,
     fingerprint_request,
@@ -41,12 +57,21 @@ from central_governance_api.auth.dependencies import get_current_principal
 from central_governance_api.auth.oidc import Principal
 from central_governance_api.clock import now_utc
 from central_governance_api.db import get_db_session
+from central_governance_api.http_params import IdempotencyKeyHeader
 from central_governance_api.models import (
     AdminAuditEvent,
     DeviceDenylistEntry,
     DeviceRegistration,
 )
 from central_governance_api.schemas_base import RequestModel
+
+
+# Non-empty, URL-safe (no `/`, `?`, `#`, whitespace, or control characters)
+# — code-review Medium: without this, an empty or path-unsafe device_id
+# could be written by register but never addressed by revoke's
+# `{device_id}` path segment, and would permanently occupy the (globally
+# unique, never-deleted — see DeviceRegistration's docstring) namespace.
+_DEVICE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,64}$"
 
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
@@ -56,24 +81,16 @@ router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 
 
 class DeviceNotFoundError(Exception):
-    """Maps to HTTP 404."""
+    """Maps to HTTP 404. REVOKE also raises this — deliberately, not just
+    when the device truly doesn't exist — for a caller who is neither the
+    device's owner nor ``governance.admin``: see ``revoke_device``'s own
+    comment on why that case is folded into "not found" rather than a
+    distinguishable 403 (code-review Low: existence-enumeration risk).
+    """
 
     def __init__(self, *, device_id: str) -> None:
         self.device_id = device_id
         super().__init__(f"no registered device with id {device_id!r}")
-
-
-class DeviceAuthorizationDeniedError(Exception):
-    """Maps to HTTP 403. Not the approval-workflow's action-typed
-    ``AuthorizationDeniedError`` (that one is keyed to ``ApprovalAction``,
-    which has no member for "revoke a device") — this is deliberately its
-    own, simpler type rather than forcing device authorization into an
-    enum that doesn't fit it.
-    """
-
-    def __init__(self, *, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
 
 
 class DeviceAlreadyRegisteredError(Exception):
@@ -119,7 +136,7 @@ class DeviceAlreadyRevokedError(Exception):
 
 
 class DeviceRegisterRequest(RequestModel):
-    device_id: str = Field(max_length=64)
+    device_id: str = Field(pattern=_DEVICE_ID_PATTERN)
 
 
 class DeviceRegisterResponse(BaseModel):
@@ -143,7 +160,7 @@ _REGISTER_ENDPOINT = "POST /devices/register"
 @router.post("/register", response_model=DeviceRegisterResponse, status_code=201)
 async def register_device(
     body: DeviceRegisterRequest,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
 ) -> DeviceRegisterResponse:
@@ -153,7 +170,9 @@ async def register_device(
     role would just add onboarding friction for none of the usual
     reasons (least privilege doesn't apply to a hint). ``owner_subject``
     is always ``principal.subject``, never taken from the request body —
-    nobody can register a device on someone else's behalf.
+    nobody can register a device on someone else's behalf. See the module
+    docstring for the disclosed, not-fixed-here quota/namespace-abuse gap
+    this permissive posture implies.
     """
     fingerprint = fingerprint_request(body.model_dump(mode="json"))
     replayed = await find_replayed_response(
@@ -184,12 +203,32 @@ async def register_device(
         await session.flush()  # trip the device_id UNIQUE constraint now,
         # deterministically, rather than only discovering it much later
         # when the final commit runs (see the DeviceRegistration table's
-        # own docstring: device_id is globally unique, not per-owner —
-        # this is a real business-rule violation, not the idempotency-key
-        # race `commit_or_replay` exists to handle further down).
-    except IntegrityError as exc:
+        # own docstring: device_id is globally unique, not per-owner).
+    except IntegrityError:
         await session.rollback()
-        raise DeviceAlreadyRegisteredError(device_id=body.device_id) from exc
+        # Code-review High: a bare "unique violation -> already
+        # registered" here would misreport a genuine concurrent retry of
+        # THIS SAME request (same principal+device_id+idempotency key) as
+        # a conflict, because under Postgres's default Read Committed
+        # isolation the losing concurrent request's flush() blocks on the
+        # winner's uncommitted insert and then fails once the winner
+        # commits — indistinguishable, from the failure alone, from a
+        # genuinely different registration attempt for this device_id.
+        # check_replay_or_raise re-checks whether the winner was actually
+        # this same idempotency key before concluding it's a real
+        # conflict. See idempotency.py's docstring for full detail; this
+        # specific race-recovery branch is unverified by an automated
+        # test (see tests/test_devices_router.py's module docstring).
+        replayed = await check_replay_or_raise(
+            session,
+            principal_subject=principal.subject,
+            endpoint=_REGISTER_ENDPOINT,
+            resource_id=body.device_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+            conflict_error=DeviceAlreadyRegisteredError(device_id=body.device_id),
+        )
+        return DeviceRegisterResponse.model_validate(replayed)
 
     response = DeviceRegisterResponse(
         id=device.id,
@@ -226,8 +265,8 @@ _REVOKE_ENDPOINT = "POST /devices/{device_id}/revoke"
 
 @router.post("/{device_id}/revoke", response_model=DeviceRevokeResponse)
 async def revoke_device(
-    device_id: str,
-    idempotency_key: str = Header(alias="Idempotency-Key"),
+    device_id: Annotated[str, Path(pattern=_DEVICE_ID_PATTERN)],
+    idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
 ) -> DeviceRevokeResponse:
@@ -251,12 +290,16 @@ async def revoke_device(
     device = await session.scalar(
         select(DeviceRegistration).where(DeviceRegistration.device_id == device_id)
     )
-    if device is None:
-        raise DeviceNotFoundError(device_id=device_id)
-
     is_admin = "governance.admin" in principal.roles
-    if not is_admin and principal.subject != device.owner_subject:
-        raise DeviceAuthorizationDeniedError(reason="not this device's owner")
+    is_owner = device is not None and principal.subject == device.owner_subject
+    if device is None or not (is_admin or is_owner):
+        # Code-review Low: deliberately the SAME error, same status code,
+        # for "doesn't exist" and "exists but you're not the owner" —
+        # distinguishing them would let any authenticated principal
+        # enumerate the device inventory by probing IDs and reading which
+        # error comes back (403 vs 404). Only `governance.admin` or the
+        # true owner ever learns whether a given device_id is real.
+        raise DeviceNotFoundError(device_id=device_id)
 
     now = now_utc()
     result = await session.execute(
@@ -269,7 +312,25 @@ async def revoke_device(
         .returning(DeviceRegistration.id)
     )
     if result.scalar_one_or_none() is None:
-        raise DeviceAlreadyRevokedError(device_id=device_id)
+        # Code-review High — same race as register_device's flush()
+        # except block, different shape: two concurrent revoke calls with
+        # the SAME idempotency key can both pass the initial replay check
+        # and both reach this UPDATE; only one matches `revoked_at IS
+        # NULL`, and the loser must not report "already revoked" without
+        # first checking whether "already revoked" actually means "my own
+        # concurrent retry already won". See check_replay_or_raise's
+        # docstring; this branch has the same untested-by-automation
+        # caveat as register's.
+        replayed = await check_replay_or_raise(
+            session,
+            principal_subject=principal.subject,
+            endpoint=_REVOKE_ENDPOINT,
+            resource_id=device_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+            conflict_error=DeviceAlreadyRevokedError(device_id=device_id),
+        )
+        return DeviceRevokeResponse.model_validate(replayed)
 
     # See models.DeviceDenylistEntry's docstring: this is what actually
     # stops the same (owner, device_id) pair from quietly re-registering

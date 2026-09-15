@@ -37,7 +37,6 @@ from central_governance_api.routers.audit import router as audit_router
 from central_governance_api.routers.devices import (
     DeviceAlreadyRegisteredError,
     DeviceAlreadyRevokedError,
-    DeviceAuthorizationDeniedError,
     DeviceNotFoundError,
     DeviceRevokedError,
 )
@@ -64,7 +63,6 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     DigestMismatchError: (400, "digest_mismatch"),
     IdempotencyKeyReusedError: (422, "idempotency_key_reused"),
     DeviceNotFoundError: (404, "device_not_found"),
-    DeviceAuthorizationDeniedError: (403, "authorization_denied"),
     DeviceAlreadyRegisteredError: (409, "device_already_registered"),
     DeviceRevokedError: (409, "device_revoked"),
     DeviceAlreadyRevokedError: (409, "device_already_revoked"),

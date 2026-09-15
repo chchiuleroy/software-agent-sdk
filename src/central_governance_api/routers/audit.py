@@ -6,6 +6,16 @@ and `routers/devices.py` for what writes into it) is `governance.admin`
 only, matching the RBAC matrix's `RECONCILE_AS_ADMIN`-style restriction
 on anything that inspects rather than acts within its own scope. No
 idempotency handling here — a GET has no side effects to make idempotent.
+
+Code-review Low, disclosed rather than fixed here: pagination is plain
+offset/limit, ordered newest-first. That's an inherent trade-off, not a
+counting bug in this file (the "fetch limit+1 to detect a next page"
+logic itself is correct) — a caller paging through results while new
+audit events keep arriving can see an item shift between pages (repeated
+or skipped) because "page 2" is just "skip N rows from a result set
+that's still growing at the front". A stable walk under concurrent writes
+would need cursor-based pagination keyed on `(occurred_at, id)` instead;
+not built here since nothing in this pass actually needs that guarantee.
 """
 
 from __future__ import annotations
