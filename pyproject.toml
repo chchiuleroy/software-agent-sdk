@@ -1,0 +1,69 @@
+[project]
+name = "central-governance-api"
+version = "0.1.0"
+description = "OHS 治理平台中央治理 API：唯一持有 PostgreSQL 憑證的獨立服務，見 Phase 1 接路由設計 v11 §3"
+readme = "README.md"
+authors = [
+    { name = "Kun-Min Chiu", email = "chchiuleroy@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "alembic>=1.13",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.141.1",
+    "httpx[socks]>=0.27.0",
+    "joserfc>=1.7.5",
+    "pydantic>=2",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy[asyncio]>=2",
+    "uvicorn[standard]>=0.53.0",
+]
+
+[project.scripts]
+central-governance-api = "central_governance_api:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.7",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "ARG", "B006", "B008", "B039", "RUF012"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.params.Depends"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ARG"]
+"alembic/**/*.py" = ["UP035", "UP007"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["central_governance_api"]
+lines-after-imports = 2
+
+[tool.pyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.13"
+include = ["src", "tests"]
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"

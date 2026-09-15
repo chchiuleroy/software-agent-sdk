@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets (DB URL with credentials, etc.) — never commit
+.env
+
+# Test/tooling caches
+.pytest_cache/
+.ruff_cache/

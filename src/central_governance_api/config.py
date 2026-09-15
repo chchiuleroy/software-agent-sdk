@@ -1,0 +1,109 @@
+"""Environment-driven settings for the central governance API.
+
+Field defaults mirror the values already validated against a real Keycloak
+instance in Phase 0 (``oidc_principal.py``, `project_openhands_governance_platform.md`
+"SSO/OIDC/RBAC 架構規劃" — real-IdP checks confirmed ``leeway_seconds=30``
+works, the realm's protocol mapper flattens roles into a claim named
+``roles``, and Keycloak's actual token ``typ`` is ``"Bearer"`` — not the
+RFC 9068 ``at+jwt`` profile this module deliberately does not assume).
+"""
+
+from __future__ import annotations
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="CGA_", env_file=".env")
+
+    # --- Database ---
+    database_url: str = Field(
+        default="postgresql+asyncpg://cga:cga@localhost:5432/central_governance",
+        description="Async SQLAlchemy connection string. Production deployments "
+        "must point this at a role with least-privilege grants on this "
+        "service's own schema only (v11 §3 deployment condition #14).",
+    )
+
+    # --- OIDC / trusted issuer (single issuer — v11 §3: "not multi-tenant") ---
+    oidc_issuer: str = Field(description="Keycloak realm issuer URL.")
+    oidc_jwks_url: str = Field(description="Keycloak realm JWKS endpoint.")
+    oidc_audience: str = Field(
+        description="Resource-server identifier this API expects in `aud`. "
+        "Must be a dedicated audience for this API, not shared with the "
+        "desktop agent-server's own client — this is the primary "
+        "ID-token-vs-access-token confusion defense given Keycloak's "
+        "tokens don't carry RFC 9068's `typ: at+jwt` (v11 已知實作時待辦 #9)."
+    )
+    oidc_roles_claim: str = Field(
+        default="roles",
+        description="Claim name carrying the flattened role list. Matches "
+        "the Phase 0 Keycloak protocol mapper's actual output claim name "
+        "('roles'); change only if that mapper is reconfigured.",
+    )
+    oidc_leeway_seconds: int = Field(default=30)
+    oidc_signing_algorithm: str = Field(
+        default="RS256",
+        description="Single pinned algorithm (v11: 'don't accept the full "
+        "safe set in production'). Must match the realm's actual key type.",
+    )
+    oidc_azp_allowlist: tuple[str, ...] = Field(
+        default=(),
+        description="Authorized-party (`azp`) client IDs allowed to call "
+        "this API. Empty = not enforced (v11 已知實作時待辦 #7: pin this "
+        "once the desktop client is registered in Keycloak — §9 not done "
+        "yet as of v11).",
+    )
+    oidc_require_https: bool = Field(
+        default=True,
+        description="Reject an issuer/JWKS URL that isn't https://. The "
+        "Phase 0 Keycloak instance currently runs http-enabled=true for "
+        "single-machine internal testing (see wiki) — set this False only "
+        "for that known, accepted local-dev configuration, never for a "
+        "real deployment.",
+    )
+    jwks_cache_ttl_seconds: int = Field(default=300)
+    jwks_negative_cache_capacity: int = Field(
+        default=256,
+        description="Max distinct unknown-kid entries cached at once, "
+        "keyed by kid (v11: bounded, to prevent memory-growth DoS from "
+        "random kids).",
+    )
+    bearer_max_token_length: int = Field(
+        default=8192,
+        description="Reject a Bearer token longer than this before "
+        "attempting to parse it (v11 §3 resource-limit requirement).",
+    )
+
+    # --- Device inventory (v10/v11: explicitly NOT a security control) ---
+    device_denylist_enabled: bool = Field(default=True)
+
+    @field_validator("oidc_issuer", "oidc_jwks_url")
+    @classmethod
+    def _check_https(cls, v: str, info) -> str:  # noqa: ARG003
+        # Validated again at Settings-construction time against
+        # oidc_require_https in get_settings(), since field order isn't
+        # guaranteed here; this validator only rejects obviously-malformed
+        # values (empty, no scheme).
+        if not v or "://" not in v:
+            raise ValueError(f"must be a full URL, got: {v!r}")
+        return v
+
+
+def get_settings() -> Settings:
+    # pydantic-settings resolves required fields from the environment at
+    # runtime (CGA_OIDC_ISSUER etc.) — pyright can't see that and flags
+    # this as missing constructor arguments.
+    settings = Settings()  # pyright: ignore[reportCallIssue]
+    if settings.oidc_require_https:
+        for name, url in (
+            ("oidc_issuer", settings.oidc_issuer),
+            ("oidc_jwks_url", settings.oidc_jwks_url),
+        ):
+            if not url.startswith("https://"):
+                raise ValueError(
+                    f"{name}={url!r} is not https:// and "
+                    "oidc_require_https is True. Set CGA_OIDC_REQUIRE_HTTPS=false "
+                    "only for the known local-dev http Keycloak instance."
+                )
+    return settings
