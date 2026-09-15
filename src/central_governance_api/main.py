@@ -1,10 +1,12 @@
 """App factory + uvicorn entrypoint for the central governance API.
 
-Step 1 of v11 §11's implementation order: this wires up the FastAPI app,
-the OIDC principal resolver, and the DB engine/session factory. The
-approval-workflow endpoints themselves (create/decide/claim/report-result/
-wait/cancel/reconciliation-findings/devices/register/audit-events) are
-step 2+ — not in this skeleton.
+Step 1 of v11 §11's implementation order wired up the FastAPI app, the
+OIDC principal resolver, and the DB engine/session factory. Step 2 adds
+the approval-workflow router (``routers/approvals.py``: create/decide/
+claim/report-result/cancel/reconciliation-findings) and the FastAPI
+exception handlers that map its pure-logic error types to HTTP responses
+— still not in this file: devices/register, audit-events, and ``/wait``
+(step 3, LISTEN/NOTIFY).
 """
 
 from __future__ import annotations
@@ -13,15 +15,63 @@ import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+from central_governance_api.approvals.authorize import AuthorizationDeniedError
+from central_governance_api.approvals.errors import (
+    ConcurrentModificationError,
+    DigestMismatchError,
+    ExecutionAttemptMismatchError,
+    RecordNotFoundError,
+    RecordNotTerminalError,
+)
+from central_governance_api.approvals.idempotency import IdempotencyKeyReusedError
+from central_governance_api.approvals.state_machine import IllegalTransitionError
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.config import Settings, get_settings
 from central_governance_api.db import create_engine, create_session_factory
+from central_governance_api.routers.approvals import router as approvals_router
 from central_governance_api.routers.health import router as health_router
 
 
 logger = logging.getLogger(__name__)
+
+# error type -> (HTTP status, "error_code" body field). One central table
+# rather than a try/except in every route handler — mirrors the sibling
+# openhands-sdk-governed repo's SelfApprovalDeniedError -> 403 pattern
+# (see errors.py's module docstring). The message shown to the caller is
+# always str(exc) — every exception type above was written with a
+# safe-to-show __str__ specifically so this table doesn't need a second,
+# separate "public message" per error type.
+_ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
+    AuthorizationDeniedError: (403, "authorization_denied"),
+    IllegalTransitionError: (409, "illegal_transition"),
+    ConcurrentModificationError: (409, "concurrent_modification"),
+    ExecutionAttemptMismatchError: (409, "execution_attempt_mismatch"),
+    RecordNotTerminalError: (409, "record_not_terminal"),
+    RecordNotFoundError: (404, "record_not_found"),
+    DigestMismatchError: (400, "digest_mismatch"),
+    IdempotencyKeyReusedError: (422, "idempotency_key_reused"),
+}
+
+
+def _install_approval_exception_handlers(app: FastAPI) -> None:
+    for exc_type, (status_code, error_code) in _ERROR_STATUS.items():
+
+        def _handler(
+            _request: Request,
+            exc: Exception,
+            *,
+            _status_code: int = status_code,
+            _error_code: str = error_code,
+        ) -> JSONResponse:
+            return JSONResponse(
+                status_code=_status_code,
+                content={"error_code": _error_code, "detail": str(exc)},
+            )
+
+        app.add_exception_handler(exc_type, _handler)
 
 
 @asynccontextmanager
@@ -48,6 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings or get_settings()
     app.include_router(health_router)
+    app.include_router(approvals_router)
+    _install_approval_exception_handlers(app)
     return app
 
 

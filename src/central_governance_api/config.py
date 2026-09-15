@@ -78,6 +78,32 @@ class Settings(BaseSettings):
     # --- Device inventory (v10/v11: explicitly NOT a security control) ---
     device_denylist_enabled: bool = Field(default=True)
 
+    # --- Approval workflow deadlines (v11 §11 step 2) ---
+    # No specific values are attested anywhere in the recovered v11
+    # narrative — these three are this implementation's own reasoned
+    # defaults, not copied from a spec, and deliberately conservative
+    # (short) rather than generous: a HIGH-risk action sitting unclaimed
+    # or unresolved for a long time is itself worth surfacing, not
+    # quietly tolerating.
+    approval_decision_ttl_seconds: int = Field(
+        default=3600,
+        description="PENDING -> EXPIRED if nobody decides within this "
+        "window (expires_at = created_at + this).",
+    )
+    approval_execution_window_seconds: int = Field(
+        default=900,
+        description="ACCEPTED -> EXPIRED if nobody claims within this "
+        "window after a decision (execution_deadline = decided_at + "
+        "this).",
+    )
+    approval_execution_lease_seconds: int = Field(
+        default=300,
+        description="EXECUTING -> FAILED_UNKNOWN if no report-result "
+        "arrives within this window after claim (executing_lease_"
+        "expires_at = claimed_at + this) — fail-closed, per v10's "
+        "'crash 後無法確認就 fail closed'.",
+    )
+
     @field_validator("oidc_issuer", "oidc_jwks_url")
     @classmethod
     def _check_https(cls, v: str, info) -> str:  # noqa: ARG003
