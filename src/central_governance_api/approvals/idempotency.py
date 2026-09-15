@@ -70,7 +70,8 @@ def fingerprint_request(payload: dict[str, Any]) -> str:
 async def find_replayed_response(
     session: AsyncSession,
     *,
-    principal_subject: str,
+    principal_issuer: str,
+    principal_sub: str,
     endpoint: str,
     resource_id: str,
     idempotency_key: str,
@@ -90,7 +91,8 @@ async def find_replayed_response(
     """
     existing = await session.scalar(
         select(IdempotencyRecord).where(
-            IdempotencyRecord.scope_principal == principal_subject,
+            IdempotencyRecord.scope_principal_issuer == principal_issuer,
+            IdempotencyRecord.scope_principal_sub == principal_sub,
             IdempotencyRecord.scope_endpoint == endpoint,
             IdempotencyRecord.scope_resource_id == resource_id,
             IdempotencyRecord.idempotency_key == idempotency_key,
@@ -106,7 +108,8 @@ async def find_replayed_response(
 async def check_replay_or_raise(
     session: AsyncSession,
     *,
-    principal_subject: str,
+    principal_issuer: str,
+    principal_sub: str,
     endpoint: str,
     resource_id: str,
     idempotency_key: str,
@@ -146,7 +149,8 @@ async def check_replay_or_raise(
     """
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal_subject,
+        principal_issuer=principal_issuer,
+        principal_sub=principal_sub,
         endpoint=endpoint,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -160,7 +164,8 @@ async def check_replay_or_raise(
 def record_response(
     session: AsyncSession,
     *,
-    principal_subject: str,
+    principal_issuer: str,
+    principal_sub: str,
     endpoint: str,
     resource_id: str,
     idempotency_key: str,
@@ -176,7 +181,8 @@ def record_response(
     """
     session.add(
         IdempotencyRecord(
-            scope_principal=principal_subject,
+            scope_principal_issuer=principal_issuer,
+            scope_principal_sub=principal_sub,
             scope_endpoint=endpoint,
             scope_resource_id=resource_id,
             idempotency_key=idempotency_key,
@@ -189,7 +195,8 @@ def record_response(
 async def commit_or_replay(
     session: AsyncSession,
     *,
-    principal_subject: str,
+    principal_issuer: str,
+    principal_sub: str,
     endpoint: str,
     resource_id: str,
     idempotency_key: str,
@@ -233,7 +240,8 @@ async def commit_or_replay(
         await session.rollback()
         replayed = await find_replayed_response(
             session,
-            principal_subject=principal_subject,
+            principal_issuer=principal_issuer,
+            principal_sub=principal_sub,
             endpoint=endpoint,
             resource_id=resource_id,
             idempotency_key=idempotency_key,

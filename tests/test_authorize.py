@@ -42,7 +42,9 @@ NO_ROLES = _principal("eve")
 
 
 def _record_owned_by(principal: Principal) -> ApprovalOwnership:
-    return ApprovalOwnership(requester_subject=principal.subject)
+    return ApprovalOwnership(
+        requester_issuer=principal.issuer, requester_sub=principal.sub
+    )
 
 
 # --- CREATE --------------------------------------------------------------

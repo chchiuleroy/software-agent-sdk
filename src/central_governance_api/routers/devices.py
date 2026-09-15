@@ -8,7 +8,7 @@ given (owner, device_id) pair was deliberately revoked so it can't
 silently come back.
 
 Schemas and error types live directly in this file rather than in a
-`devices/` subpackage mirroring `approvals/` — two endpoints and five
+`devices/` subpackage mirroring `approvals/` — two endpoints and six
 small, single-purpose exception classes don't earn the extra structure
 yet (YAGNI); if this surface grows, splitting into a subpackage then is a
 mechanical refactor, same as `commit_or_replay`/`RequestModel` already
@@ -19,30 +19,34 @@ Both write endpoints follow the same idempotency-check -> ... -> single
 commit-or-replay shape as `routers/approvals.py` — see that module's
 docstring for the full rationale; not repeated here.
 
-Code-review disclosed gap, not fixed in this pass: any authenticated
-principal may self-register a device with no quota or rate limit (see
-`register_device`'s own docstring for the reasoning on why no *role* is
-required). Review confirmed this is a legitimate resource-exhaustion /
-namespace-squatting surface — an attacker with any valid token could
-register a large number of never-reused, permanently-occupied device_id
-values (see the DeviceRegistration table's own docstring: revoke never
-deletes a row) — not merely a theoretical nitpick. Mitigations review
-suggested (per-principal registration quota, unpredictable/system-
-generated device_id values instead of caller-chosen ones, or scoping
-device_id uniqueness per-owner instead of globally) are all real feature/
-policy decisions, not mechanical fixes, so they're deliberately left for
-Roy to weigh rather than picked here unilaterally.
+Code-review resource-exhaustion finding, fixed 2026-09-15 (Roy's decision
+after weighing the three mitigations review raised): ``device_id``
+uniqueness is now scoped per-owner rather than global (models.py), and
+``register_device`` enforces a per-principal registration quota
+(``config.device_registration_quota``). Roy explicitly declined the third
+option (server-generated, non-caller-chosen device_id) — a caller-chosen
+name is more useful in the admin audit trail than an opaque UUID, and
+nothing in this service ties ``device_id`` to anything security-relevant
+(see the "NOT a security control" framing above) that a predictable name
+would actually endanger.
+
+Per-owner uniqueness has one structural consequence worth calling out:
+``device_id`` is no longer a value that identifies a single row *service-
+wide* (two different owners can each have their own "laptop"). REVOKE
+therefore addresses a specific registration by its own row id (returned
+from ``register_device``'s response), not by the ``device_id`` string —
+the same pattern ``routers/approvals.py`` already uses (server-issued
+UUID in the path, not the client-chosen ``request_id``).
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +60,7 @@ from central_governance_api.approvals.idempotency import (
 from central_governance_api.auth.dependencies import get_current_principal
 from central_governance_api.auth.oidc import Principal
 from central_governance_api.clock import now_utc
+from central_governance_api.config import Settings, get_settings_dependency
 from central_governance_api.db import get_db_session
 from central_governance_api.http_params import IdempotencyKeyHeader
 from central_governance_api.models import (
@@ -69,12 +74,24 @@ from central_governance_api.schemas_base import RequestModel
 # Non-empty, URL-safe (no `/`, `?`, `#`, whitespace, or control characters)
 # — code-review Medium: without this, an empty or path-unsafe device_id
 # could be written by register but never addressed by revoke's
-# `{device_id}` path segment, and would permanently occupy the (globally
-# unique, never-deleted — see DeviceRegistration's docstring) namespace.
+# `{device_id}` path segment, and would permanently occupy the per-owner
+# namespace (revoke never deletes the row — see DeviceRegistration's
+# docstring).
 _DEVICE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,64}$"
 
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
+
+
+def _display_subject(issuer: str, sub: str) -> str:
+    """Builds the same ``f"{issuer}#{sub}"`` shape ``Principal.subject``
+    computes, for response bodies only — DB storage and security
+    comparisons use the separate issuer/sub columns (see models.py's
+    module docstring); this is purely a human-readable convenience so the
+    HTTP response shape doesn't have to change just because the storage
+    layer did.
+    """
+    return f"{issuer}#{sub}"
 
 
 # --- Errors (see module docstring on why these live here, not a shared module) --
@@ -82,22 +99,23 @@ router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 
 class DeviceNotFoundError(Exception):
     """Maps to HTTP 404. REVOKE also raises this — deliberately, not just
-    when the device truly doesn't exist — for a caller who is neither the
-    device's owner nor ``governance.admin``: see ``revoke_device``'s own
-    comment on why that case is folded into "not found" rather than a
-    distinguishable 403 (code-review Low: existence-enumeration risk).
+    when the registration truly doesn't exist — for a caller who is
+    neither the device's owner nor ``governance.admin``: see
+    ``revoke_device``'s own comment on why that case is folded into "not
+    found" rather than a distinguishable 403 (code-review Low: existence-
+    enumeration risk).
     """
 
-    def __init__(self, *, device_id: str) -> None:
-        self.device_id = device_id
-        super().__init__(f"no registered device with id {device_id!r}")
+    def __init__(self, *, identifier: str) -> None:
+        self.identifier = identifier
+        super().__init__(f"no registered device with id {identifier!r}")
 
 
 class DeviceAlreadyRegisteredError(Exception):
-    """CREATE only: ``device_id`` already exists in ``device_registrations``
-    — the column is globally unique (not scoped per owner), so this
-    covers both "someone else already registered this device_id" and "you
-    already registered it yourself" alike. Maps to HTTP 409.
+    """CREATE only: this ``device_id`` is already registered *for this
+    owner* — uniqueness is per-owner (models.py), so this never fires
+    because of a different principal's device_id choice, only your own.
+    Maps to HTTP 409.
     """
 
     def __init__(self, *, device_id: str) -> None:
@@ -106,8 +124,8 @@ class DeviceAlreadyRegisteredError(Exception):
 
 
 class DeviceRevokedError(Exception):
-    """CREATE only: this exact ``(owner_subject, device_id)`` pair is on
-    the denylist (see ``models.DeviceDenylistEntry``'s docstring) — the
+    """CREATE only: this exact ``(owner, device_id)`` pair is on the
+    denylist (see ``models.DeviceDenylistEntry``'s docstring) — the
     device was deliberately revoked and this service intentionally never
     lets it quietly come back via a fresh register call. Maps to HTTP 409.
     """
@@ -119,6 +137,20 @@ class DeviceRevokedError(Exception):
         )
 
 
+class DeviceQuotaExceededError(Exception):
+    """CREATE only: this principal has already registered
+    ``config.device_registration_quota`` devices (revoked ones count too
+    — see ``DeviceRegistration``'s docstring on why revocation doesn't
+    free the slot). Code-review finding, Roy's decision 2026-09-15: bound
+    total registrations per principal now that per-owner uniqueness alone
+    doesn't stop one account from unbounded row growth. Maps to HTTP 429.
+    """
+
+    def __init__(self, *, quota: int) -> None:
+        self.quota = quota
+        super().__init__(f"device registration quota ({quota}) exceeded")
+
+
 class DeviceAlreadyRevokedError(Exception):
     """REVOKE only: the conditional UPDATE's ``WHERE revoked_at IS NULL``
     affected zero rows — same "request doesn't match current resource
@@ -127,9 +159,9 @@ class DeviceAlreadyRevokedError(Exception):
     Maps to HTTP 409.
     """
 
-    def __init__(self, *, device_id: str) -> None:
-        self.device_id = device_id
-        super().__init__(f"device_id {device_id!r} was already revoked")
+    def __init__(self, *, registration_id: uuid.UUID) -> None:
+        self.registration_id = registration_id
+        super().__init__(f"device registration {registration_id} was already revoked")
 
 
 # --- Schemas -------------------------------------------------------------
@@ -147,6 +179,7 @@ class DeviceRegisterResponse(BaseModel):
 
 
 class DeviceRevokeResponse(BaseModel):
+    id: uuid.UUID
     device_id: str
     revoked_at: datetime
     revoked_by_subject: str
@@ -163,21 +196,23 @@ async def register_device(
     idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings_dependency),
 ) -> DeviceRegisterResponse:
     """Any authenticated principal may self-register a device, regardless
     of role — device inventory isn't a security control (see module
     docstring), so there's no privilege to gate here, and requiring a
     role would just add onboarding friction for none of the usual
-    reasons (least privilege doesn't apply to a hint). ``owner_subject``
-    is always ``principal.subject``, never taken from the request body —
-    nobody can register a device on someone else's behalf. See the module
-    docstring for the disclosed, not-fixed-here quota/namespace-abuse gap
-    this permissive posture implies.
+    reasons (least privilege doesn't apply to a hint). ``owner_issuer``/
+    ``owner_sub`` are always the caller's own, never taken from the
+    request body — nobody can register a device on someone else's behalf.
+    Bounded instead by ``device_registration_quota`` (see module
+    docstring) rather than a role gate.
     """
     fingerprint = fingerprint_request(body.model_dump(mode="json"))
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REGISTER_ENDPOINT,
         resource_id=body.device_id,
         idempotency_key=idempotency_key,
@@ -188,22 +223,36 @@ async def register_device(
 
     denylisted = await session.scalar(
         select(DeviceDenylistEntry).where(
-            DeviceDenylistEntry.owner_subject == principal.subject,
+            DeviceDenylistEntry.owner_issuer == principal.issuer,
+            DeviceDenylistEntry.owner_sub == principal.sub,
             DeviceDenylistEntry.device_id == body.device_id,
         )
     )
     if denylisted is not None:
         raise DeviceRevokedError(device_id=body.device_id)
 
+    existing_count = await session.scalar(
+        select(func.count())
+        .select_from(DeviceRegistration)
+        .where(
+            DeviceRegistration.owner_issuer == principal.issuer,
+            DeviceRegistration.owner_sub == principal.sub,
+        )
+    )
+    quota = settings.device_registration_quota
+    if existing_count is not None and existing_count >= quota:
+        raise DeviceQuotaExceededError(quota=quota)
+
     device = DeviceRegistration(
-        owner_subject=principal.subject, device_id=body.device_id
+        owner_issuer=principal.issuer,
+        owner_sub=principal.sub,
+        device_id=body.device_id,
     )
     session.add(device)
     try:
-        await session.flush()  # trip the device_id UNIQUE constraint now,
-        # deterministically, rather than only discovering it much later
-        # when the final commit runs (see the DeviceRegistration table's
-        # own docstring: device_id is globally unique, not per-owner).
+        await session.flush()  # trip the (owner, device_id) UNIQUE
+        # constraint now, deterministically, rather than only discovering
+        # it much later when the final commit runs.
     except IntegrityError:
         await session.rollback()
         # Code-review High: a bare "unique violation -> already
@@ -221,7 +270,8 @@ async def register_device(
         # test (see tests/test_devices_router.py's module docstring).
         replayed = await check_replay_or_raise(
             session,
-            principal_subject=principal.subject,
+            principal_issuer=principal.issuer,
+            principal_sub=principal.sub,
             endpoint=_REGISTER_ENDPOINT,
             resource_id=body.device_id,
             idempotency_key=idempotency_key,
@@ -233,12 +283,13 @@ async def register_device(
     response = DeviceRegisterResponse(
         id=device.id,
         device_id=device.device_id,
-        owner_subject=device.owner_subject,
+        owner_subject=_display_subject(device.owner_issuer, device.owner_sub),
         registered_at=device.registered_at,
     )
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REGISTER_ENDPOINT,
         resource_id=body.device_id,
         idempotency_key=idempotency_key,
@@ -247,7 +298,8 @@ async def register_device(
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REGISTER_ENDPOINT,
         resource_id=body.device_id,
         idempotency_key=idempotency_key,
@@ -260,12 +312,12 @@ async def register_device(
 
 # --- REVOKE ------------------------------------------------------------------
 
-_REVOKE_ENDPOINT = "POST /devices/{device_id}/revoke"
+_REVOKE_ENDPOINT = "POST /devices/{registration_id}/revoke"
 
 
-@router.post("/{device_id}/revoke", response_model=DeviceRevokeResponse)
+@router.post("/{registration_id}/revoke", response_model=DeviceRevokeResponse)
 async def revoke_device(
-    device_id: Annotated[str, Path(pattern=_DEVICE_ID_PATTERN)],
+    registration_id: uuid.UUID,
     idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
@@ -274,41 +326,52 @@ async def revoke_device(
     reasoning applies here too (see ``approvals/authorize.py``'s module
     docstring, design decision 2): revoking doesn't require executing
     anything on anyone's behalf, so admin-as-kill-switch is safe to allow.
+
+    Addressed by the registration's own server-issued ``id``, not the
+    caller-chosen ``device_id`` string — see module docstring on why
+    per-owner uniqueness makes ``device_id`` alone ambiguous service-wide.
     """
+    resource_id = str(registration_id)
     fingerprint = fingerprint_request({})
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REVOKE_ENDPOINT,
-        resource_id=device_id,
+        resource_id=resource_id,
         idempotency_key=idempotency_key,
         request_fingerprint=fingerprint,
     )
     if replayed is not None:
         return DeviceRevokeResponse.model_validate(replayed)
 
-    device = await session.scalar(
-        select(DeviceRegistration).where(DeviceRegistration.device_id == device_id)
-    )
+    device = await session.get(DeviceRegistration, registration_id)
     is_admin = "governance.admin" in principal.roles
-    is_owner = device is not None and principal.subject == device.owner_subject
+    is_owner = device is not None and (principal.issuer, principal.sub) == (
+        device.owner_issuer,
+        device.owner_sub,
+    )
     if device is None or not (is_admin or is_owner):
         # Code-review Low: deliberately the SAME error, same status code,
         # for "doesn't exist" and "exists but you're not the owner" —
         # distinguishing them would let any authenticated principal
         # enumerate the device inventory by probing IDs and reading which
         # error comes back (403 vs 404). Only `governance.admin` or the
-        # true owner ever learns whether a given device_id is real.
-        raise DeviceNotFoundError(device_id=device_id)
+        # true owner ever learns whether a given registration is real.
+        raise DeviceNotFoundError(identifier=resource_id)
 
     now = now_utc()
     result = await session.execute(
         update(DeviceRegistration)
         .where(
-            DeviceRegistration.device_id == device_id,
+            DeviceRegistration.id == registration_id,
             DeviceRegistration.revoked_at.is_(None),
         )
-        .values(revoked_at=now, revoked_by_subject=principal.subject)
+        .values(
+            revoked_at=now,
+            revoked_by_issuer=principal.issuer,
+            revoked_by_sub=principal.sub,
+        )
         .returning(DeviceRegistration.id)
     )
     if result.scalar_one_or_none() is None:
@@ -323,49 +386,60 @@ async def revoke_device(
         # caveat as register's.
         replayed = await check_replay_or_raise(
             session,
-            principal_subject=principal.subject,
+            principal_issuer=principal.issuer,
+            principal_sub=principal.sub,
             endpoint=_REVOKE_ENDPOINT,
-            resource_id=device_id,
+            resource_id=resource_id,
             idempotency_key=idempotency_key,
             request_fingerprint=fingerprint,
-            conflict_error=DeviceAlreadyRevokedError(device_id=device_id),
+            conflict_error=DeviceAlreadyRevokedError(registration_id=registration_id),
         )
         return DeviceRevokeResponse.model_validate(replayed)
 
     # See models.DeviceDenylistEntry's docstring: this is what actually
     # stops the same (owner, device_id) pair from quietly re-registering
-    # — device_id's own UNIQUE constraint on DeviceRegistration already
-    # blocks a literal re-INSERT forever (revoke never deletes the row),
-    # but the denylist gives register_device() a specific, friendly
-    # "this was revoked" error instead of an opaque conflict.
+    # — the (owner, device_id) UNIQUE constraint on DeviceRegistration
+    # already blocks a literal re-INSERT forever (revoke never deletes
+    # the row), but the denylist gives register_device() a specific,
+    # friendly "this was revoked" error instead of an opaque conflict.
     session.add(
-        DeviceDenylistEntry(owner_subject=device.owner_subject, device_id=device_id)
+        DeviceDenylistEntry(
+            owner_issuer=device.owner_issuer,
+            owner_sub=device.owner_sub,
+            device_id=device.device_id,
+        )
     )
     session.add(
         AdminAuditEvent(
             event_type="device_revoked",
-            actor_subject=principal.subject,
-            origin_device_id=device_id,
+            actor_issuer=principal.issuer,
+            actor_sub=principal.sub,
+            origin_device_id=device.device_id,
         )
     )
 
     response = DeviceRevokeResponse(
-        device_id=device_id, revoked_at=now, revoked_by_subject=principal.subject
+        id=registration_id,
+        device_id=device.device_id,
+        revoked_at=now,
+        revoked_by_subject=_display_subject(principal.issuer, principal.sub),
     )
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REVOKE_ENDPOINT,
-        resource_id=device_id,
+        resource_id=resource_id,
         idempotency_key=idempotency_key,
         request_fingerprint=fingerprint,
         response=response.model_dump(mode="json"),
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REVOKE_ENDPOINT,
-        resource_id=device_id,
+        resource_id=resource_id,
         idempotency_key=idempotency_key,
         request_fingerprint=fingerprint,
     )

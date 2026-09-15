@@ -188,15 +188,46 @@ header 在所有 write 端點（含既有的 `approvals` 六端點）原本都�
 
 尚未開始：`wait`（第 3 步，LISTEN/NOTIFY）。
 
-**待 Roy 拍板**（審查發現，範圍會動到已 commit 的 schema，不是我能單方面決定的）：
-`requester_subject`／`decision_actor_subject`／`verifier_subject`／
-`actor_subject`／`owner_subject` 等欄位目前只存 `Principal.subject`
-（`f"{issuer}#{sub}"` 拼接字串），但 `auth/oidc.py` 的 `Principal.subject`
-docstring 明講安全性比對該用 `(issuer, sub)` tuple。審查結論：目前風險比
-原本設想的低（OIDC issuer URL 依規範不含 fragment，且 resolver 目前只信任
-單一 issuer），但仍是「資料模型違反身份 API 契約」，值得趁 schema 還新
-（尚未接上任何真實資料庫）現在就拆成 `*_issuer`／`*_sub` 兩欄，牽動
-`models.py` 六張表與 Alembic migration。
+## `(issuer, sub)` 身份欄位拆分 + devices 配額/範圍修正（已完成，2026-09-15）
+
+兩項先前「待 Roy 拍板」的項目，Roy 拍板後同一輪一起做（兩者都動 schema，同一
+次 migration 比較有效率）：
+
+**身份欄位拆分**：`requester_subject`／`decision_actor_subject`／
+`verifier_subject`／`actor_subject`／`owner_subject`／`revoked_by_subject`／
+`scope_principal` 等欄位，原本都只存 `Principal.subject`（`f"{issuer}#{sub}"`
+拼接字串），現在全部拆成 `*_issuer`／`*_sub` 兩欄，安全性比對（self-approval
+檢查、ownership 檢查）也全部改成 `(issuer, sub)` tuple 比對，不再比字串。
+影響範圍：`models.py` 七張表、`approvals/authorize.py`
+（`ApprovalOwnership`）、`approvals/idempotency.py`（所有函式的
+`principal_subject` 參數拆成兩個）、`routers/approvals.py`／
+`routers/devices.py`／`routers/audit.py` 全部呼叫點。HTTP 回應層級刻意不變
+——回應仍回傳單一 `xxx_subject` 字串欄位（router 端用
+`f"{issuer}#{sub}"` 組出來），只有 DB 儲存與安全比對層改變，API 呼叫端無感。
+因為這個 repo 尚未接上任何真實資料庫，直接改寫既有的 initial migration，不
+另開一支 follow-up migration。
+
+**devices 配額與範圍**：Roy 三選一（配額 / 系統產生 ID / per-owner 範圍）拍板
+「per-owner 範圍 + 配額」，明確不做系統產生 ID（呼叫端自訂名稱對 admin 稽核
+更有用，且目前沒有任何安全邏輯依賴 device_id 的不可預測性）：
+- `device_registrations.device_id` 唯一性從全域改成 `(owner_issuer,
+  owner_sub, device_id)` 複合唯一——這本身也是修正一個既有內部不一致：
+  `DeviceDenylistEntry` 原本就是 per-owner 設計，只有主表是全域，兩者現在一致
+- 新增 `config.device_registration_quota`（預設 20，含已撤銷的累計筆數，因為
+  撤銷不釋放 row）
+- **per-owner 範圍改變帶出一個原本沒設計好的問題**：revoke 端點原本用
+  `device_id` 字串當路徑參數，但 per-owner 唯一性下，兩個不同 owner 可以有同
+  一個 `device_id`（如都叫 "laptop"），revoke 若還用 `device_id` 定址會有歧
+  義——改成用註冊時回傳的伺服器 `id`（UUID）定址，跟 approvals 端點「路徑用
+  伺服器 UUID，不用呼叫端自訂的 request_id」同一個既有慣例
+- 兩個小重構順手做：`_get_settings` 從 `routers/approvals.py` 私有函式搬到
+  `config.py` 變成公開的 `get_settings_dependency()`（`devices.py` 配額檢查
+  也需要）
+
+10 個新／修改測試（duplicate device_id 分成 same-owner 409／different-owner
+成功兩支、配額測試用自訂低配額的獨立 app instance、revoke 全面改用
+registration id）。**144 個測試全過**（100 純邏輯 + 44 真實 DB 整合），
+ruff/pyright 皆 0 issue。
 
 ## 開發
 

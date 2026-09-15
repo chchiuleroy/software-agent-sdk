@@ -133,7 +133,8 @@ async def test_create_approval_persists_a_real_row(client, signing_key, db_sessi
 
     row = await db_session.get(PendingApprovalRecord, uuid.UUID(created["id"]))
     assert row is not None
-    assert row.requester_subject == f"{ISSUER}#alice"
+    assert row.requester_issuer == ISSUER
+    assert row.requester_sub == "alice"
     assert row.status == "pending"
 
 

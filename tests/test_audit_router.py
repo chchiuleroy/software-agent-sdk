@@ -42,17 +42,22 @@ def _auth(token: str) -> dict[str, str]:
 
 
 async def _register_and_revoke(client, signing_key, sub: str) -> str:
+    """Returns the registration's own ``device_id`` (not its server ``id``
+    — revoke needs the latter, since device_id uniqueness is per-owner
+    now, not global; see routers/devices.py's module docstring)."""
     token = _sign(signing_key, sub=sub, roles=["agent.operator"])
     device_id = f"device-{uuid.uuid4()}"
-    await client.post(
+    register_resp = await client.post(
         "/api/v1/devices/register",
         json={"device_id": device_id},
         headers={**_auth(token), "Idempotency-Key": f"reg-{uuid.uuid4()}"},
     )
-    await client.post(
-        f"/api/v1/devices/{device_id}/revoke",
+    registration_id = register_resp.json()["id"]
+    revoke_resp = await client.post(
+        f"/api/v1/devices/{registration_id}/revoke",
         headers={**_auth(token), "Idempotency-Key": f"rev-{uuid.uuid4()}"},
     )
+    assert revoke_resp.status_code == 200, revoke_resp.text
     return device_id
 
 

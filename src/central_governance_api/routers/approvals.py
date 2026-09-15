@@ -52,7 +52,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -97,7 +97,7 @@ from central_governance_api.approvals.state_machine import (
 from central_governance_api.auth.dependencies import get_current_principal
 from central_governance_api.auth.oidc import Principal
 from central_governance_api.clock import now_utc
-from central_governance_api.config import Settings
+from central_governance_api.config import Settings, get_settings_dependency
 from central_governance_api.db import get_db_session
 from central_governance_api.http_params import IdempotencyKeyHeader
 from central_governance_api.models import (
@@ -133,10 +133,6 @@ _OUTCOME_EVENTS: dict[str, ApprovalEvent] = {
 _DECISION_DB_VALUES: dict[str, str] = {"accept": "accepted", "reject": "rejected"}
 
 
-def _get_settings(request: Request) -> Settings:
-    return request.app.state.settings
-
-
 async def _load_record(
     session: AsyncSession, approval_id: uuid.UUID
 ) -> PendingApprovalRecord:
@@ -147,7 +143,9 @@ async def _load_record(
 
 
 def _ownership(record: PendingApprovalRecord) -> ApprovalOwnership:
-    return ApprovalOwnership(requester_subject=record.requester_subject)
+    return ApprovalOwnership(
+        requester_issuer=record.requester_issuer, requester_sub=record.requester_sub
+    )
 
 
 # --- CREATE --------------------------------------------------------------
@@ -161,12 +159,13 @@ async def create_approval(
     idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
-    settings: Settings = Depends(_get_settings),
+    settings: Settings = Depends(get_settings_dependency),
 ) -> ApprovalSummary:
     fingerprint = fingerprint_request(body.model_dump(mode="json"))
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CREATE_ENDPOINT,
         resource_id=body.request_id,
         idempotency_key=idempotency_key,
@@ -195,7 +194,8 @@ async def create_approval(
     now = now_utc()
     record = PendingApprovalRecord(
         request_id=body.request_id,
-        requester_subject=principal.subject,
+        requester_issuer=principal.issuer,
+        requester_sub=principal.sub,
         origin_device_id=body.origin_device_id,
         conversation_id=body.conversation_id,
         action_event_id=body.action_event_id,
@@ -223,7 +223,8 @@ async def create_approval(
     )
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CREATE_ENDPOINT,
         resource_id=body.request_id,
         idempotency_key=idempotency_key,
@@ -232,7 +233,8 @@ async def create_approval(
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CREATE_ENDPOINT,
         resource_id=body.request_id,
         idempotency_key=idempotency_key,
@@ -255,13 +257,14 @@ async def decide_approval(
     idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
-    settings: Settings = Depends(_get_settings),
+    settings: Settings = Depends(get_settings_dependency),
 ) -> DecideResponse:
     resource_id = str(approval_id)
     fingerprint = fingerprint_request(body.model_dump(mode="json"))
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_DECIDE_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -308,14 +311,16 @@ async def decide_approval(
         ApprovalDecision(
             approval_request_id=approval_id,
             decision=_DECISION_DB_VALUES[body.decision],
-            decision_actor_subject=principal.subject,
+            decision_actor_issuer=principal.issuer,
+            decision_actor_sub=principal.sub,
         )
     )
 
     response = DecideResponse(id=approval_id, status=target.value, decided_at=now)
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_DECIDE_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -324,7 +329,8 @@ async def decide_approval(
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_DECIDE_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -346,13 +352,14 @@ async def claim_approval(
     idempotency_key: IdempotencyKeyHeader,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
-    settings: Settings = Depends(_get_settings),
+    settings: Settings = Depends(get_settings_dependency),
 ) -> ClaimResponse:
     resource_id = str(approval_id)
     fingerprint = fingerprint_request({})  # no request body to fingerprint
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CLAIM_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -410,7 +417,8 @@ async def claim_approval(
     )
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CLAIM_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -419,7 +427,8 @@ async def claim_approval(
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CLAIM_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -447,7 +456,8 @@ async def report_result(
     fingerprint = fingerprint_request(body.model_dump(mode="json"))
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REPORT_RESULT_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -520,7 +530,8 @@ async def report_result(
         session.add(
             AdminAuditEvent(
                 event_type="approval_pre_claim_abort",
-                actor_subject=principal.subject,
+                actor_issuer=principal.issuer,
+                actor_sub=principal.sub,
                 approval_request_id=approval_id,
             )
         )
@@ -528,7 +539,8 @@ async def report_result(
     response = ReportResultResponse(id=approval_id, status=target.value)
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REPORT_RESULT_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -537,7 +549,8 @@ async def report_result(
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_REPORT_RESULT_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -564,7 +577,8 @@ async def cancel_approval(
     fingerprint = fingerprint_request({})
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CANCEL_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -597,7 +611,8 @@ async def cancel_approval(
     session.add(
         AdminAuditEvent(
             event_type="approval_cancelled",
-            actor_subject=principal.subject,
+            actor_issuer=principal.issuer,
+            actor_sub=principal.sub,
             approval_request_id=approval_id,
         )
     )
@@ -605,7 +620,8 @@ async def cancel_approval(
     response = CancelResponse(id=approval_id, status=target.value)
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CANCEL_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -614,7 +630,8 @@ async def cancel_approval(
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_CANCEL_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -646,7 +663,8 @@ async def create_reconciliation_finding(
     fingerprint = fingerprint_request(body.model_dump(mode="json"))
     replayed = await find_replayed_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_RECONCILE_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -670,7 +688,8 @@ async def create_reconciliation_finding(
         finding_type=body.finding_type,
         conclusion=body.conclusion,
         note=body.note,
-        verifier_subject=principal.subject,
+        verifier_issuer=principal.issuer,
+        verifier_sub=principal.sub,
         evidence=body.evidence,
     )
     session.add(finding)
@@ -684,7 +703,8 @@ async def create_reconciliation_finding(
     )
     record_response(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_RECONCILE_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,
@@ -693,7 +713,8 @@ async def create_reconciliation_finding(
     )
     replayed = await commit_or_replay(
         session,
-        principal_subject=principal.subject,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
         endpoint=_RECONCILE_ENDPOINT,
         resource_id=resource_id,
         idempotency_key=idempotency_key,

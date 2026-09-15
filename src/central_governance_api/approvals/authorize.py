@@ -35,13 +35,14 @@ folded in directly below rather than kept as a separate changelog.
    distributed-execution architecture doesn't support at all.
 
    Review correction: the reasoning above is about *requester identity*,
-   not actual device binding — ``ApprovalOwnership`` only carries
-   ``requester_subject``, and ``DeviceRegistration`` (models.py) is
-   explicitly documented as "not a cryptographic device proof". So what
-   this module actually guarantees is narrower than "only the originating
-   device can execute": it's "only a principal holding ``agent.operator``
-   whose *identity* matches ``requester_subject`` can claim/report" — the
-   same principal authenticated from a second device would still pass.
+   not actual device binding — ``ApprovalOwnership`` only carries the
+   requester's ``(issuer, sub)``, and ``DeviceRegistration`` (models.py)
+   is explicitly documented as "not a cryptographic device proof". So
+   what this module actually guarantees is narrower than "only the
+   originating device can execute": it's "only a principal holding
+   ``agent.operator`` whose *identity* matches the requester's can
+   claim/report" — the same principal authenticated from a second device
+   would still pass.
    If "must be the literal originating device" ever becomes a real
    requirement, it needs its own check against ``origin_device_id`` at
    the router layer; this module doesn't attempt it. A device going
@@ -115,11 +116,17 @@ class ApprovalOwnership:
 
     Deliberately not the ORM row itself, so this module never imports
     SQLAlchemy: a router builds one of these from a loaded
-    ``PendingApprovalRecord``'s ``requester_subject`` column once it has
-    the row.
+    ``PendingApprovalRecord``'s ``requester_issuer``/``requester_sub``
+    columns once it has the row. Two fields, not one concatenated string
+    — ``(issuer, sub)`` is the actual OIDC identity key; see
+    ``auth/oidc.py``'s ``Principal.subject`` docstring on why the
+    concatenated string form isn't meant for security-relevant
+    comparisons (code-review finding, fixed 2026-09-15 — this dataclass
+    used to be exactly that concatenated-string mistake).
     """
 
-    requester_subject: str
+    requester_issuer: str
+    requester_sub: str
 
 
 def authorize_create(principal: Principal) -> None:
@@ -159,7 +166,10 @@ def authorize_on_record(
         raise ValueError("authorize_create() handles CREATE, not this function")
 
     is_admin = "governance.admin" in principal.roles
-    is_owner = principal.subject == record.requester_subject
+    is_owner = (principal.issuer, principal.sub) == (
+        record.requester_issuer,
+        record.requester_sub,
+    )
 
     if action is ApprovalAction.DECIDE:
         if not (is_admin or "agent.approver" in principal.roles):

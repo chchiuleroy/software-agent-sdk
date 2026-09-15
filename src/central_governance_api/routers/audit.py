@@ -85,7 +85,7 @@ async def list_audit_events(
         AuditEventResponse(
             id=row.id,
             event_type=row.event_type,
-            actor_subject=row.actor_subject,
+            actor_subject=f"{row.actor_issuer}#{row.actor_sub}",
             origin_device_id=row.origin_device_id,
             approval_request_id=row.approval_request_id,
             occurred_at=row.occurred_at,

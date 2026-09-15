@@ -10,6 +10,7 @@ RFC 9068 ``at+jwt`` profile this module deliberately does not assume).
 
 from __future__ import annotations
 
+from fastapi import Request
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -77,6 +78,19 @@ class Settings(BaseSettings):
 
     # --- Device inventory (v10/v11: explicitly NOT a security control) ---
     device_denylist_enabled: bool = Field(default=True)
+    device_registration_quota: int = Field(
+        default=20,
+        description="Max devices one principal may register in total "
+        "(counts revoked rows too — device_id is per-owner unique but "
+        "never freed by revocation, see DeviceRegistration's docstring, "
+        "so this bounds total namespace consumption, not just active "
+        "devices). Code-review finding: zero-role self-registration with "
+        "no bound at all is a real resource-exhaustion surface, not "
+        "merely theoretical. Default is a reasoned guess for the "
+        "'internal small-scale validation' deployment this service "
+        "currently targets, not a value attested anywhere in the "
+        "recovered v11 narrative.",
+    )
 
     # --- Approval workflow deadlines (v11 §11 step 2) ---
     # No specific values are attested anywhere in the recovered v11
@@ -133,3 +147,15 @@ def get_settings() -> Settings:
                     "only for the known local-dev http Keycloak instance."
                 )
     return settings
+
+
+def get_settings_dependency(request: Request) -> Settings:
+    """FastAPI dependency reading the ``Settings`` constructed once at app
+    startup off ``app.state`` (see ``main.py``'s lifespan) — mirrors
+    ``auth/dependencies.get_oidc_resolver``'s pattern. Promoted here from a
+    private ``_get_settings`` duplicated in ``routers/approvals.py`` once
+    ``routers/devices.py`` needed the identical dependency, same reason
+    ``commit_or_replay``/``RequestModel`` were promoted (see
+    ``approvals/idempotency.py``/``schemas_base.py``).
+    """
+    return request.app.state.settings

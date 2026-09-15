@@ -38,6 +38,7 @@ from central_governance_api.routers.devices import (
     DeviceAlreadyRegisteredError,
     DeviceAlreadyRevokedError,
     DeviceNotFoundError,
+    DeviceQuotaExceededError,
     DeviceRevokedError,
 )
 from central_governance_api.routers.devices import router as devices_router
@@ -65,6 +66,7 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     DeviceNotFoundError: (404, "device_not_found"),
     DeviceAlreadyRegisteredError: (409, "device_already_registered"),
     DeviceRevokedError: (409, "device_revoked"),
+    DeviceQuotaExceededError: (429, "device_quota_exceeded"),
     DeviceAlreadyRevokedError: (409, "device_already_revoked"),
 }
 

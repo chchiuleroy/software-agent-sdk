@@ -2,13 +2,24 @@
 
 Mirrors the tables described in Phase 1 route-wiring design v11 (§4
 ``PendingApprovalRecord``, §5 transition table, §3 device inventory / audit
-/ idempotency sections). This module only defines the schema — the
-conditional-update transition logic (§5's table), digest verification, and
-endpoint behavior are step 2 of v11 §11's implementation order, not this
-skeleton pass.
+/ idempotency sections), now with v11 §11 step 2's conditional-update
+logic and RBAC matrix implemented on top (see ``approvals/`` and
+``routers/``).
 
 Every table is Postgres-specific (native ``UUID``/``JSONB``) since this
 service has exactly one supported backend, per the design.
+
+Identity columns (code-review finding, fixed 2026-09-15): every place
+this schema previously stored a single ``*_subject: String(512)`` column
+(``Principal.subject``'s ``f"{issuer}#{sub}"`` concatenation) now stores
+the issuer and sub as two separate columns instead. ``auth/oidc.py``'s
+``Principal.subject`` docstring always said the concatenated string
+shouldn't be used for security-relevant comparisons — only ``(issuer,
+sub)`` as a tuple is the real identity key per OIDC — and this schema was
+the one place that guidance wasn't actually followed. Rewritten directly
+into the original migration (``alembic/versions/6bd53bd8f7a5_...``)
+rather than layered as a follow-up migration, since nothing has been
+deployed against this schema outside disposable local test clusters.
 """
 
 from __future__ import annotations
@@ -36,6 +47,13 @@ class Base(DeclarativeBase):
 
 def _uuid_pk() -> Mapped[uuid.UUID]:
     return mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+
+# An OIDC issuer is a URL (can be long); `sub` is an IdP-opaque identifier,
+# conventionally short. These two lengths are reused for every identity
+# column pair in this module rather than picked ad hoc per table.
+_ISSUER_LEN = 512
+_SUB_LEN = 255
 
 
 # --- v11 §4/§5: the approval workflow's core record --------------------
@@ -66,7 +84,8 @@ class PendingApprovalRecord(Base):
 
     tenant_scope: Mapped[str] = mapped_column(String(64), default="default")
 
-    requester_subject: Mapped[str] = mapped_column(String(512), index=True)
+    requester_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    requester_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
     origin_device_id: Mapped[str] = mapped_column(String(64))
 
     conversation_id: Mapped[str] = mapped_column(String(128))
@@ -120,7 +139,12 @@ class PendingApprovalRecord(Base):
         CheckConstraint(
             f"status IN {APPROVAL_STATUSES!r}", name="ck_approval_status_valid"
         ),
-        Index("ix_approval_requester_status", "requester_subject", "status"),
+        Index(
+            "ix_approval_requester_status",
+            "requester_issuer",
+            "requester_sub",
+            "status",
+        ),
     )
 
 
@@ -139,7 +163,8 @@ class ApprovalDecision(Base):
         unique=True,
     )
     decision: Mapped[str] = mapped_column(String(16))  # "accepted" | "rejected"
-    decision_actor_subject: Mapped[str] = mapped_column(String(512))
+    decision_actor_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    decision_actor_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
     decided_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -177,7 +202,8 @@ class ReconciliationFinding(Base):
     finding_type: Mapped[str] = mapped_column(String(32))
     conclusion: Mapped[str | None] = mapped_column(String(32), nullable=True)
     note: Mapped[str] = mapped_column(Text, default="")
-    verifier_subject: Mapped[str] = mapped_column(String(512))
+    verifier_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    verifier_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
     evidence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -205,38 +231,68 @@ class DeviceRegistration(Base):
     """v11 §2/§4. `origin_device_id` inventory — a registration hint, not a
     cryptographic device proof (see v11 §2's honesty note; this table's
     existence does not itself make claim/decide endpoints "device-bound").
+
+    ``device_id`` uniqueness is scoped per-owner (code-review finding,
+    fixed 2026-09-15), not global: the original global-unique constraint
+    let one principal's registration permanently claim a device_id string
+    out of a namespace every other principal shared, and was already
+    inconsistent with ``DeviceDenylistEntry``'s own per-owner design (see
+    that table's docstring) — this fix makes the two agree rather than
+    introducing new policy. It does not by itself bound how many devices
+    one principal can register in total; see
+    ``config.device_registration_quota`` / ``routers/devices.py`` for
+    that half of the code-review finding.
     """
 
     __tablename__ = "device_registrations"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    owner_subject: Mapped[str] = mapped_column(String(512), index=True)
-    device_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    owner_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN), index=True)
+    owner_sub: Mapped[str] = mapped_column(String(_SUB_LEN), index=True)
+    device_id: Mapped[str] = mapped_column(String(64), index=True)
     registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    revoked_by_subject: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    revoked_by_issuer: Mapped[str | None] = mapped_column(
+        String(_ISSUER_LEN), nullable=True
+    )
+    revoked_by_sub: Mapped[str | None] = mapped_column(String(_SUB_LEN), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_issuer",
+            "owner_sub",
+            "device_id",
+            name="uq_device_registration_owner_device",
+        ),
+    )
 
 
 class DeviceDenylistEntry(Base):
-    """v11 §2: after revocation, (owner_subject, device_id) goes here so the
-    same device_id can't just be immediately re-registered.
+    """v11 §2: after revocation, (owner, device_id) goes here so the same
+    device_id can't just be immediately re-registered by that same owner.
     """
 
     __tablename__ = "device_denylist_entries"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    owner_subject: Mapped[str] = mapped_column(String(512))
+    owner_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    owner_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
     device_id: Mapped[str] = mapped_column(String(64))
     denied_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
     __table_args__ = (
-        UniqueConstraint("owner_subject", "device_id", name="uq_denylist_owner_device"),
+        UniqueConstraint(
+            "owner_issuer",
+            "owner_sub",
+            "device_id",
+            name="uq_denylist_owner_device",
+        ),
     )
 
 
@@ -254,7 +310,8 @@ class AdminAuditEvent(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     event_type: Mapped[str] = mapped_column(String(64), index=True)
-    actor_subject: Mapped[str] = mapped_column(String(512), index=True)
+    actor_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN), index=True)
+    actor_sub: Mapped[str] = mapped_column(String(_SUB_LEN), index=True)
     origin_device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     approval_request_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -282,7 +339,8 @@ class IdempotencyRecord(Base):
     __tablename__ = "idempotency_records"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    scope_principal: Mapped[str] = mapped_column(String(512))
+    scope_principal_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    scope_principal_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
     scope_endpoint: Mapped[str] = mapped_column(String(128))
     scope_resource_id: Mapped[str] = mapped_column(String(128))
     idempotency_key: Mapped[str] = mapped_column(String(128))
@@ -294,7 +352,8 @@ class IdempotencyRecord(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "scope_principal",
+            "scope_principal_issuer",
+            "scope_principal_sub",
             "scope_endpoint",
             "scope_resource_id",
             "idempotency_key",
