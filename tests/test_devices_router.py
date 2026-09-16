@@ -27,10 +27,12 @@ from __future__ import annotations
 import asyncio
 import uuid
 from typing import Any
+from unittest import mock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from central_governance_api.auth.dependencies import get_oidc_resolver
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
@@ -401,6 +403,159 @@ async def test_register_quota_race_is_prevented_by_advisory_lock(
             f"advisory lock did not prevent quota overshoot: {succeeded} "
             f"registrations succeeded against a quota of {quota} "
             f"(statuses={statuses})"
+        )
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(
+                delete(DeviceRegistration).where(
+                    DeviceRegistration.owner_issuer == ISSUER,
+                    DeviceRegistration.owner_sub == principal_sub,
+                )
+            )
+            await conn.execute(
+                delete(IdempotencyRecord).where(
+                    IdempotencyRecord.scope_principal_issuer == ISSUER,
+                    IdempotencyRecord.scope_principal_sub == principal_sub,
+                )
+            )
+        await engine.dispose()
+
+
+async def test_register_quota_race_same_idempotency_key_replays_not_429(
+    public_jwks, signing_key
+):
+    """Code-review Medium (round-5 confirmation review, found on the
+    advisory-lock fix itself): the lock above closes the count/insert
+    race, but opened a narrower one against a request's OWN concurrent
+    retry — if two requests carrying the SAME idempotency key (a genuine
+    retry, not a different registration) race while quota has exactly one
+    slot left, the loser's *initial* ``find_replayed_response()`` call ran
+    before the winner committed and legitimately saw nothing yet; without
+    re-checking after acquiring the advisory lock, the loser would raise
+    ``DeviceQuotaExceededError`` instead of replaying the winner's success
+    — breaking the idempotency contract this whole mechanism exists for
+    (a safe retry must always replay, never surface as a conflict). Fixed
+    by re-running ``find_replayed_response()`` in ``register_device``
+    right after the lock is acquired, before the quota count.
+
+    Same real-engine/genuine-concurrency rationale as the test above (a
+    single SAVEPOINT-isolated session can't race against itself), reused
+    here with quota=1 and every concurrent request sharing one
+    idempotency key AND one device_id, so they are all, by definition,
+    retries of the exact same logical request. All must come back 201
+    with an IDENTICAL body (proving replay, not a fresh registration);
+    none may come back 429.
+
+    Code-review Low, addressed (not just disclosed): a first version of
+    this test relied on plain ``asyncio.gather`` for overlap and turned
+    out to be a false-negative risk exactly as review warned — verified by
+    temporarily reverting the fix above and re-running just this test,
+    which still passed, because ``asyncio.gather`` gave no guarantee every
+    request reached its first DB call before any of them could have
+    already committed and been replayed there, never even reaching the
+    lock/quota logic this test means to exercise. Fixed with a real
+    ``asyncio.Barrier``: monkeypatching ``find_replayed_response`` in this
+    router module so each task's FIRST call blocks until all
+    `concurrent_requests` tasks have reached it, forcing them to actually
+    still be racing when they proceed past that point — deterministic
+    proof, not a timing hope.
+    """
+    quota = 1
+    concurrent_requests = 8
+    principal_sub = f"quota-replay-race-{uuid.uuid4()}"
+    device_id = f"device-{uuid.uuid4()}"
+    shared_idempotency_key = f"register-{uuid.uuid4()}"
+    low_quota_settings = Settings(
+        oidc_issuer=ISSUER,
+        oidc_jwks_url=JWKS_URL,
+        oidc_audience=AUDIENCE,
+        database_url=_TEST_DATABASE_URL,
+        device_registration_quota=quota,
+    )
+    engine = create_engine(low_quota_settings)
+    try:
+        async with engine.connect():
+            pass
+    except Exception as exc:
+        await engine.dispose()
+        pytest.skip(f"no reachable test Postgres at {_TEST_DATABASE_URL!r}: {exc}")
+
+    app = create_app(low_quota_settings)
+    resolver = OIDCPrincipalResolver(
+        low_quota_settings, preloaded_keys=public_jwks, never_refresh_keys=True
+    )
+    app.dependency_overrides[get_oidc_resolver] = lambda: resolver
+
+    session_factory = create_session_factory(engine)
+
+    async def _real_db_session_override():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db_session] = _real_db_session_override
+
+    # Force genuine overlap AT THE LOCK ITSELF, not just at the top of the
+    # handler: an earlier version of this test barriered every task's
+    # FIRST find_replayed_response() call instead (the very first await in
+    # register_device) and turned out to be its own false-negative risk —
+    # once released, asyncio's scheduler let one task race all the way
+    # through lock+count+insert+commit before the others even issued
+    # their (barriered) replay-check query, so the others found the
+    # winner's row via that INITIAL check and correctly replayed WITHOUT
+    # ever reaching the lock/count section this test means to exercise
+    # (verified empirically: that version passed even against the
+    # pre-fix code, under pytest-asyncio specifically, despite reliably
+    # reproducing the bug in a plain `asyncio.run()` script — proof its
+    # "overlap" wasn't actually where it mattered). Barriering at the
+    # `pg_advisory_xact_lock` call itself instead guarantees all
+    # `concurrent_requests` tasks are genuinely queued at the REAL
+    # Postgres advisory lock when it releases — enforced by Postgres's
+    # own mutual exclusion, not by hoping the Python scheduler cooperates.
+    barrier = asyncio.Barrier(concurrent_requests)
+    barriered_task_ids: set[int] = set()
+    real_execute = AsyncSession.execute
+
+    async def _barrier_before_lock_execute(self, statement, *args, **kwargs):
+        if "pg_advisory_xact_lock" in str(statement):
+            task_id = id(asyncio.current_task())
+            if task_id not in barriered_task_ids:
+                barriered_task_ids.add(task_id)
+                await barrier.wait()
+        return await real_execute(self, statement, *args, **kwargs)
+
+    try:
+        token = _sign(signing_key, sub=principal_sub, roles=["agent.operator"])
+        transport = ASGITransport(app=app)
+        with mock.patch.object(
+            AsyncSession,
+            "execute",
+            _barrier_before_lock_execute,
+        ):
+            async with AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+
+                async def _one_register() -> tuple[int, dict[str, Any]]:
+                    resp = await client.post(
+                        "/api/v1/devices/register",
+                        json={"device_id": device_id},
+                        headers=_auth(token, shared_idempotency_key),
+                    )
+                    return resp.status_code, resp.json()
+
+                results = await asyncio.gather(
+                    *(_one_register() for _ in range(concurrent_requests))
+                )
+
+        statuses = [status for status, _ in results]
+        bodies = [body for _, body in results]
+        assert statuses == [201] * concurrent_requests, (
+            "a retry sharing the winner's own idempotency key must always "
+            f"replay 201, never surface as a quota conflict (statuses={statuses})"
+        )
+        assert all(body == bodies[0] for body in bodies), (
+            "every response must be the exact same replayed body, not a "
+            f"freshly-computed one (bodies={bodies})"
         )
     finally:
         async with engine.begin() as conn:

@@ -264,6 +264,29 @@ async def register_device(
         )
     )
 
+    # Code-review Medium (round-5 confirmation review): the lock above
+    # closes the count/insert race, but opens a narrower one against
+    # idempotent retries specifically — if this request's own concurrent
+    # retry (same idempotency key) is what filled the last quota slot
+    # while we were blocked waiting for the lock, the initial
+    # find_replayed_response() call above ran before that retry committed
+    # and legitimately saw nothing yet. Without re-checking here, we'd
+    # raise DeviceQuotaExceededError instead of replaying that retry's own
+    # success — a safe retry must always replay, never surface as a
+    # quota conflict. Re-running the read now (past the lock) sees a fresh
+    # Read Committed snapshot that includes the winner's commit.
+    replayed = await find_replayed_response(
+        session,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
+        endpoint=_REGISTER_ENDPOINT,
+        resource_id=body.device_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+    )
+    if replayed is not None:
+        return DeviceRegisterResponse.model_validate(replayed)
+
     existing_count = await session.scalar(
         select(func.count())
         .select_from(DeviceRegistration)
