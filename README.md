@@ -449,7 +449,52 @@ High + 2 個 Medium，全部已修正**：
 engine/app/resolver 建置邏輯。
 
 **165 個測試全過**（151 舊有 + 14 新增，含審查後修正版本），ruff/pyright
-皆 0 issue。commit 待本輪收尾後統一送出（本機未 push）。
+皆 0 issue。commit `ccaf214`，本機未 push。
+
+## MVP 正式環境驗證 + console-script 進入點 bug 修復（已完成，2026-09-16）
+
+v11 §11 三步驟程式碼完成後，Roy 要求「先建正式資料庫和 DB role 當成 MVP
+來用，然後測試呼叫」——第一次真的用 `uv run central-governance-api`（正式
+進入點，不是 pytest 的 in-process `httpx.ASGITransport`）對接真實
+PostgreSQL 與真實 Keycloak，而不只是本機臨時測試叢集。
+
+**正式基礎設施**：獨立的 `cga` DB role + `central_governance` 資料庫（`ops/create_production_db.sql`，
+Roy 用自己保管的 Postgres superuser 密碼執行；此檔含真實產生的密碼，已被
+`.gitignore` 排除不進版控）；獨立的 `roy-governance` Keycloak realm + 三個
+service-account 測試身份（`cga-test-operator`/`cga-test-approver`/`cga-test-admin`，
+各自對應 RBAC 矩陣的一個角色，`ops/create_keycloak_test_identities.bat`）——
+Phase 0 dev-mode 驗證用的舊測試 realm 在切換到正式 PostgreSQL 後端時已被清空，
+這次是重新建立，不是重用。過程中兩個腳本本身也各修了一個真 bug 才能用：
+①`.bat` 檔一開始寫了中文/em-dash 註解，這台機器的預設 codepage 把嵌入的
+UTF-8 位元組解讀成批次特殊字元，讓 cmd.exe 的解析器整個爛掉，改寫成純
+ASCII 才正常執行 ②`-s config."dotted.key"=value` 這種 kcadm 語法在 Windows
+上會回「Cannot parse the JSON」且靜默不建立任何東西，改用 `-f <json檔案>`
+才成功建出 protocol mapper（`roles` 攤平 claim + `aud` 注入）。
+
+**發現並修復一個先前完全沒被抓到的真實 bug**：`src/central_governance_api/__init__.py`
+從第 1 步骨架起就還是 `uv init` 產生的預設樣板（只印一行字），但
+`pyproject.toml` 的 `[project.scripts]` 進入點指的正是這支樣板函式，不是
+`main.py` 裡真正啟動 uvicorn 的 `main()`——因為所有既有測試都是透過
+`main.create_app()` 走 in-process ASGITransport，從來沒有人真的執行過這個
+套件自己的 console-script 進入點，直到今天真的用 `uv run central-governance-api`
+啟動才發現完全沒有啟動任何伺服器。委派小o 審查（`codex exec` CLI 背景執行
+卡住 30 分鐘完全無輸出，改用 computer-use 操作 Codex 桌面 App，依既有 CLI
+卡住降級路徑）確認修法無循環 import 風險，並建議更乾淨的版本——讓
+`pyproject.toml` 直接指向 `central_governance_api.main:main`，不透過
+`__init__.py` 中介（避免 import 套件本身就要拉進整條 app 組裝依賴鏈）；已
+採納，`__init__.py` 恢復為空檔案，新增 `tests/test_packaging.py` 直接解析
+`importlib.metadata` 的 `console_scripts` 進入點，驗證它真的指向
+`main.main`——這正是這個 bug 當初該被抓到卻沒有的那個測試。
+
+**端對端驗證**：用 `cga-test-operator`/`cga-test-approver` 兩個真實 Keycloak
+token（不同身份，因為 self-approval 會被擋）跑完整
+create→wait（真的卡住，approver 身份 decide 後約 1.5 秒被 NOTIFY 喚醒，不是
+空等 20 秒逾時）→claim→report-result 流程，最終狀態正確落在 `applied`；
+`/whoami` 確認 OIDC allowlist 正確過濾掉 Keycloak 預設塞的 3 個系統角色
+（`default-roles-*`/`offline_access`/`uma_authorization`）。
+
+**166 個測試全過**（165 + 新增的 packaging 進入點回歸測試），ruff/pyright 皆
+0 issue。commit `5b04b41`，本機未 push。
 
 ## 開發
 
@@ -465,4 +510,7 @@ uv run pyright
 
 寫任何會真正連上正式資料庫的程式碼前，先確認 v11 §3「強制部署條件」
 （15 條）已經落實——獨立低權限 service account、PostgreSQL ACL 限制、DB
-拒絕桌面端直連等。這個 repo 目前只是骨架，還沒到需要那些條件生效的階段。
+拒絕桌面端直連等。2026-09-16 已完成其中「獨立低權限 service account」與
+「資料庫/憑證隔離」兩項（見上方「MVP 正式環境驗證」章節）；其餘條件（DB
+拒絕桌面端直連的網路層限制、migration 專用帳號與執行期帳號分離等）**尚未
+落實**，目前仍是 MVP 等級的隔離，不是完整的 15 條件正式部署。
