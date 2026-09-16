@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from openhands.agent_server.api import api_lifespan, create_app
 from openhands.agent_server.config import Config
@@ -105,6 +105,54 @@ class TestBuildInitializedConfig:
         )
         assert merged.secret_key is not None
         assert merged.secret_key.get_secret_value() == "explicit-secret"
+
+    def test_governance_fields_applied_from_init_request(self):
+        """A warm-pool pod boots 'personal' (the OH_GOVERNANCE_* env vars
+        aren't known yet at pod-warm time) and only becomes 'team' once
+        /api/init delivers the per-user bridge token — env vars placed in
+        InitRequest.env cannot do this, because the dormant Config this
+        merges against was already built from the process environment
+        before this request ever arrives."""
+        base = Config(deferred_init=True)
+        assert base.governance_deployment_mode == "personal"
+        assert base.governance_bridge_token is None
+
+        merged = _build_initialized_config(
+            base,
+            InitRequest(
+                governance_deployment_mode="team",
+                governance_bridge_token=SecretStr("bridge-secret"),
+            ),
+        )
+
+        assert merged.governance_deployment_mode == "team"
+        assert merged.governance_bridge_token is not None
+        assert merged.governance_bridge_token.get_secret_value() == "bridge-secret"
+
+    def test_governance_bridge_token_blank_rejected_at_init_request_level(self):
+        """``_build_initialized_config`` merges via ``Config.model_copy
+        (update=...)``, which does not re-run Config's own field
+        validators — so InitRequest needs its own matching check, or a
+        blank token smuggled through /api/init would reach a live Config
+        that Config's own direct-construction validation would have
+        rejected."""
+        with pytest.raises(ValidationError):
+            InitRequest(governance_bridge_token="   ")
+
+    def test_governance_fields_untouched_when_not_provided(self):
+        """Matches every other InitRequest field: omitting it keeps
+        whatever the dormant pod booted with, it does not reset to the
+        Config default."""
+        base = Config(
+            deferred_init=True,
+            governance_deployment_mode="team",
+            governance_bridge_token=SecretStr("booted-with-this"),
+        )
+        merged = _build_initialized_config(base, InitRequest(session_api_keys=["k1"]))
+
+        assert merged.governance_deployment_mode == "team"
+        assert merged.governance_bridge_token is not None
+        assert merged.governance_bridge_token.get_secret_value() == "booted-with-this"
 
 
 class TestRouterMounting:
@@ -368,6 +416,87 @@ class TestEndToEndOverLifespan:
                 assert app.root_path == "/agent-server-123/agent-server", (
                     f"root_path was not updated after /api/init: {app.root_path!r}"
                 )
+            finally:
+                _reset_conversation_singleton()
+
+    def test_governance_bridge_token_takes_effect_after_deferred_init(self, tmp_path):
+        """A warm-pool pod boots 'personal' (no OH_GOVERNANCE_* env vars are
+        known at pool-warm time); /api/init is the only way a per-user
+        'team' mode + bridge token can ever reach this server. Drives the
+        real route end to end (not by calling authorize_confirmation_response
+        directly) so this also proves respond_to_confirmation reads
+        app.state.config fresh on every call rather than a value captured
+        when the route module was imported."""
+        from unittest.mock import AsyncMock
+
+        from openhands.agent_server.dependencies import get_event_service
+
+        _reset_conversation_singleton()
+        cfg = Config(
+            deferred_init=True,
+            conversations_path=tmp_path / "convs",
+            bash_events_dir=tmp_path / "bash",
+        )
+        app = create_app(cfg)
+        stub_event_service = AsyncMock()
+        app.dependency_overrides[get_event_service] = lambda: stub_event_service
+        conversation_id = "11111111-1111-1111-1111-111111111111"
+        confirm_url = (
+            f"/api/conversations/{conversation_id}/events/respond_to_confirmation"
+        )
+        with TestClient(app) as client:
+            try:
+                resp = client.post(
+                    "/api/init",
+                    json={
+                        "conversations_path": str(tmp_path / "u" / "convs"),
+                        "bash_events_dir": str(tmp_path / "u" / "bash"),
+                        "governance_deployment_mode": "team",
+                        "governance_bridge_token": "s3cr3t",
+                    },
+                )
+                assert resp.status_code == 200
+
+                # No token → refused, even though the server was dormant
+                # (and therefore 'personal') when the process booted.
+                resp = client.post(confirm_url, json={"accept": True})
+                assert resp.status_code == 403
+
+                # Correct token, delivered only via /api/init → accepted.
+                resp = client.post(
+                    confirm_url,
+                    json={"accept": True},
+                    headers={"X-Governance-Bridge-Token": "s3cr3t"},
+                )
+                assert resp.status_code == 200
+            finally:
+                _reset_conversation_singleton()
+
+    def test_init_rejects_blank_governance_bridge_token(self, tmp_path):
+        """A blank token sent via /api/init must be rejected at request
+        validation (422), not silently accepted into a live Config whose
+        own direct-construction validator would have refused it."""
+        _reset_conversation_singleton()
+        cfg = Config(
+            deferred_init=True,
+            conversations_path=tmp_path / "convs",
+            bash_events_dir=tmp_path / "bash",
+        )
+        app = create_app(cfg)
+        with TestClient(app) as client:
+            try:
+                resp = client.post(
+                    "/api/init",
+                    json={
+                        "conversations_path": str(tmp_path / "u" / "convs"),
+                        "bash_events_dir": str(tmp_path / "u" / "bash"),
+                        "governance_deployment_mode": "team",
+                        "governance_bridge_token": "   ",
+                    },
+                )
+                assert resp.status_code == 422
+                # The dormant server must remain dormant, not initializing.
+                assert client.get("/api/init").json()["state"] == "dormant"
             finally:
                 _reset_conversation_singleton()
 

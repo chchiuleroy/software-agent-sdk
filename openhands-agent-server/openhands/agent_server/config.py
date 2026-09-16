@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from openhands.agent_server.conversation_lease import DEFAULT_LEASE_TTL_SECONDS
 from openhands.agent_server.env_parser import (
@@ -67,6 +67,28 @@ def _default_web_url() -> str | None:
         return web_url
 
     return None
+
+
+def reject_blank_secret(
+    value: SecretStr | None, *, field_name: str
+) -> SecretStr | None:
+    """A blank/whitespace-only secret is almost certainly a misconfigured
+    source (e.g. ``OH_GOVERNANCE_BRIDGE_TOKEN=""``, or the same field left
+    blank in a ``POST /api/init`` payload), not an intentional value — fail
+    validation instead of quietly becoming an unmatchable-by-design
+    fail-closed secret that's hard to diagnose.
+
+    Module-level (not a method) so both ``Config``'s own field validator and
+    ``InitRequest``'s equivalent field in ``init_router.py`` share one
+    definition of "blank" — ``Config.model_copy(update=...)`` (used to
+    merge a dormant ``Config`` with a deferred-init payload) does not
+    re-run field validators on the updated fields, so without this,
+    ``InitRequest`` could smuggle a blank token past ``Config``'s own
+    check entirely.
+    """
+    if value is not None and not value.get_secret_value().strip():
+        raise ValueError(f"{field_name} must not be blank")
+    return value
 
 
 class WebhookSpec(BaseModel):
@@ -340,6 +362,46 @@ class Config(BaseModel):
             "be restored between restarts."
         ),
     )
+    governance_deployment_mode: Literal["personal", "team"] = Field(
+        default="personal",
+        description=(
+            "'personal' (default): today's behavior, entirely unchanged — the "
+            "existing POST .../respond_to_confirmation endpoint accepts any "
+            "caller holding a valid session API key, exactly as before. "
+            "'team': that endpoint's accept=True path additionally requires "
+            "governance_bridge_token (see below) on the "
+            "X-Governance-Bridge-Token header, so a central-governance-api "
+            "bridge process — not an arbitrary session-API-key holder — is "
+            "the only caller that can move a conversation out of "
+            "WAITING_FOR_CONFIRMATION. accept=False (reject) is never gated: "
+            "rejecting a pending action cannot grant elevated privilege, "
+            "matching roy_self_approval.py's existing self-approval check, "
+            "which also only ever blocks the accept path."
+        ),
+    )
+    governance_bridge_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Shared secret a central-governance-api bridge process presents "
+            "on the X-Governance-Bridge-Token header to call the accept=True "
+            "path of POST .../respond_to_confirmation while "
+            "governance_deployment_mode is 'team'. Unrelated to "
+            "session_api_keys, which only gates 'can this caller talk to "
+            "this agent-server at all' — a session-API-key holder (e.g. the "
+            "Agent Canvas GUI) is not automatically a governance bridge. "
+            "If governance_deployment_mode is 'team' and this is unset, the "
+            "accept=True path is refused for every caller (fail closed) "
+            "rather than silently comparing against an absent value."
+        ),
+    )
+
+    @field_validator("governance_bridge_token")
+    @classmethod
+    def _reject_blank_governance_bridge_token(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        return reject_blank_secret(value, field_name="governance_bridge_token")
+
     web_url: str | None = Field(
         default_factory=_default_web_url,
         description=(

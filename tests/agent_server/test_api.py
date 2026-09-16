@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from openhands.agent_server.api import (
     _default_server_tmux_tmpdir,
@@ -670,3 +671,217 @@ class TestSelfApprovalDeniedHandler:
         body = response.json()
         assert body["error_code"] == "self_approval_denied"
         assert "self-approval not allowed" in body["detail"]
+        # The requester identity ('roy') must not leak into the response
+        # body — it is only safe to have it in the server-side log.
+        assert "roy" not in body["detail"]
+
+
+class TestGovernanceBridgeTokenGate:
+    """``POST .../respond_to_confirmation``'s ``accept=True`` path, gated by
+    ``X-Governance-Bridge-Token`` when ``governance_deployment_mode ==
+    "team"`` — see ``dependencies.authorize_confirmation_response``.
+
+    Exercised through real ASGI requests (TestClient) against the actual
+    mounted route, not by calling the dependency function directly, so this
+    proves the gate is really wired into ``event_router.py`` and reads
+    ``app.state.config`` at request time. ``get_event_service`` is
+    overridden with a stub so these tests isolate the authorization gate
+    itself from the (unrelated, heavier) machinery of driving a real
+    conversation into WAITING_FOR_CONFIRMATION.
+    """
+
+    @staticmethod
+    def _client_and_stub(config: Config) -> tuple[TestClient, AsyncMock]:
+        from openhands.agent_server.dependencies import get_event_service
+
+        app = create_app(config)
+        stub_event_service = AsyncMock()
+        app.dependency_overrides[get_event_service] = lambda: stub_event_service
+        return TestClient(app), stub_event_service
+
+    @staticmethod
+    def _respond(
+        client: TestClient,
+        *,
+        accept: bool,
+        token: str | None = None,
+    ):
+        conversation_id = "11111111-1111-1111-1111-111111111111"
+        headers = {"X-Governance-Bridge-Token": token} if token is not None else {}
+        return client.post(
+            f"/api/conversations/{conversation_id}/events/respond_to_confirmation",
+            json={"accept": accept, "reason": "test"},
+            headers=headers,
+        )
+
+    def test_personal_mode_accept_ignores_missing_token(self):
+        """Default deployment mode: today's behavior, completely unchanged."""
+        config = Config(static_files_path=None)
+        assert config.governance_deployment_mode == "personal"
+        client, stub = self._client_and_stub(config)
+
+        response = self._respond(client, accept=True)
+
+        assert response.status_code == 200
+        stub.respond_to_confirmation.assert_awaited_once()
+
+    def test_team_mode_accept_with_correct_token_passes(self):
+        config = Config(
+            static_files_path=None,
+            governance_deployment_mode="team",
+            governance_bridge_token="s3cr3t",
+        )
+        client, stub = self._client_and_stub(config)
+
+        response = self._respond(client, accept=True, token="s3cr3t")
+
+        assert response.status_code == 200
+        stub.respond_to_confirmation.assert_awaited_once()
+
+    def test_team_mode_accept_with_wrong_token_is_403(self):
+        config = Config(
+            static_files_path=None,
+            governance_deployment_mode="team",
+            governance_bridge_token="s3cr3t",
+        )
+        client, stub = self._client_and_stub(config)
+
+        response = self._respond(client, accept=True, token="wrong")
+
+        assert response.status_code == 403
+        stub.respond_to_confirmation.assert_not_awaited()
+
+    def test_team_mode_accept_with_missing_token_is_403(self):
+        config = Config(
+            static_files_path=None,
+            governance_deployment_mode="team",
+            governance_bridge_token="s3cr3t",
+        )
+        client, stub = self._client_and_stub(config)
+
+        response = self._respond(client, accept=True)
+
+        assert response.status_code == 403
+        stub.respond_to_confirmation.assert_not_awaited()
+
+    def test_team_mode_accept_fails_closed_when_token_unconfigured(self):
+        """An unconfigured bridge token must never be treated as 'no check
+        needed' — every accept=True caller is refused, even one that
+        supplies no token at all (which would otherwise trivially "match"
+        an absent expected value if compared naively)."""
+        config = Config(
+            static_files_path=None,
+            governance_deployment_mode="team",
+            governance_bridge_token=None,
+        )
+        client, stub = self._client_and_stub(config)
+
+        response = self._respond(client, accept=True)
+
+        assert response.status_code == 403
+        stub.respond_to_confirmation.assert_not_awaited()
+
+    def test_team_mode_reject_is_never_gated(self):
+        """accept=False cannot grant elevated privilege, so it is never
+        gated — even with no token, an unconfigured bridge token, and team
+        mode active all at once."""
+        config = Config(
+            static_files_path=None,
+            governance_deployment_mode="team",
+            governance_bridge_token=None,
+        )
+        client, stub = self._client_and_stub(config)
+
+        response = self._respond(client, accept=False)
+
+        assert response.status_code == 200
+        stub.respond_to_confirmation.assert_awaited_once()
+
+    def test_governance_bridge_token_masked_in_repr(self):
+        """``governance_bridge_token`` is ``SecretStr`` (matching the
+        existing ``secret_key`` field's precedent) specifically so that
+        logging or otherwise stringifying a ``Config`` instance — e.g. an
+        unrelated error message that happens to include ``repr(config)`` —
+        can never leak the raw token. Pins that this field actually uses
+        that type, not just that a plain string happens not to appear
+        somewhere incidental."""
+        config = Config(
+            static_files_path=None,
+            governance_deployment_mode="team",
+            governance_bridge_token="s3cr3t",
+        )
+
+        assert "s3cr3t" not in repr(config)
+        assert "s3cr3t" not in str(config.governance_bridge_token)
+        # The actual Pydantic serialization boundary — the path any future
+        # debug/admin endpoint that dumps Config would go through — not
+        # just repr()/str(), which nothing in this codebase necessarily
+        # calls on a live Config today.
+        assert "s3cr3t" not in config.model_dump_json()
+
+    def test_governance_bridge_token_rejects_blank_value(self):
+        """A blank token is almost certainly a misconfigured env var
+        (``OH_GOVERNANCE_BRIDGE_TOKEN=""``), not an intentional secret —
+        must fail at Config construction, not silently become an
+        unmatchable-by-design fail-closed token nobody can diagnose."""
+        with pytest.raises(ValidationError):
+            Config(governance_bridge_token="   ")
+
+    def test_session_api_key_still_required_alongside_bridge_token(self):
+        """The bridge token is an *additional* requirement layered on top
+        of session-key auth (check_session_api_key, applied to the whole
+        /api router), not a replacement for it — a caller must satisfy
+        both, not either."""
+        config = Config(
+            static_files_path=None,
+            session_api_keys=["session-key"],
+            governance_deployment_mode="team",
+            governance_bridge_token="bridge-secret",
+        )
+        client, stub = self._client_and_stub(config)
+        conversation_id = "11111111-1111-1111-1111-111111111111"
+        url = f"/api/conversations/{conversation_id}/events/respond_to_confirmation"
+
+        # Correct bridge token but no session key → still rejected by the
+        # unrelated, pre-existing session-key gate.
+        response = client.post(
+            url,
+            json={"accept": True},
+            headers={"X-Governance-Bridge-Token": "bridge-secret"},
+        )
+        assert response.status_code == 401
+        stub.respond_to_confirmation.assert_not_awaited()
+
+        # Both satisfied → passes through.
+        response = client.post(
+            url,
+            json={"accept": True},
+            headers={
+                "X-Session-API-Key": "session-key",
+                "X-Governance-Bridge-Token": "bridge-secret",
+            },
+        )
+        assert response.status_code == 200
+        stub.respond_to_confirmation.assert_awaited_once()
+
+    def test_governance_bridge_token_header_documented_in_openapi(self):
+        """The header must be a real, documented parameter on this route —
+        not silently collapsed into the unrelated X-Session-API-Key
+        security scheme (both were, at one point, undistinguished
+        APIKeyHeader instances with no scheme_name, which FastAPI merges
+        into a single OpenAPI security scheme)."""
+        config = Config(static_files_path=None, governance_deployment_mode="team")
+        app = create_app(config)
+        client = TestClient(app)
+
+        schema = client.get("/openapi.json").json()
+
+        confirm_op = schema["paths"][
+            "/api/conversations/{conversation_id}/events/respond_to_confirmation"
+        ]["post"]
+        header_params = [
+            p for p in confirm_op.get("parameters", []) if p.get("in") == "header"
+        ]
+        assert any(p["name"] == "X-Governance-Bridge-Token" for p in header_params), (
+            header_params
+        )

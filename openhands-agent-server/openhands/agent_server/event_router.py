@@ -11,11 +11,17 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     status,
 )
 from starlette.responses import JSONResponse
 
-from openhands.agent_server.dependencies import get_event_service
+from openhands.agent_server.config import Config
+from openhands.agent_server.dependencies import (
+    authorize_confirmation_response,
+    get_event_service,
+    governance_bridge_token_header,
+)
 from openhands.agent_server.event_service import EventService
 from openhands.agent_server.models import (
     ConfirmationResponseRequest,
@@ -218,9 +224,25 @@ async def send_message(
     "/respond_to_confirmation", responses={404: {"description": "Item not found"}}
 )
 async def respond_to_confirmation(
+    http_request: Request,
     request: ConfirmationResponseRequest,
     event_service: EventService = Depends(get_event_service),
+    governance_bridge_token: str | None = Depends(governance_bridge_token_header),
 ) -> Success:
-    """Accept or reject a pending action in confirmation mode."""
+    """Accept or reject a pending action in confirmation mode.
+
+    In ``governance_deployment_mode == "team"`` (see ``config.py``), the
+    ``accept=True`` path additionally requires a valid
+    ``X-Governance-Bridge-Token`` — see
+    ``dependencies.authorize_confirmation_response`` for the full policy.
+    The check reads ``request.app.state.config`` here, at request time (not
+    a value captured at router-registration time), so a
+    ``POST /api/init`` deferred-init config change takes effect on the very
+    next call. ``accept=False`` is never gated.
+    """
+    config: Config = http_request.app.state.config
+    authorize_confirmation_response(
+        config, accept=request.accept, supplied_token=governance_bridge_token
+    )
     await event_service.respond_to_confirmation(request)
     return Success()

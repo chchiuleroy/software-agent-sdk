@@ -543,10 +543,23 @@ def _add_exception_handlers(api: FastAPI) -> None:
         a server fault — map it to 403 with a stable, machine-checkable
         error_code instead of falling through to the generic 500 every
         other unhandled ValueError gets (see roy_self_approval.py's known
-        limitations for the residual TOCTOU window this doesn't close)."""
+        limitations for the residual TOCTOU window this doesn't close).
+
+        The response body is a fixed, generic detail string — not
+        ``str(exc)`` — because that message embeds the requester identity
+        (see ``SelfApprovalDeniedError``'s raise site in
+        ``roy_self_approval.py``), which has no reason to be readable by
+        every caller entitled to see a 403. The full message, identity
+        included, still goes to the server-side log for anyone who actually
+        needs to debug this.
+        """
+        logger.info("Self-approval denied: %s", exc)
         return JSONResponse(
             status_code=403,
-            content={"detail": str(exc), "error_code": "self_approval_denied"},
+            content={
+                "detail": "self-approval not allowed",
+                "error_code": "self_approval_denied",
+            },
         )
 
     @api.exception_handler(RequestValidationError)

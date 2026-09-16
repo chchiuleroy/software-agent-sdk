@@ -19,10 +19,15 @@ from typing import Any, ClassVar, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from openhands.agent_server.bash_service import BashEventService
-from openhands.agent_server.config import Config, TelemetrySpec, WebhookSpec
+from openhands.agent_server.config import (
+    Config,
+    TelemetrySpec,
+    WebhookSpec,
+    reject_blank_secret,
+)
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.server_details_router import mark_initialization_complete
 from openhands.agent_server.telemetry import (
@@ -136,6 +141,38 @@ class InitRequest(BaseModel):
             "a deployment that expects telemetry must supply it here."
         ),
     )
+    governance_deployment_mode: Literal["personal", "team"] | None = Field(
+        default=None,
+        description=(
+            "Per-user override of Config.governance_deployment_mode. Without "
+            "this, a warm-pool pod keeps whatever mode it booted with "
+            "(normally 'personal')."
+        ),
+    )
+    governance_bridge_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Per-user override of Config.governance_bridge_token. Required "
+            "here (not just via OH_GOVERNANCE_BRIDGE_TOKEN at pod boot) for "
+            "'team' mode to be usable on a warm-pool pod: the dormant config "
+            "is built before this request arrives, so an env var placed in "
+            "``env`` below would not be picked up — Config is only ever "
+            "constructed from the process environment once, at boot."
+        ),
+    )
+
+    @field_validator("governance_bridge_token")
+    @classmethod
+    def _reject_blank_governance_bridge_token(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        """``_build_initialized_config`` merges this via
+        ``Config.model_copy(update=...)``, which does NOT re-run ``Config``'s
+        own field validators on the updated fields — so without a matching
+        check here, a blank token could reach a live ``Config`` instance via
+        ``/api/init`` despite ``Config`` itself rejecting one at direct
+        construction time. See ``reject_blank_secret``'s docstring."""
+        return reject_blank_secret(value, field_name="governance_bridge_token")
 
 
 class InitStatus(BaseModel):
@@ -183,6 +220,10 @@ def _build_initialized_config(base: Config, req: InitRequest) -> Config:
         updates["max_concurrent_runs"] = req.max_concurrent_runs
     if req.telemetry is not None:
         updates["telemetry"] = req.telemetry
+    if req.governance_deployment_mode is not None:
+        updates["governance_deployment_mode"] = req.governance_deployment_mode
+    if req.governance_bridge_token is not None:
+        updates["governance_bridge_token"] = req.governance_bridge_token
     return base.model_copy(update=updates)
 
 
