@@ -271,6 +271,40 @@ Medium + 4 個 Low，全部已修正**：
 1 個、撤銷仍計入配額 1 個、配額併發競爭 1 個）。**150 個測試全過**（102
 純邏輯 + 48 真實 DB 整合），ruff/pyright 皆 0 issue。
 
+**第五輪確認性審查改用 Codex 桌面 App**（`codex exec` CLI 連續兩次背景
+執行後無實質輸出，第一次卡在自己嘗試用 `rg` 搜尋自身 memory 檔案但環境無
+`rg` 可執行檔，第二次連 hook 都跑完卻無回應——依既有 CLI 卡住降級路徑改
+用 computer-use 操作桌面 App），**抓到 advisory lock 修法本身引入的 1 個
+新 Medium + 1 個 Low**：
+1. **[Medium]** 配額滿載時，兩個帶同一 idempotency key 的併發重試若卡在
+   advisory lock 上，後到者取得 lock 後重新計算配額會看到「已滿」，直接
+   拋 429，而非回放先到者的成功結果——原本的 `find_replayed_response()`
+   只在 lock 之前查一次，取得 lock 之後沒有再查，破壞了 idempotency 機
+   制的核心保證。已在 `register_device` 取得 lock 後、算配額前，再呼叫
+   一次 `find_replayed_response()`
+2. **[Low]** 併發測試沒有保證請求真的在 count 區段重疊
+
+新增的確認測試 `test_register_quota_race_same_idempotency_key_replays_not_429`
+第一版用 `asyncio.Barrier` 卡住每個 request「第一次」呼叫
+`find_replayed_response()`，實測發現在 pytest-asyncio 下即使還原掉修
+法，該測試仍穩定通過（asyncio 排程讓某個 task 在其他 task 發出第一次查
+詢前就已跑完整個 lock→count→insert→commit）——同一份邏輯改用普通
+`asyncio.run()` 腳本測卻能穩定重現 bug，證明是測試本身的假通過風險。改
+把 barrier 卡在真正的 `pg_advisory_xact_lock` 呼叫本身（monkeypatch
+`AsyncSession.execute`，偵測 SQL 字串含 `pg_advisory_xact_lock` 才卡），
+靠 Postgres 自己的互斥鎖保證同時性。連續驗證 3 次：還原修法前穩定
+3/3 fail，還原後穩定 3/3 pass。commit `9b0c45f`，**151 個測試全過**
+（102 純邏輯 + 49 真實 DB 整合），ruff/pyright 皆 0 issue。
+
+**第六輪確認審查**（同一 Codex 桌面 App session）確認這批修正**無
+Critical/High/Medium**，僅 2 個不阻塞的 Low：測試 docstring 仍描述已淘
+汰的第一版作法（barrier 卡 `find_replayed_response`，實際已改卡
+`AsyncSession.execute`）；barrier 缺少 timeout，若未來某 request 在抵達
+lock 前先失敗，其餘 task 會永遠等不到完整 barrier parties。已修正：更新
+docstring 反映目前實作，`gather` 外包 `asyncio.wait_for(timeout=10)`。
+commit `6d0efbb`，151 測試全過，ruff/pyright 皆 0 issue。**至此五輪委派
+審查全部收斂，v11 §11 第 2 步含兩項待拍板決策全部完工。**
+
 ## 開發
 
 ```bash
