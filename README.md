@@ -186,7 +186,7 @@ header 在所有 write 端點（含既有的 `approvals` 六端點）原本都�
 
 **141 個測試全過**（100 純邏輯 + 41 真實 DB 整合），ruff/pyright 皆 0 issue。
 
-尚未開始：`wait`（第 3 步，LISTEN/NOTIFY）。
+`wait`（第 3 步，LISTEN/NOTIFY）已完成，見下方新章節。
 
 ## `(issuer, sub)` 身份欄位拆分 + devices 配額/範圍修正（已完成，2026-09-15）
 
@@ -304,6 +304,152 @@ lock 前先失敗，其餘 task 會永遠等不到完整 barrier parties。已�
 docstring 反映目前實作，`gather` 外包 `asyncio.wait_for(timeout=10)`。
 commit `6d0efbb`，151 測試全過，ruff/pyright 皆 0 issue。**至此五輪委派
 審查全部收斂，v11 §11 第 2 步含兩項待拍板決策全部完工。**
+
+## `/wait` + 背景到期 sweep（v11 §11 第 3 步，已完成，2026-09-16）
+
+v11 設計記錄本身對 `/wait` 的完整 wire contract 沒有留下逐字稿（只留下 wiki
+的一句話：round-10 修過一個「LISTEN/commit 邊界」的 bug，沒留下修法本身長什
+麼樣）——這一步的具體實作細節（channel 設計、race-safety 論證、authorization
+矩陣）全部是依 PostgreSQL NOTIFY 本身的官方語意重新推導，不是照抄遺失的原文，
+所有模組 docstring 都誠實標明這點。
+
+**`approvals/notify.py`（新檔案）**：
+- `notify_status_changed()`：在狀態變更的同一個 DB transaction 內呼叫
+  `pg_notify()`——這是唯一需要遵守的正確性規則：Postgres 本身保證 NOTIFY 只
+  在該 transaction **真的 COMMIT** 時才送達，ROLLBACK 則完全不送，所以只要
+  永遠跟著同一筆 conditional UPDATE 放進同一個 transaction，就不需要額外的
+  「LISTEN/commit 邊界」處理——這正是 v10 那個遺失的 bug 修法在做的事，只是
+  用 Postgres 自己的保證重新推導出來，不是照抄
+- `wait_for_status_change()`：**先註冊 LISTEN，再做「目前是否已經不同」的
+  authoritative 讀取**，這個順序本身就是唯一的 race-safety 保證——LISTEN 註
+  冊之後才 commit 的任何變更，保證會被送達（不論是這次讀取就看到、還是等待
+  中被喚醒），不可能被漏掉。用獨立的 `asyncpg.connect()`，不是從 SQLAlchemy
+  連線池借連線——asyncpg 的 `add_listener()` callback API 在 SQLAlchemy async
+  engine 沒有對應介面，而且每個 `/wait` call 佔用一個連線到 `timeout_seconds`
+  （最長 30 秒）會跟其他 endpoint 共用的連線池搶資源。**已知規模限制**：一個
+  `/wait` 呼叫一條專屬連線，適合「內部小規模驗證」（README/config.py 反覆強
+  調的目前目標），不適合大量同時等待的部署——真要解決需要一個共享單一 LISTEN
+  連線＋in-process fan-out 的設計，這次沒做（YAGNI，多一組 reconnect/liveness
+  狀態機這個部署階段還不需要）
+- 單一共用 channel（`cga_approval_status_changed`），不是每個 approval id 一
+  個 channel——動態 channel 需要處理 id 轉 Postgres identifier 的跳脫問題，
+  這個規模下每個 listener 多花一次無關通知的 JSON decode+比對可以忽略
+
+**`GET /api/v1/approvals/{id}/wait`**（`routers/approvals.py`）：
+- Query 參數：`known_status`（必填，呼叫端最後觀察到的狀態）、
+  `timeout_seconds`（選填，預設 `settings.wait_default_timeout_seconds`=25，
+  硬上限 `settings.wait_max_timeout_seconds`=30——超過上限直接夾緊，不拒絕，
+  因為長輪詢呼叫端本來就該在逾時後立刻再打一次）
+- 兩條免等待的快速路徑：① `record.status != known_status` 時直接回
+  `changed=true`（不論這次讀取多舊都成立，某次變更已經發生是不會因為讀取時
+  間點而改變的事實）② `known_status` 已經是終態時直接回 `changed=false`（終
+  態依 `state_machine.TERMINAL_STATUSES` 定義永不再變，浪費一次完整逾時等待
+  沒有意義）
+- 不是 Idempotency-Key 保護的 write 端點——GET 本來就對重試安全，而且長輪詢
+  呼叫端本來就預期會重複呼叫，強加 idempotency key 只會增加摩擦沒有好處
+- **RBAC**（`approvals/authorize.py` 新增 `ApprovalAction.WAIT`）：完全是設計
+  推理，v11 遺失記錄從沒討論到 `/wait` 的授權——`governance.admin` 或任何
+  `agent.approver`（有資格決定「任何」記錄的角色，理所當然有資格確認是否已
+  經被別人搶先決定）或持有 `agent.operator` 的記錄本人（跟 CLAIM/REPORT_RESULT
+  同一組角色＋ownership 要求，因為 requester 自己的 agent-server 正是 `/wait`
+  設計時設想的主要呼叫端）
+- 每個會改變 `status` 的既有端點（decide／claim／report-result／cancel）都補
+  上 `notify_status_changed()` 呼叫；create（此時 id 還不存在，不可能有人在
+  等）與 reconciliation-findings（從不改變 `status`，見
+  `models.ReconciliationFinding` docstring）不需要
+
+**`approvals/sweep.py`（新檔案，背景到期 sweep）**：`state_machine.py` 的
+`ApprovalEvent.EXPIRE` 事件從第 2 步就定義好了，但沒有任何東西真的觸發
+它——每個 write 端點的 conditional UPDATE 只會「拒絕」過期後的寫入，不會主
+動把過期的 row 翻成 `expired`/`failed_unknown`，沒有這支 sweep，一個過期的
+`pending` row 會永遠停在 `pending`，`/wait` 呼叫端也永遠等不到「它過期了」的
+通知，只能等自己的 timeout。以單一 `asyncio` 背景任務（`main.py` 的
+lifespan 啟動/取消）逐一掃描三個 deadline 欄位（`expires_at`／
+`execution_deadline`／`executing_lease_expires_at`），沿用跟 write 端點完全
+相同的 conditional-UPDATE-with-RETURNING 寫法，每筆過期 row 都呼叫
+`notify_status_changed()`，讓正在等的 `/wait` 呼叫立刻醒來而不是空等到自己逾
+時。多 process 部署會需要加一個 `pg_advisory_lock` 式的單一領導者機制避免多
+個 sweep 互相搶同一批 row——這次沒做（YAGNI，目前部署就是單一 process，而且
+就算真的重複觸發，conditional UPDATE 本身也只是浪費一次查詢，不會造成錯誤）。
+`config.expiry_sweep_interval_seconds`（預設 10 秒）控制掃描頻率。
+
+**測試**：
+- `tests/test_sweep.py`（6 個）：純粹用既有 SAVEPOINT-isolated `db_session`
+  fixture 直接呼叫 `sweep_expired_approvals()`，驗證三個 deadline bucket 各
+  自轉去正確的終態、`executing` 過期落地在 `failed_unknown`（呼應 v10「crash
+  後無法確認就 fail closed」）、沒設 deadline 的 row 不會被誤掃、一次掃描可
+  以處理多筆過期 row
+- `tests/test_wait_endpoint.py`（8 個）：多數用既有 `client`+`db_session`
+  fixture 驗證免等待的快速路徑（已變更／已終態／404／403／approver 也可
+  wait／未知 status 值 422）與「真的等到逾時」路徑（1 秒逾時，量測耗時確認
+  真的等了約 1 秒而非提早返回）。**唯一需要真正跨連線的測試**
+  （`test_wait_wakes_immediately_when_another_connection_decides`）比照
+  `test_devices_router.py` 的
+  `test_register_quota_race_is_prevented_by_advisory_lock` 先例，另起一顆真
+  實 engine/session-factory（不用共用的 SAVEPOINT session，因為 SAVEPOINT
+  release 從來不是真正的 Postgres COMMIT，NOTIFY 只在真正 COMMIT 時送達）：
+  一個真實 HTTP 請求卡在 `/wait`（20 秒逾時），另一個真實 HTTP 請求 0.5 秒後
+  呼叫 `decide`，量測 `/wait` 大約 5 秒內就醒來（遠低於 20 秒逾時，證明是被
+  NOTIFY 喚醒而非空等逾時）。實測：快速路徑約 0.1 秒完成、1 秒逾時測試量到約
+  1 秒、跨連線喚醒測試量到約 4.9 秒（0.5 秒延遲＋連線/HTTP 開銷，遠低於 20
+  秒逾時判斷門檻）。
+- **165 個測試全過**（151 舊有 + 14 新增），ruff/pyright 皆 0 issue。
+
+**誠實範圍**：sweep 本身在多 process 部署下的重複觸發只靠「conditional
+UPDATE 天然不會重複套用」這個既有機制保證安全，沒有寫多 process 併發測試
+（單一 process 部署下這條路徑根本不會發生）；`wait_for_status_change()` 的
+逐連線資源用量在大量同時等待的情境下沒有上限，屬於已知規模限制（見
+`approvals/notify.py` docstring）；timeout 邊界「commit 剛好卡在 callback
+排程之間」這條路徑只靠最後一次 authoritative refresh 的程式邏輯保證正確，
+沒有專門構造這個時序的race測試（人為在正確的瞬間製造這個邊界本身就需要對
+event loop 排程做不可靠的假設）。
+
+**委派小o（`codex exec --sandbox read-only`）唯讀審查一輪，抓到 1 個
+High + 2 個 Medium，全部已修正**：
+1. **[High]** 每個 `/wait` 呼叫實際占用兩條 DB 連線，可能耗盡主 pool——
+   `wait_for_status_change()` 原本只在意「不用連線池借 LISTEN 連線」，卻沒
+   注意到函式簽章本身接收的 `session`（來自 FastAPI 的 `Depends(get_db_session)`）
+   在整個等待期間完全沒有 commit/rollback/close，SQLAlchemy 的 autobegin
+   交易會一路占用池連線到請求結束——docstring 宣稱「不會跟其他 endpoint 共
+   用的連線池搶資源」根本不成立，每個長輪詢實際上同時占用池連線＋專屬
+   LISTEN 連線兩條。已修正：新增 `_refresh_and_release()` helper，每次讀取
+   `record` 後立刻呼叫 `session.commit()`（在 `expire_on_commit=False` 設定
+   下，commit 只結束交易釋放連線，不會讓已載入的屬性過期，故之後仍可安全
+   讀取 `record.status`），只在真正讀取的瞬間短暫借用池連線，等待期間完全
+   不占用
+2. **[Medium]** timeout 路徑沒有做最後一次 authoritative refresh——`remaining
+   <= 0` 或 `asyncio.wait_for()` 逾時都直接回傳 `False`，若狀態剛好在逾時邊
+   界 commit、但 callback 還沒被 event loop 執行到，回應可能攜帶過時狀態卻
+   宣稱 `changed=False`，也是 LISTEN 連線中途斷線時唯一能保正確性的地方
+   （斷線後所有 NOTIFY 都會漏接，但只要逾時前有這一次補讀，答案依然正確，
+   只是變慢，不會答錯）。已修正：`remaining <= 0` 與 `TimeoutError` 兩個逾時
+   出口都改呼叫 `_refresh_and_release()` 再決定回傳值，同一支 helper 順便解
+   決上一項連線釋放問題
+3. **[Medium]** 跨連線測試不夠嚴謹，不必然證明真的走了 NOTIFY 喚醒路
+   徑——原本只用 0.5 秒 `sleep` 賭 `/wait` 呼叫已經完成 LISTEN 註冊，機器夠
+   慢時 `decide` 可能搶先在監聽註冊前完成，這種情況下 `wait_for_status_change()`
+   自己的「進迴圈前那次 authoritative read」就會直接看到 `accepted` 提早返
+   回，測試仍會通過但證明錯了東西（只證明「跨連線變更最終會被觀察到」，不
+   是「NOTIFY 真的喚醒了卡住的 waiter」）。修法比照本 repo 既有
+   `test_register_quota_race_same_idempotency_key_replays_not_429` 解決同類
+   問題的手法：monkeypatch 一個真實呼叫邊界（`AsyncSession.refresh`——
+   `wait_for_status_change()` 進迴圈前唯一會呼叫它的地方，`decide` 端點完全
+   不會呼叫），讓 `decide` 呼叫端明確等到 waiter 真的通過這個點（`listener_ready`
+   事件）才送出請求，測試因此變得更快（不再需要固定 0.5 秒 sleep）也更嚴謹
+
+其中 High 的修法本身也連帶讓兩個既有的「timeout 快速路徑」測試
+（`test_wait_times_out_when_nothing_changes`／`test_wait_allows_any_approver_not_just_the_owner`）
+從共用的 SAVEPOINT-isolated `db_session` fixture 改用真實 engine——因為現在
+會在同一個 session 上呼叫兩次 `commit()`（初次讀取一次＋逾時前補讀一次），
+而 SAVEPOINT join 模式下釋放一個 savepoint 後再開新的會炸
+`sqlalchemy.exc.MissingGreenlet`（這是該 fixture 隔離手法本身的限制，不是
+端點邏輯錯誤——同一段邏輯在真實 engine 下的三個測試皆正常通過已經證明這
+點）。新增共用 `real_client` fixture（比照 `test_devices_router.py` 既有的
+「自建 engine，連不上就 skip」慣例）避免三個真實連線測試各自重複整段
+engine/app/resolver 建置邏輯。
+
+**165 個測試全過**（151 舊有 + 14 新增，含審查後修正版本），ruff/pyright
+皆 0 issue。commit 待本輪收尾後統一送出（本機未 push）。
 
 ## 開發
 

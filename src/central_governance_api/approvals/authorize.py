@@ -94,6 +94,7 @@ class ApprovalAction(StrEnum):
     CLAIM = "claim"
     REPORT_RESULT = "report_result"
     CANCEL = "cancel"
+    WAIT = "wait"
     RECONCILE_AS_REQUESTER = "reconcile_as_requester"
     RECONCILE_AS_ADMIN = "reconcile_as_admin"
     RECONCILE_LATE_REPORT = "reconcile_late_report"
@@ -200,6 +201,30 @@ def authorize_on_record(
                 action=action, reason="not this request's owner"
             )
         return
+
+    if action is ApprovalAction.WAIT:
+        # Step 3 (v11 §11) addition — not attested in the recovered v11
+        # narrative at all (it never got far enough to describe /wait's
+        # authorization), so this is reasoned from first principles rather
+        # than reconstructed from lost text. Reading/blocking on a
+        # record's status is strictly less sensitive than any action that
+        # changes it, so this is deliberately the widest-open check in
+        # this module: governance.admin (oversight), any agent.approver
+        # (the class of principals entitled to decide ANY record, so
+        # entitled to check whether someone already beat them to it), or
+        # the record's own owner holding agent.operator (the same
+        # role/ownership pairing CLAIM/REPORT_RESULT require — the owner's
+        # own agent-server, waiting to learn when to proceed to CLAIM, is
+        # /wait's primary intended caller; see approvals/notify.py).
+        if is_admin or "agent.approver" in principal.roles:
+            return
+        if "agent.operator" in principal.roles and is_owner:
+            return
+        raise AuthorizationDeniedError(
+            action=action,
+            reason="requires role governance.admin or agent.approver, or "
+            "agent.operator on your own request",
+        )
 
     if action is ApprovalAction.CANCEL:
         if is_admin:

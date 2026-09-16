@@ -121,6 +121,47 @@ class Settings(BaseSettings):
         "'crash 後無法確認就 fail closed'.",
     )
 
+    # --- /wait (v11 §11 step 3, LISTEN/NOTIFY long-poll) ---
+    # Neither value is attested anywhere in the recovered v11 narrative —
+    # the design record only confirms a `/wait` endpoint exists and that a
+    # "LISTEN/commit 邊界" bug in it was fixed in round 10, not the actual
+    # wire contract (see approvals/notify.py's module docstring). Both are
+    # this implementation's own reasoned defaults.
+    wait_default_timeout_seconds: int = Field(
+        default=25,
+        gt=0,
+        description="How long GET .../{id}/wait blocks when the caller "
+        "omits `timeout_seconds`. Chosen to sit safely under common "
+        "reverse-proxy/load-balancer default idle timeouts (60s) while "
+        "still meaningfully cutting poll frequency versus a fixed-"
+        "interval poll loop.",
+    )
+    wait_max_timeout_seconds: int = Field(
+        default=30,
+        gt=0,
+        description="Hard ceiling on the caller-supplied `timeout_seconds` "
+        "query parameter — a request for longer is silently clamped down "
+        "to this, not rejected: a long-poll client's correct response to "
+        "a timed-out `/wait` is to just call again immediately, so "
+        "clamping costs it nothing but one extra round trip.",
+    )
+
+    # --- Background expiry sweep (v11 §11 step 3) ---
+    expiry_sweep_interval_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="How often approvals/sweep.py checks for PENDING/"
+        "ACCEPTED/EXECUTING rows whose relevant deadline has lapsed and "
+        "applies the state machine's EXPIRE event. This is what makes "
+        "those deadlines actually enforced over time rather than merely "
+        "defensively checked by each write endpoint's own conditional "
+        "UPDATE — without this sweep a lapsed PENDING row just sits "
+        "showing `pending` forever unless some caller happens to hit an "
+        "endpoint on it again. Not attested in the recovered v11 "
+        "narrative; a reasoned default balancing DB load against how "
+        "promptly a `/wait` caller learns a record expired.",
+    )
+
     @field_validator("oidc_issuer", "oidc_jwks_url")
     @classmethod
     def _check_https(cls, v: str, info) -> str:  # noqa: ARG003

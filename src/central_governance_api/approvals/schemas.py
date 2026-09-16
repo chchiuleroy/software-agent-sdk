@@ -135,3 +135,16 @@ class ReconciliationFindingResponse(BaseModel):
     approval_request_id: uuid.UUID
     finding_type: str
     created_at: datetime
+
+
+class WaitResponse(BaseModel):
+    """``changed=False`` means ``timeout_seconds`` elapsed with the status
+    still equal to the caller's ``known_status`` — not an error, just "try
+    again". ``changed=True`` means ``status`` is the caller's answer,
+    whether that was learned immediately (already different on entry) or
+    only after actually blocking on LISTEN/NOTIFY.
+    """
+
+    id: uuid.UUID
+    status: str
+    changed: bool

@@ -1,17 +1,23 @@
 """App factory + uvicorn entrypoint for the central governance API.
 
 Step 1 of v11 §11's implementation order wired up the FastAPI app, the
-OIDC principal resolver, and the DB engine/session factory. Step 2 adds
+OIDC principal resolver, and the DB engine/session factory. Step 2 added
 the approval-workflow router (``routers/approvals.py``: create/decide/
 claim/report-result/cancel/reconciliation-findings), the device inventory
 router (``routers/devices.py``: register/revoke), the audit-events read
 router (``routers/audit.py``), and the FastAPI exception handlers that
-map their pure-logic error types to HTTP responses — still not in this
-file: ``/wait`` (step 3, LISTEN/NOTIFY).
+map their pure-logic error types to HTTP responses. Step 3 adds
+``GET .../wait`` (also in ``routers/approvals.py``, LISTEN/NOTIFY-backed —
+see ``approvals/notify.py``) and the background expiry sweep
+(``approvals/sweep.py``) started/stopped here in the app lifespan, which
+is what actually applies the state machine's EXPIRE transitions over time
+rather than merely rejecting stale writes against them.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -29,6 +35,7 @@ from central_governance_api.approvals.errors import (
 )
 from central_governance_api.approvals.idempotency import IdempotencyKeyReusedError
 from central_governance_api.approvals.state_machine import IllegalTransitionError
+from central_governance_api.approvals.sweep import run_expiry_sweep_forever
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.config import Settings, get_settings
 from central_governance_api.db import create_engine, create_session_factory
@@ -98,10 +105,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.db_engine = engine
     app.state.db_session_factory = create_session_factory(engine)
 
+    sweep_task = asyncio.create_task(
+        run_expiry_sweep_forever(
+            app.state.db_session_factory,
+            interval_seconds=settings.expiry_sweep_interval_seconds,
+        )
+    )
+
     logger.info("central-governance-api startup complete")
     try:
         yield
     finally:
+        sweep_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweep_task
         await engine.dispose()
 
 

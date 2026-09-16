@@ -4,15 +4,23 @@ v11 §11 step 2, second half — wires ``approvals/state_machine.py`` and
 ``approvals/authorize.py`` (already committed, code-reviewed) to real
 conditional-update SQL against ``PendingApprovalRecord``, plus digest
 verification (``approvals/digest.py``) and idempotency enforcement
-(``approvals/idempotency.py``).
+(``approvals/idempotency.py``). Step 3 (LISTEN/NOTIFY, ``/wait``) is
+layered on top below, in the same file.
 
 Endpoint scope this router covers, matching todo.md's step-2 description:
 create, decide, claim, report-result (both shapes), cancel,
 reconciliation-findings — the harder state-machine/digest/idempotency
 wiring. Devices register/revoke and audit-events (read) live in
 ``routers/devices.py``/``routers/audit.py`` (simpler, lower-risk,
-deliberately built in a separate follow-up pass). ``/wait`` (step 3,
-LISTEN/NOTIFY) is still not built anywhere.
+deliberately built in a separate follow-up pass). Step 3 adds
+``GET .../wait`` at the bottom of this file (same resource, so it lives
+here rather than a separate router — see its own docstring) plus a
+``notify_status_changed`` call after every conditional UPDATE above that
+actually changes ``status`` (decide/claim/report-result/cancel — CREATE
+has no prior waiter since the id doesn't exist yet, and
+reconciliation-findings never changes ``status`` at all, see
+``models.ReconciliationFinding``'s docstring) so a blocked ``/wait``
+caller wakes up immediately instead of only via its own timeout.
 
 Pattern shared by every write endpoint below:
 
@@ -52,7 +60,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -76,6 +84,10 @@ from central_governance_api.approvals.idempotency import (
     fingerprint_request,
     record_response,
 )
+from central_governance_api.approvals.notify import (
+    notify_status_changed,
+    wait_for_status_change,
+)
 from central_governance_api.approvals.schemas import (
     ApprovalSummary,
     CancelResponse,
@@ -87,6 +99,7 @@ from central_governance_api.approvals.schemas import (
     ReconciliationFindingResponse,
     ReportResultRequest,
     ReportResultResponse,
+    WaitResponse,
 )
 from central_governance_api.approvals.state_machine import (
     ApprovalEvent,
@@ -307,6 +320,8 @@ async def decide_approval(
     if result.scalar_one_or_none() is None:
         raise ConcurrentModificationError(approval_id=approval_id)
 
+    await notify_status_changed(session, approval_id=approval_id, status=target.value)
+
     session.add(
         ApprovalDecision(
             approval_request_id=approval_id,
@@ -407,6 +422,10 @@ async def claim_approval(
         # ACCEPTED" both mean the same thing to the caller: this claim
         # cannot proceed, retry is pointless without a fresh decision.
         raise ConcurrentModificationError(approval_id=approval_id)
+
+    await notify_status_changed(
+        session, approval_id=approval_id, status=ApprovalStatus.EXECUTING.value
+    )
 
     response = ClaimResponse(
         id=approval_id,
@@ -518,6 +537,8 @@ async def report_result(
     if result.scalar_one_or_none() is None:
         raise ConcurrentModificationError(approval_id=approval_id)
 
+    await notify_status_changed(session, approval_id=approval_id, status=target.value)
+
     if body.is_pre_claim_abort:
         # Code-review Medium: pre-claim abort and a plain pre-decision
         # CANCEL land on the same terminal status (see state_machine.py's
@@ -604,6 +625,8 @@ async def cancel_approval(
     )
     if result.scalar_one_or_none() is None:
         raise ConcurrentModificationError(approval_id=approval_id)
+
+    await notify_status_changed(session, approval_id=approval_id, status=target.value)
 
     # See report_result's pre-claim-abort branch for why this exists:
     # both events land on CANCELLED, so an audit row is what lets the
@@ -723,3 +746,67 @@ async def create_reconciliation_finding(
     if replayed is not None:
         return ReconciliationFindingResponse.model_validate(replayed)
     return response
+
+
+# --- WAIT (v11 §11 step 3) ---------------------------------------------------
+
+
+@router.get("/{approval_id}/wait", response_model=WaitResponse)
+async def wait_for_approval(
+    approval_id: uuid.UUID,
+    known_status: ApprovalStatus,
+    timeout_seconds: int | None = Query(default=None, ge=1),
+    principal: Principal = Depends(get_current_principal),
+    session: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings_dependency),
+) -> WaitResponse:
+    """Long-poll: blocks until ``approval_id``'s status differs from the
+    caller-supplied ``known_status``, or ``timeout_seconds`` elapses,
+    whichever comes first. Backed by PostgreSQL LISTEN/NOTIFY
+    (``approvals/notify.py``) rather than a fixed-interval poll loop, so
+    the primary intended caller — the requester's own agent-server, after
+    CREATE, waiting to learn when its request is decided so it can proceed
+    to CLAIM — doesn't have to trade "check often" against "load the
+    API/DB heavily".
+
+    Not one of this router's Idempotency-Key-guarded write endpoints: a
+    GET that only ever reads is already safe to call repeatedly with no
+    special handling, and a long-poll client is *expected* to call this
+    again immediately after every timeout — an idempotency key would add
+    friction for no benefit here.
+
+    ``known_status`` is required, not inferred server-side: the caller is
+    always the one who last observed some status (from CREATE's response,
+    or a previous ``/wait`` call) and is asking "tell me when it's no
+    longer that" — there is no other way to phrase "wait for a change"
+    without a baseline to compare against.
+    """
+    record = await _load_record(session, approval_id)
+    authorize_on_record(principal, ApprovalAction.WAIT, _ownership(record))
+
+    current = ApprovalStatus(record.status)
+    if current != known_status:
+        # True regardless of how stale this particular read is — some
+        # change away from known_status already happened by now, full
+        # stop. No need to touch LISTEN/NOTIFY at all for this answer.
+        return WaitResponse(id=approval_id, status=record.status, changed=True)
+    if is_terminal(current):
+        # known_status already matches a terminal status, which by
+        # definition (state_machine.TERMINAL_STATUSES) never changes
+        # again — waiting would just burn the full timeout for nothing.
+        return WaitResponse(id=approval_id, status=record.status, changed=False)
+
+    effective_timeout = min(
+        timeout_seconds
+        if timeout_seconds is not None
+        else settings.wait_default_timeout_seconds,
+        settings.wait_max_timeout_seconds,
+    )
+    changed = await wait_for_status_change(
+        session,
+        record,
+        database_url=settings.database_url,
+        known_status=known_status.value,
+        timeout_seconds=effective_timeout,
+    )
+    return WaitResponse(id=approval_id, status=record.status, changed=changed)
