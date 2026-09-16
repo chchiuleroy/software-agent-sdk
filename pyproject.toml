@@ -20,7 +20,13 @@ dependencies = [
 ]
 
 [project.scripts]
-central-governance-api = "central_governance_api:main"
+# Points directly at main.py rather than re-exporting through __init__.py
+# (code-review suggestion, 2026-09-16 entry-point bug fix): keeps package
+# import (`import central_governance_api`) from having to pull in the
+# whole app-assembly module graph (routers/OIDC/DB/FastAPI wiring) just to
+# resolve this script, avoiding a future circular-import/import-time
+# side-effect trap for no functional benefit over pointing here directly.
+central-governance-api = "central_governance_api.main:main"
 
 [build-system]
 requires = ["uv_build>=0.11.21,<0.12.0"]

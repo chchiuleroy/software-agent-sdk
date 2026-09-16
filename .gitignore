@@ -12,6 +12,11 @@ wheels/
 # Local secrets (DB URL with credentials, etc.) — never commit
 .env
 
+# One-time local setup scripts with real generated passwords embedded
+# (production DB role, Keycloak client secrets) — never commit, same
+# reasoning as .env above.
+/ops/
+
 # Test/tooling caches
 .pytest_cache/
 .ruff_cache/

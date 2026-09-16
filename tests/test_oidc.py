@@ -224,22 +224,36 @@ def test_config_rejects_unsafe_signing_algorithm():
 
 
 def test_settings_reject_http_urls_by_default():
+    """Regression (found running the real MVP deployment, 2026-09-16): a
+    local ``.env`` with ``CGA_OIDC_REQUIRE_HTTPS=false`` — exactly what
+    README's own ``cp .env.example .env`` step produces once uncommented
+    for local dev against the known http-enabled Keycloak instance — was
+    silently satisfying this test's "reject by default" assertion via
+    dotenv, not the field default this test exists to prove. `.env`
+    values sit below explicit environment variables in pydantic-settings'
+    precedence, so pinning ``CGA_OIDC_REQUIRE_HTTPS`` here the same way
+    the other three vars already are is what actually isolates this test
+    from whatever `.env` happens to exist on the machine running it.
+    """
     with pytest.raises(ValueError, match="oidc_require_https"):
         import os
 
         from central_governance_api.config import get_settings
 
-        env_backup = {
-            k: os.environ.pop(k)
-            for k in ("CGA_OIDC_ISSUER", "CGA_OIDC_JWKS_URL", "CGA_OIDC_AUDIENCE")
-            if k in os.environ
-        }
+        env_vars = (
+            "CGA_OIDC_ISSUER",
+            "CGA_OIDC_JWKS_URL",
+            "CGA_OIDC_AUDIENCE",
+            "CGA_OIDC_REQUIRE_HTTPS",
+        )
+        env_backup = {k: os.environ.pop(k) for k in env_vars if k in os.environ}
         os.environ["CGA_OIDC_ISSUER"] = "http://insecure.invalid/realm"
         os.environ["CGA_OIDC_JWKS_URL"] = "http://insecure.invalid/certs"
         os.environ["CGA_OIDC_AUDIENCE"] = AUDIENCE
+        os.environ["CGA_OIDC_REQUIRE_HTTPS"] = "true"
         try:
             get_settings()
         finally:
-            for k in ("CGA_OIDC_ISSUER", "CGA_OIDC_JWKS_URL", "CGA_OIDC_AUDIENCE"):
+            for k in env_vars:
                 os.environ.pop(k, None)
             os.environ.update(env_backup)
