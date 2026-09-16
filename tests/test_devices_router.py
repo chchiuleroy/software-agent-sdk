@@ -446,19 +446,18 @@ async def test_register_quota_race_same_idempotency_key_replays_not_429(
     with an IDENTICAL body (proving replay, not a fresh registration);
     none may come back 429.
 
-    Code-review Low, addressed (not just disclosed): a first version of
-    this test relied on plain ``asyncio.gather`` for overlap and turned
-    out to be a false-negative risk exactly as review warned — verified by
+    Code-review Low, addressed (not just disclosed) through two iterations:
+    a first version relied on plain ``asyncio.gather`` for overlap and was
+    a false-negative risk exactly as review warned — verified by
     temporarily reverting the fix above and re-running just this test,
-    which still passed, because ``asyncio.gather`` gave no guarantee every
-    request reached its first DB call before any of them could have
-    already committed and been replayed there, never even reaching the
-    lock/quota logic this test means to exercise. Fixed with a real
-    ``asyncio.Barrier``: monkeypatching ``find_replayed_response`` in this
-    router module so each task's FIRST call blocks until all
-    `concurrent_requests` tasks have reached it, forcing them to actually
-    still be racing when they proceed past that point — deterministic
-    proof, not a timing hope.
+    which still passed. A second version barriered each task's FIRST call
+    to ``find_replayed_response()`` instead, which turned out to be its
+    OWN false-negative risk under pytest-asyncio specifically (see the
+    inline comment below on ``_barrier_before_lock_execute`` for the full
+    story of why). The version below barriers at the actual
+    ``pg_advisory_xact_lock`` call instead, verified to reliably fail
+    without the fix and reliably pass with it across repeated runs —
+    deterministic proof, not a timing hope.
     """
     quota = 1
     concurrent_requests = 8
@@ -543,8 +542,16 @@ async def test_register_quota_race_same_idempotency_key_replays_not_429(
                     )
                     return resp.status_code, resp.json()
 
-                results = await asyncio.gather(
-                    *(_one_register() for _ in range(concurrent_requests))
+                # Code-review Low: without a timeout, a future regression
+                # that makes some request fail *before* it ever reaches
+                # the barriered lock call would leave the barrier one
+                # party short forever, hanging every other task (and this
+                # test) indefinitely rather than failing cleanly.
+                results = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(_one_register() for _ in range(concurrent_requests))
+                    ),
+                    timeout=10,
                 )
 
         statuses = [status for status, _ in results]
