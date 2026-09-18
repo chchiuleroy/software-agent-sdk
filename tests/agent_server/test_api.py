@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from openhands.agent_server.api import (
     _default_server_tmux_tmpdir,
@@ -729,7 +729,7 @@ class TestGovernanceBridgeTokenGate:
         config = Config(
             static_files_path=None,
             governance_deployment_mode="team",
-            governance_bridge_token="s3cr3t",
+            governance_bridge_token=SecretStr("s3cr3t"),
         )
         client, stub = self._client_and_stub(config)
 
@@ -742,7 +742,7 @@ class TestGovernanceBridgeTokenGate:
         config = Config(
             static_files_path=None,
             governance_deployment_mode="team",
-            governance_bridge_token="s3cr3t",
+            governance_bridge_token=SecretStr("s3cr3t"),
         )
         client, stub = self._client_and_stub(config)
 
@@ -755,7 +755,7 @@ class TestGovernanceBridgeTokenGate:
         config = Config(
             static_files_path=None,
             governance_deployment_mode="team",
-            governance_bridge_token="s3cr3t",
+            governance_bridge_token=SecretStr("s3cr3t"),
         )
         client, stub = self._client_and_stub(config)
 
@@ -808,7 +808,7 @@ class TestGovernanceBridgeTokenGate:
         config = Config(
             static_files_path=None,
             governance_deployment_mode="team",
-            governance_bridge_token="s3cr3t",
+            governance_bridge_token=SecretStr("s3cr3t"),
         )
 
         assert "s3cr3t" not in repr(config)
@@ -825,7 +825,7 @@ class TestGovernanceBridgeTokenGate:
         must fail at Config construction, not silently become an
         unmatchable-by-design fail-closed token nobody can diagnose."""
         with pytest.raises(ValidationError):
-            Config(governance_bridge_token="   ")
+            Config(governance_bridge_token=SecretStr("   "))
 
     def test_session_api_key_still_required_alongside_bridge_token(self):
         """The bridge token is an *additional* requirement layered on top
@@ -836,7 +836,7 @@ class TestGovernanceBridgeTokenGate:
             static_files_path=None,
             session_api_keys=["session-key"],
             governance_deployment_mode="team",
-            governance_bridge_token="bridge-secret",
+            governance_bridge_token=SecretStr("bridge-secret"),
         )
         client, stub = self._client_and_stub(config)
         conversation_id = "11111111-1111-1111-1111-111111111111"

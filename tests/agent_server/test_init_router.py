@@ -137,7 +137,7 @@ class TestBuildInitializedConfig:
         that Config's own direct-construction validation would have
         rejected."""
         with pytest.raises(ValidationError):
-            InitRequest(governance_bridge_token="   ")
+            InitRequest(governance_bridge_token=SecretStr("   "))
 
     def test_governance_fields_untouched_when_not_provided(self):
         """Matches every other InitRequest field: omitting it keeps
