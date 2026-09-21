@@ -637,3 +637,85 @@ async def test_lifespan_teardown_releases_conversation_service_after_init(
     assert init_svc._entered_bash_service is None
     _reset_conversation_singleton()
     _reset_bash_singleton()
+
+
+@pytest.mark.asyncio
+async def test_governance_fields_consistent_across_app_service_and_eventservice(
+    tmp_path,
+):
+    """End-to-end DI-consistency check for the team-mode governance fields:
+    drives the real deferred-init composition path (InitService ->
+    ConversationService.get_instance() -> app.state), then starts a real
+    conversation through that real ConversationService (not a stubbed
+    get_event_service) and confirms app.state.config, the
+    ConversationService's own snapshot, and the live EventService it
+    started all agree on governance_deployment_mode/governance_client/
+    governance_origin_device_id. Credentials are supplied on the *base*
+    config (as they would be at pool-warm time), matching how
+    governance_central_api_base_url et al. are (deliberately) not part of
+    InitRequest yet; only governance_deployment_mode itself is a per-user
+    /api/init override, matching governance_bridge_token's existing
+    precedent."""
+    from openhands.agent_server.bash_service import BashEventService
+    from openhands.agent_server.conversation_service import ConversationService
+    from openhands.agent_server.models import StartConversationRequest
+    from openhands.sdk import LLM, Agent
+    from openhands.sdk.security.confirmation_policy import NeverConfirm
+    from openhands.sdk.workspace import LocalWorkspace
+
+    _reset_conversation_singleton()
+    _reset_bash_singleton()
+    base = Config(
+        deferred_init=True,
+        conversations_path=tmp_path / "boot" / "convs",
+        bash_events_dir=tmp_path / "boot" / "bash",
+        governance_central_api_base_url="https://central.example",
+        governance_central_api_token_url="https://idp.example/token",
+        governance_client_id="agent-server",
+        governance_client_secret=SecretStr("s3cr3t"),
+        governance_origin_device_id="device-1",
+    )
+    app = SimpleNamespace(state=SimpleNamespace(config=base))
+    svc = InitService(app, base_config=base)  # type: ignore[arg-type]
+
+    await svc.initialize(
+        InitRequest(
+            conversations_path=tmp_path / "user" / "convs",
+            bash_events_dir=tmp_path / "user" / "bash",
+            governance_deployment_mode="team",
+        )
+    )
+    try:
+        conversation_service = app.state.conversation_service
+        assert isinstance(conversation_service, ConversationService)
+        assert isinstance(app.state.bash_event_service, BashEventService)
+
+        # app.state.config, the value the REST layer's bridge-token gate
+        # reads at request time, must agree with what ConversationService
+        # itself snapshotted — this is the split-brain a prior fix closed.
+        assert (
+            app.state.config.governance_deployment_mode
+            == conversation_service.governance_deployment_mode
+            == "team"
+        )
+        assert conversation_service.governance_client is not None
+        assert conversation_service.governance_origin_device_id == "device-1"
+
+        workspace_dir = tmp_path / "user" / "workspace"
+        workspace_dir.mkdir(parents=True)
+        info, _ = await conversation_service.start_conversation(
+            StartConversationRequest(
+                agent=Agent(llm=LLM(model="gpt-4o", usage_id="test"), tools=[]),
+                workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+                confirmation_policy=NeverConfirm(),
+            )
+        )
+        event_service = await conversation_service.get_event_service(info.id)
+        assert event_service is not None
+        assert event_service.governance_deployment_mode == "team"
+        assert event_service.governance_client is conversation_service.governance_client
+        assert event_service.governance_origin_device_id == "device-1"
+    finally:
+        await svc.teardown()
+        _reset_conversation_singleton()
+        _reset_bash_singleton()

@@ -28,8 +28,8 @@ from openhands.agent_server.config import (
 )
 from openhands.agent_server.conversation_router import conversation_router
 from openhands.agent_server.conversation_service import (
+    ConversationService,
     CredentialBindingActivationRequired,
-    get_default_conversation_service,
 )
 from openhands.agent_server.credential_binding import (
     router as credential_binding_router,
@@ -40,6 +40,11 @@ from openhands.agent_server.dependencies import (
 )
 from openhands.agent_server.desktop_router import desktop_router
 from openhands.agent_server.event_router import event_router
+from openhands.agent_server.event_service import (
+    GovernanceApprovalRequiredError,
+    GovernanceStartOutcome,
+    GovernanceStartRejectedError,
+)
 from openhands.agent_server.file_router import file_router
 from openhands.agent_server.git_router import git_router
 from openhands.agent_server.hooks_router import hooks_router
@@ -93,6 +98,11 @@ from openhands.agent_server.vscode_service import get_vscode_service
 from openhands.agent_server.workspace_router import workspace_router
 from openhands.agent_server.workspaces_router import workspaces_router
 from openhands.sdk.logger import DEBUG, get_logger
+from openhands.sdk.security.roy_action_binding import (
+    ActionBindingMismatchError,
+    ActionCountMismatchError,
+    ExecutionLeaseExpiredError,
+)
 from openhands.sdk.security.roy_self_approval import SelfApprovalDeniedError
 from openhands.sdk.utils.redact import sanitize_dict
 from openhands.tools.terminal.constants import TMUX_SOCKET_NAME
@@ -246,7 +256,15 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
 
         # Non-deferred (legacy) path: build and enter the conversation
         # service as part of the lifespan, exactly as before.
-        service = get_default_conversation_service()
+        #
+        # Built from the local `config` via ConversationService.get_
+        # instance(), not get_default_conversation_service() -- that helper
+        # caches a process-wide singleton from its own get_default_config()
+        # call, independent of whatever Config create_app() actually
+        # received. Every real reader of the running service resolves it
+        # from request.app.state.conversation_service (set below), so
+        # nothing needs that module-level cache here.
+        service = ConversationService.get_instance(config)
         mark_initialization_complete()
         logger.info("Server initialization complete - ready to serve requests")
 
@@ -559,6 +577,137 @@ def _add_exception_handlers(api: FastAPI) -> None:
             content={
                 "detail": "self-approval not allowed",
                 "error_code": "self_approval_denied",
+            },
+        )
+
+    @api.exception_handler(ActionBindingMismatchError)
+    async def _action_binding_mismatch_handler(
+        _request: Request,
+        exc: ActionBindingMismatchError,
+    ) -> JSONResponse:
+        """The pending action no longer matches what a central-governance-
+        api approval was granted for — an expected authorization outcome
+        under team mode, not a server fault. Same generic-detail treatment
+        as SelfApprovalDeniedError: the full message could describe which
+        action/content changed, which has no reason to be readable by the
+        caller; it goes to the server-side log instead.
+        """
+        logger.info("Action binding mismatch: %s", exc)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "pending action no longer matches the central approval",
+                "error_code": "action_binding_mismatch",
+            },
+        )
+
+    @api.exception_handler(ExecutionLeaseExpiredError)
+    async def _execution_lease_expired_handler(
+        _request: Request,
+        exc: ExecutionLeaseExpiredError,
+    ) -> JSONResponse:
+        logger.info("Execution lease expired: %s", exc)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": (
+                    "central execution lease expired before this action could start"
+                ),
+                "error_code": "execution_lease_expired",
+            },
+        )
+
+    @api.exception_handler(ActionCountMismatchError)
+    async def _action_count_mismatch_handler(
+        _request: Request,
+        exc: ActionCountMismatchError,
+    ) -> JSONResponse:
+        logger.info("Action count mismatch: %s", exc)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": ("central governance requires exactly one pending action"),
+                "error_code": "action_count_mismatch",
+            },
+        )
+
+    @api.exception_handler(GovernanceApprovalRequiredError)
+    async def _governance_approval_required_handler(
+        _request: Request,
+        exc: GovernanceApprovalRequiredError,
+    ) -> JSONResponse:
+        """Team mode + ``accept=True`` without ``central_approval_id`` — a
+        valid bridge token only proves the caller may reach this endpoint,
+        not that central-governance-api actually approved this action. See
+        ``GovernanceApprovalRequiredError``'s docstring for why this check
+        exists."""
+        logger.info("Governance approval required: %s", exc)
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "team mode requires a central governance approval",
+                "error_code": "governance_approval_required",
+            },
+        )
+
+    @api.exception_handler(GovernanceStartRejectedError)
+    async def _governance_start_rejected_handler(
+        _request: Request,
+        exc: GovernanceStartRejectedError,
+    ) -> JSONResponse:
+        """A team-mode ``respond_to_confirmation(accept=True,
+        central_approval_id=...)`` whose claim/binding handshake did not
+        end in the run actually starting. Reuses the same stable
+        ``error_code`` values as the direct-SDK-bypass handlers above for
+        the three outcomes that share their root cause; the two outcomes
+        with no SDK-layer equivalent (a failed central-governance-api
+        claim call, or an unclassified internal error) get their own
+        codes. ``PENDING_UNKNOWN`` (the handshake timed out rather than
+        being rejected) gets its own 202 — a distinct, non-terminal
+        response the caller can retry or poll on, not merged into either
+        a hard rejection or a plain ``STARTED`` success. Same generic-
+        detail treatment as the handlers above — the outcome is logged in
+        full server-side.
+        """
+        status_and_code = {
+            GovernanceStartOutcome.REJECTED_BINDING_MISMATCH: (
+                409,
+                "action_binding_mismatch",
+            ),
+            GovernanceStartOutcome.REJECTED_ACTION_COUNT_MISMATCH: (
+                409,
+                "action_count_mismatch",
+            ),
+            GovernanceStartOutcome.REJECTED_LEASE_EXPIRED: (
+                409,
+                "execution_lease_expired",
+            ),
+            GovernanceStartOutcome.REJECTED_CLAIM_FAILED: (
+                502,
+                "governance_claim_failed",
+            ),
+            GovernanceStartOutcome.REJECTED_CANCELLED: (
+                409,
+                "governance_cancelled",
+            ),
+            GovernanceStartOutcome.PENDING_UNKNOWN: (
+                202,
+                "governance_pending",
+            ),
+        }.get(exc.outcome, (500, "governance_internal_error"))
+        status_code, error_code = status_and_code
+        logger.info("Governed confirmation start rejected: %s", exc.outcome.value)
+        detail = (
+            "central governance has not yet confirmed this action started; "
+            "retry or poll for status"
+            if exc.outcome == GovernanceStartOutcome.PENDING_UNKNOWN
+            else "central governance did not allow this confirmation to start"
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "detail": detail,
+                "error_code": error_code,
             },
         )
 

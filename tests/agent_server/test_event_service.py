@@ -16,7 +16,14 @@ import pytest_asyncio
 
 from openhands.agent_server.conversation_lease import LEASE_FILE_NAME
 from openhands.agent_server.conversation_service import ConversationService
-from openhands.agent_server.event_service import EventService
+from openhands.agent_server.event_service import (
+    EventService,
+    GovernanceApprovalRequiredError,
+    GovernanceStartOutcome,
+    GovernanceStartRejectedError,
+    _GovernanceHandshake,
+)
+from openhands.agent_server.governance_outbox import OutboxRecord, OutboxState
 from openhands.agent_server.models import (
     ConfirmationResponseRequest,
     EventPage,
@@ -52,6 +59,10 @@ from openhands.sdk.io.memory import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.mcp.config import coerce_mcp_config
 from openhands.sdk.security.confirmation_policy import NeverConfirm
+from openhands.sdk.security.roy_action_binding import (
+    ActionBindingMismatchError,
+    compute_execution_commitment,
+)
 from openhands.sdk.subagent.schema import AgentDefinition
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
@@ -1496,6 +1507,76 @@ class TestEventServiceRespondToConfirmation:
         event_service.run.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_respond_to_confirmation_requires_central_approval_id_in_team_mode(
+        self, event_service
+    ):
+        """Team mode + accept=True without central_approval_id must be
+        refused, not silently fall through to the plain (ungoverned) accept
+        path — a valid X-Governance-Bridge-Token only proves the caller may
+        reach this endpoint, not that this specific action was actually
+        approved by central-governance-api."""
+        event_service.governance_deployment_mode = "team"
+        event_service._conversation = MagicMock()
+        event_service.run = AsyncMock()
+        event_service.run_and_wait_for_start = AsyncMock()
+
+        request = ConfirmationResponseRequest(accept=True, central_approval_id=None)
+
+        with pytest.raises(GovernanceApprovalRequiredError):
+            await event_service.respond_to_confirmation(request)
+
+        event_service.run.assert_not_awaited()
+        event_service.run_and_wait_for_start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_respond_to_confirmation_uses_handshake_in_team_mode(
+        self, event_service
+    ):
+        """The mirror-image case: team mode + a real central_approval_id
+        must route through run_and_wait_for_start(), not the plain path."""
+        event_service.governance_deployment_mode = "team"
+        event_service._conversation = MagicMock()
+        event_service.run = AsyncMock()
+        event_service.run_and_wait_for_start = AsyncMock(
+            return_value=GovernanceStartOutcome.STARTED
+        )
+
+        request = ConfirmationResponseRequest(
+            accept=True, central_approval_id="approval-1"
+        )
+        await event_service.respond_to_confirmation(request)
+
+        event_service.run_and_wait_for_start.assert_awaited_once_with(
+            central_approval_id="approval-1"
+        )
+        event_service.run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_respond_to_confirmation_raises_on_pending_unknown_outcome(
+        self, event_service
+    ):
+        """PENDING_UNKNOWN (the handshake timed out, not a rejection — see
+        run_and_wait_for_start()'s own docstring) must not be folded into
+        the STARTED success path: the caller cannot yet tell whether
+        claim/binding actually succeeded, so it needs its own distinct,
+        non-success outcome rather than a false-positive 200."""
+        event_service.governance_deployment_mode = "team"
+        event_service._conversation = MagicMock()
+        event_service.run = AsyncMock()
+        event_service.run_and_wait_for_start = AsyncMock(
+            return_value=GovernanceStartOutcome.PENDING_UNKNOWN
+        )
+
+        request = ConfirmationResponseRequest(
+            accept=True, central_approval_id="approval-1"
+        )
+        with pytest.raises(GovernanceStartRejectedError) as exc_info:
+            await event_service.respond_to_confirmation(request)
+
+        assert exc_info.value.outcome == GovernanceStartOutcome.PENDING_UNKNOWN
+        event_service.run.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_run_blocks_self_approval_before_scheduling_background_task(
         self, event_service
     ):
@@ -2173,6 +2254,62 @@ class TestEventServiceStartWithRunningStatus:
             assert error_event.tool_call_id == "call_1"
             assert "restart occurred" in error_event.error
             assert "fatal memory error" in error_event.error
+
+    @pytest.mark.asyncio
+    async def test_start_crash_recovery_triggers_governance_result_reporting(
+        self, event_service, tmp_path
+    ):
+        """The synthetic AgentErrorEvent this crash-recovery path writes is
+        exactly the evidence maybe_report_governance_result()'s classifier
+        needs — start() must actually call it, not just publish state.
+        Without this wiring, a governed action whose process died
+        mid-execution with no follow-up run would leave central waiting
+        forever."""
+        from openhands.sdk.event.llm_convertible import ActionEvent
+        from openhands.sdk.llm import MessageToolCall, TextContent
+        from openhands.tools.terminal import TerminalAction
+
+        event_service.conversations_dir = tmp_path
+        conv_dir = tmp_path / event_service.stored.id.hex
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        event_service.stored.workspace = LocalWorkspace(working_dir=str(tmp_path))
+        event_service.governance_deployment_mode = "team"
+        event_service.maybe_report_governance_result = AsyncMock()
+
+        with patch(
+            "openhands.agent_server.event_service.LocalConversation"
+        ) as MockConversation:
+            mock_conv = MagicMock()
+            mock_state = MagicMock()
+            mock_agent = MagicMock()
+
+            unmatched_action = ActionEvent(
+                source="agent",
+                thought=[TextContent(text="running a command")],
+                action=TerminalAction(command="ls"),
+                tool_name="terminal",
+                tool_call_id="call_1",
+                tool_call=MessageToolCall(
+                    id="call_1",
+                    name="terminal",
+                    arguments='{"command": "ls"}',
+                    origin="completion",
+                ),
+                llm_response_id="response_1",
+            )
+            mock_state.execution_status = ConversationExecutionStatus.RUNNING
+            mock_state.events = [unmatched_action]
+            mock_state.stats = MagicMock()
+            mock_agent.get_all_llms.return_value = []
+            mock_conv._state = mock_state
+            mock_conv.state = mock_state
+            mock_conv.agent = mock_agent
+            mock_conv._on_event = MagicMock()
+            MockConversation.return_value = mock_conv
+
+            await event_service.start()
+
+        event_service.maybe_report_governance_result.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_start_does_not_add_error_event_when_no_unmatched_actions(
@@ -3621,3 +3758,1307 @@ async def test_event_service_creates_lease_with_custom_ttl(tmp_path: Path) -> No
     assert service._lease is not None
     assert service._lease._ttl_seconds == 10.0
     assert (tmp_path / stored.id.hex / LEASE_FILE_NAME).exists()
+
+
+def _governance_pending_action(call_id: str = "call_1") -> ActionEvent:
+    return ActionEvent(
+        source="agent",
+        thought=[TextContent(text="running a command")],
+        action=TerminalAction(command="ls"),
+        tool_name="terminal",
+        tool_call_id=call_id,
+        tool_call=MessageToolCall(
+            id=call_id,
+            name="terminal",
+            arguments='{"command": "ls"}',
+            origin="completion",
+        ),
+        llm_response_id="response_1",
+    )
+
+
+class TestEventServiceGovernanceOrchestration:
+    """Team-mode central-governance-api orchestration: the Phase B
+    create-approval hook (``maybe_register_governance_approval`` /
+    ``_create_governance_approval``) and the claim/run handshake
+    (``run_and_wait_for_start`` / ``_claim_and_run_governed`` /
+    ``_report_governance_failure``).
+    """
+
+    @pytest.fixture
+    def governed_service(self, event_service, tmp_path):
+        """team mode active, matching what ConversationService.get_instance()
+        would snapshot from a validated Config onto every EventService it
+        constructs (see event_service.py's governance_deployment_mode/
+        governance_client/governance_origin_device_id fields) — these are
+        plain instance attributes, not process environment variables, so
+        tests set them directly rather than monkeypatching env vars or
+        patching a module-level lookup function. governance_client stays
+        unset here — tests that need one set
+        `governed_service.governance_client = fake_client` directly.
+        """
+        event_service.conversations_dir = tmp_path
+        event_service.conversation_dir.mkdir(parents=True, exist_ok=True)
+        event_service.governance_deployment_mode = "team"
+        event_service.governance_origin_device_id = "device-1"
+        return event_service
+
+    def _mock_conversation(self, pending_actions):
+        conversation = MagicMock()
+        state = MagicMock()
+        state.__enter__ = MagicMock(return_value=state)
+        state.__exit__ = MagicMock(return_value=None)
+        state.active_branch = MagicMock(return_value=list(pending_actions))
+        conversation._state = state
+        return conversation
+
+    # ---------------- maybe_register_governance_approval ----------------
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_noop_when_team_mode_inactive(self, event_service):
+        event_service._conversation = self._mock_conversation(
+            [_governance_pending_action()]
+        )
+        event_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        await event_service.maybe_register_governance_approval()
+        assert event_service.governance_outbox.load() is None
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_noop_when_not_waiting_for_confirmation(
+        self, governed_service
+    ):
+        governed_service._conversation = self._mock_conversation(
+            [_governance_pending_action()]
+        )
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.RUNNING
+        )
+        await governed_service.maybe_register_governance_approval()
+        assert governed_service.governance_outbox.load() is None
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_noop_when_outbox_already_exists(
+        self, governed_service
+    ):
+        governed_service._conversation = self._mock_conversation(
+            [_governance_pending_action()]
+        )
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service._create_governance_approval = AsyncMock()
+        with patch(
+            "openhands.agent_server.event_service.GovernanceOutbox.load",
+            return_value=MagicMock(),
+        ):
+            await governed_service.maybe_register_governance_approval()
+        governed_service._create_governance_approval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_retries_a_stuck_pending_create_for_the_same_action(
+        self, governed_service
+    ):
+        """A create call interrupted mid-flight (crash, or close()
+        cancelling the create task) leaves the outbox in PENDING_CREATE
+        with no relay to ever move it forward on its own — this hook is
+        the only retry path a stuck PENDING_CREATE has in this MVP slice,
+        and it runs after every single run cycle including crash-recovery,
+        so it must retry rather than treat "record already exists for this
+        action" as unconditionally done."""
+        action = _governance_pending_action()
+        governed_service._conversation = self._mock_conversation([action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        stuck_record = OutboxRecord(
+            request_id="req-stuck",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.PENDING_CREATE,
+        )
+        await governed_service.governance_outbox.create_record(stuck_record)
+        governed_service._create_governance_approval = AsyncMock()
+        governed_service._send_create_approval = AsyncMock()
+
+        await governed_service.maybe_register_governance_approval()
+        await asyncio.sleep(0)
+
+        governed_service._send_create_approval.assert_called_once()
+        (called_record,) = governed_service._send_create_approval.call_args.args
+        assert called_record.request_id == "req-stuck"
+        governed_service._create_governance_approval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_noop_when_pending_count_not_one(
+        self, governed_service
+    ):
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service._create_governance_approval = AsyncMock()
+        await governed_service.maybe_register_governance_approval()
+        governed_service._create_governance_approval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_schedules_create_for_single_pending_action(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        governed_service._conversation = self._mock_conversation([action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service._create_governance_approval = AsyncMock()
+
+        await governed_service.maybe_register_governance_approval()
+        # _create_governance_approval is scheduled via asyncio.create_task —
+        # give the loop a tick to actually run it.
+        await asyncio.sleep(0)
+
+        governed_service._create_governance_approval.assert_called_once_with(action)
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_tracks_create_task_until_it_completes(
+        self, governed_service
+    ):
+        """The fire-and-forget task must be visible to close()/idle
+        eviction while in flight, and drop out again once it settles —
+        otherwise close() has no way to cancel-and-drain it and a long-
+        idle conversation with a stuck create call could never be evicted.
+        """
+        action = _governance_pending_action()
+        governed_service._conversation = self._mock_conversation([action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        release = asyncio.Event()
+
+        async def _slow_create(_action):
+            await release.wait()
+
+        governed_service._create_governance_approval = AsyncMock(
+            side_effect=_slow_create
+        )
+
+        await governed_service.maybe_register_governance_approval()
+        await asyncio.sleep(0)
+
+        assert len(governed_service._pending_governance_create_tasks) == 1
+
+        release.set()
+        (task,) = governed_service._pending_governance_create_tasks
+        await task
+
+        assert governed_service._pending_governance_create_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_archives_terminal_record_for_a_new_action(
+        self, governed_service
+    ):
+        """A conversation must be governable more than once over its
+        lifetime — after the first governed action reaches a terminal
+        state, the next WAITING_FOR_CONFIRMATION round (a *different*
+        action) must get its own approval, not be silently skipped
+        forever."""
+        old_action = _governance_pending_action(call_id="call_1")
+        await governed_service.governance_outbox.create_record(
+            OutboxRecord(
+                request_id="req-old",
+                conversation_id=str(governed_service.stored.id),
+                action_event_id=old_action.id,
+                tool_call_id=old_action.tool_call_id,
+                tool_name=old_action.tool_name,
+                action_type="tool_call",
+                policy_revision="agent-server-mvp-v1",
+                action_summary="old action",
+                action_payload={},
+                digest_salt="salt",
+                action_payload_digest="digest",
+                execution_commitment="commitment",
+                origin_device_id="device-1",
+                state=OutboxState.RESULT_REPORTED,
+                central_approval_id="approval-old",
+            )
+        )
+
+        new_action = _governance_pending_action(call_id="call_2")
+        governed_service._conversation = self._mock_conversation([new_action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service._create_governance_approval = AsyncMock()
+
+        await governed_service.maybe_register_governance_approval()
+        await asyncio.sleep(0)
+
+        governed_service._create_governance_approval.assert_called_once_with(new_action)
+        # The old, terminal record was archived (moved aside), not deleted.
+        archived = list(
+            governed_service.conversation_dir.glob(".governance_outbox.req-old.*.json")
+        )
+        assert len(archived) == 1
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_does_not_duplicate_for_the_same_action(
+        self, governed_service
+    ):
+        """Idempotent: if the outbox already tracks this exact action
+        (whatever its state), don't create a second one for it."""
+        action = _governance_pending_action()
+        await governed_service.governance_outbox.create_record(
+            OutboxRecord(
+                request_id="req-1",
+                conversation_id=str(governed_service.stored.id),
+                action_event_id=action.id,
+                tool_call_id=action.tool_call_id,
+                tool_name=action.tool_name,
+                action_type="tool_call",
+                policy_revision="agent-server-mvp-v1",
+                action_summary="an action",
+                action_payload={},
+                digest_salt="salt",
+                action_payload_digest="digest",
+                execution_commitment="commitment",
+                origin_device_id="device-1",
+                state=OutboxState.CREATED,
+                central_approval_id="approval-1",
+            )
+        )
+
+        governed_service._conversation = self._mock_conversation([action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service._create_governance_approval = AsyncMock()
+
+        await governed_service.maybe_register_governance_approval()
+        await asyncio.sleep(0)
+
+        governed_service._create_governance_approval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_maybe_register_fails_closed_for_a_different_nonterminal_action(
+        self, governed_service
+    ):
+        """If the outbox tracks a *different*, still-active workflow, this
+        is an unexpected state (the MVP only ever governs one action at a
+        time) — fail closed rather than guessing or overwriting it."""
+        active_action = _governance_pending_action(call_id="call_1")
+        await governed_service.governance_outbox.create_record(
+            OutboxRecord(
+                request_id="req-active",
+                conversation_id=str(governed_service.stored.id),
+                action_event_id=active_action.id,
+                tool_call_id=active_action.tool_call_id,
+                tool_name=active_action.tool_name,
+                action_type="tool_call",
+                policy_revision="agent-server-mvp-v1",
+                action_summary="active action",
+                action_payload={},
+                digest_salt="salt",
+                action_payload_digest="digest",
+                execution_commitment="commitment",
+                origin_device_id="device-1",
+                state=OutboxState.CLAIMED,
+                central_approval_id="approval-active",
+            )
+        )
+
+        other_action = _governance_pending_action(call_id="call_2")
+        governed_service._conversation = self._mock_conversation([other_action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service._create_governance_approval = AsyncMock()
+
+        await governed_service.maybe_register_governance_approval()
+        await asyncio.sleep(0)
+
+        governed_service._create_governance_approval.assert_not_called()
+        # The still-active record is untouched, not archived.
+        record = governed_service.governance_outbox.load()
+        assert record is not None
+        assert record.request_id == "req-active"
+
+    # ---------------- _create_governance_approval ----------------
+
+    @pytest.mark.asyncio
+    async def test_create_governance_approval_noop_without_client_config(
+        self, event_service, tmp_path
+    ):
+        """Team mode with incomplete GovernanceClient env config must not
+        silently pretend to succeed — it should leave no outbox record
+        behind for a relay to find later."""
+        event_service.conversations_dir = tmp_path
+        await event_service._create_governance_approval(_governance_pending_action())
+        assert event_service.governance_outbox.load() is None
+
+    @pytest.mark.asyncio
+    async def test_create_governance_approval_success_updates_outbox(
+        self, governed_service
+    ):
+        fake_client = MagicMock()
+        fake_client.create_approval = AsyncMock(return_value={"id": "approval-123"})
+        governed_service.governance_client = fake_client
+        await governed_service._create_governance_approval(_governance_pending_action())
+
+        record = governed_service.governance_outbox.load()
+        assert record is not None
+        assert record.state == OutboxState.CREATED
+        assert record.central_approval_id == "approval-123"
+        fake_client.create_approval.assert_awaited_once()
+        _, kwargs = fake_client.create_approval.call_args
+        assert kwargs["idempotency_key"] == f"create-{record.request_id}"
+
+    @pytest.mark.asyncio
+    async def test_create_governance_approval_never_sends_raw_canonical_payload(
+        self, governed_service
+    ):
+        """The canonical tool-call payload (may contain shell commands,
+        file contents, secrets) must never leave this device — only a
+        redaction placeholder + the LLM's own natural-language summary are
+        sent as action_payload/action_summary. execution_commitment is
+        exempt: it's a local-only SHA-256, never transmitted in cleartext
+        form."""
+        action = _governance_pending_action()  # TerminalAction(command="ls")
+        fake_client = MagicMock()
+        fake_client.create_approval = AsyncMock(return_value={"id": "approval-123"})
+        governed_service.governance_client = fake_client
+        await governed_service._create_governance_approval(action)
+
+        (body,), kwargs = fake_client.create_approval.call_args
+        assert "ls" not in str(body["action_payload"])
+        assert "command" not in body["action_payload"]
+        assert body["action_payload"] == {
+            "redaction_status": "not_yet_implemented",
+            "tool_name": "terminal",
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_governance_approval_leaves_pending_on_api_failure(
+        self, governed_service
+    ):
+        fake_client = MagicMock()
+        fake_client.create_approval = AsyncMock(side_effect=RuntimeError("boom"))
+        governed_service.governance_client = fake_client
+        await governed_service._create_governance_approval(_governance_pending_action())
+
+        record = governed_service.governance_outbox.load()
+        assert record is not None
+        assert record.state == OutboxState.PENDING_CREATE
+        assert record.central_approval_id is None
+
+    # ---------------- run_and_wait_for_start ----------------
+
+    @pytest.mark.asyncio
+    async def test_run_and_wait_for_start_raises_without_matching_outbox(
+        self, event_service, tmp_path
+    ):
+        event_service.conversations_dir = tmp_path
+        with pytest.raises(ValueError, match="no governance outbox"):
+            await event_service.run_and_wait_for_start(central_approval_id="approval-1")
+
+    @pytest.mark.asyncio
+    async def test_run_and_wait_for_start_refuses_a_new_handshake_while_closing(
+        self, governed_service
+    ):
+        """A handshake created after close() has started would never be
+        captured by close()'s own (already-run) handshake snapshot step —
+        its claim would go completely unreconciled by this shutdown.
+        Mirrors run()'s own _closing check."""
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CREATED,
+            central_approval_id="approval-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+        governed_service._closing = True
+
+        with pytest.raises(ValueError, match="inactive_service"):
+            await governed_service.run_and_wait_for_start(
+                central_approval_id="approval-1"
+            )
+
+        assert governed_service._active_governance_handshake is None
+
+    @pytest.mark.asyncio
+    async def test_run_and_wait_for_start_returns_started_on_success(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CREATED,
+            central_approval_id="approval-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-1",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+
+        async def _fake_run(*, expected_binding, on_governed_start, **_kwargs):
+            # Matches real EventService.run() timing: it only *schedules*
+            # the actual run and returns almost immediately, well before
+            # on_governed_start/on_governed_reject fire. Calling the
+            # callback synchronously here instead would mask a
+            # premature-resolution bug: a bare `finally` in
+            # _claim_and_run_governed()'s cancellation handling would
+            # resolve the handshake to REJECTED_CANCELLED as soon as this
+            # coroutine returned, before the deferred callback ever got a
+            # chance to run.
+            asyncio.get_running_loop().call_soon(on_governed_start)
+
+        governed_service.run = AsyncMock(side_effect=_fake_run)
+
+        governed_service.governance_client = fake_client
+        outcome = await governed_service.run_and_wait_for_start(
+            central_approval_id="approval-1", timeout_seconds=5.0
+        )
+
+        assert outcome == GovernanceStartOutcome.STARTED
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CLAIMED
+        assert updated.execution_attempt_id == "attempt-1"
+
+        # A retried call for the exact same binding (e.g. central replaying
+        # create/claim with the same idempotency key, or any other caller
+        # retry) must replay the already-settled STARTED outcome, not
+        # dispatch a second claim/run attempt — an already-consumed
+        # approval must not become a replayable execution credential.
+        second_outcome = await governed_service.run_and_wait_for_start(
+            central_approval_id="approval-1", timeout_seconds=5.0
+        )
+        assert second_outcome == GovernanceStartOutcome.STARTED
+        fake_client.claim.assert_awaited_once()
+        governed_service.run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_run_and_wait_for_start_rejects_mismatched_approval_id(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CREATED,
+            central_approval_id="approval-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+
+        with pytest.raises(ValueError, match="no governance outbox record matches"):
+            await governed_service.run_and_wait_for_start(
+                central_approval_id="some-other-approval"
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_and_wait_for_start_times_out_to_pending_unknown(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CREATED,
+            central_approval_id="approval-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+
+        never_resolves: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _hang_forever(*_args, **_kwargs):
+            await never_resolves
+
+        governed_service._claim_and_run_governed = AsyncMock(side_effect=_hang_forever)
+
+        outcome = await governed_service.run_and_wait_for_start(
+            central_approval_id="approval-1", timeout_seconds=0.05
+        )
+        assert outcome == GovernanceStartOutcome.PENDING_UNKNOWN
+        never_resolves.cancel()
+
+    # ---------------- _claim_and_run_governed ----------------
+
+    @pytest.mark.asyncio
+    async def test_claim_and_run_governed_reports_claim_failure(self, governed_service):
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CREATED,
+            central_approval_id="approval-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(side_effect=RuntimeError("network down"))
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        governed_service.governance_client = fake_client
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+        # _resolve_handshake_once schedules via call_soon_threadsafe —
+        # pump the loop once so it actually runs before we check it.
+        await asyncio.sleep(0)
+
+        assert future.result() == GovernanceStartOutcome.REJECTED_CLAIM_FAILED
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+
+    @pytest.mark.asyncio
+    async def test_claim_and_run_governed_reports_binding_mismatch_to_central(
+        self, governed_service
+    ):
+        """A binding mismatch discovered *after* claim already succeeded must
+        still resolve the handshake and best-effort report the failure back
+        to central — see _report_governance_failure's docstring for why this
+        window can't be fully closed in this MVP slice."""
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CREATED,
+            central_approval_id="approval-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-1",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+        fake_client.report_result = AsyncMock(return_value={})
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _fake_run(*, on_governed_reject, **_kwargs):
+            on_governed_reject(ActionBindingMismatchError("replaced"))
+
+        governed_service.run = AsyncMock(side_effect=_fake_run)
+
+        governed_service.governance_client = fake_client
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+        # on_governed_reject schedules the report via
+        # run_coroutine_threadsafe — pump the loop so it actually runs.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert future.result() == GovernanceStartOutcome.REJECTED_BINDING_MISMATCH
+        fake_client.report_result.assert_awaited_once()
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "failure_definite"
+        assert kwargs["execution_attempt_id"] == "attempt-1"
+
+    # ---------------- _report_governance_failure ----------------
+
+    @pytest.mark.asyncio
+    async def test_report_governance_failure_marks_result_reported_on_success(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CLAIMED,
+            central_approval_id="approval-1",
+            execution_attempt_id="attempt-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        await governed_service._report_governance_failure("approval-1", "attempt-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.RESULT_REPORTED
+
+    @pytest.mark.asyncio
+    async def test_report_governance_failure_marks_needs_attention_on_error(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        record = OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CLAIMED,
+            central_approval_id="approval-1",
+            execution_attempt_id="attempt-1",
+        )
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(side_effect=RuntimeError("boom"))
+        governed_service.governance_client = fake_client
+        await governed_service._report_governance_failure("approval-1", "attempt-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+
+    # ---------------- maybe_report_governance_result ----------------
+
+    def _claimed_record(self, governed_service, action) -> OutboxRecord:
+        return OutboxRecord(
+            request_id="req-1",
+            conversation_id=str(governed_service.stored.id),
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary="running a command",
+            action_payload={},
+            digest_salt="salt",
+            action_payload_digest="digest",
+            execution_commitment=compute_execution_commitment(
+                action, str(governed_service.stored.id)
+            ),
+            origin_device_id="device-1",
+            state=OutboxState.CLAIMED,
+            central_approval_id="approval-1",
+            execution_attempt_id="attempt-1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_maybe_report_result_reports_success(self, governed_service):
+        action = _governance_pending_action()
+        await governed_service.governance_outbox.create_record(
+            self._claimed_record(governed_service, action)
+        )
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=False),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        await governed_service.maybe_report_governance_result()
+
+        fake_client.report_result.assert_awaited_once()
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "success"
+        assert kwargs["execution_attempt_id"] == "attempt-1"
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.RESULT_REPORTED
+
+    @pytest.mark.asyncio
+    async def test_maybe_report_result_reports_failure_definite(self, governed_service):
+        action = _governance_pending_action()
+        await governed_service.governance_outbox.create_record(
+            self._claimed_record(governed_service, action)
+        )
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=True),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        await governed_service.maybe_report_governance_result()
+
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "failure_definite"
+
+    @pytest.mark.asyncio
+    async def test_maybe_report_result_reports_failure_unknown_on_crash_recovery(
+        self, governed_service
+    ):
+        """A synthetic AgentErrorEvent (crash-recovery, matched by
+        tool_call_id — it carries no action_id) means the process died
+        before we know whether the tool's side effect happened — must never
+        be reported as a definite outcome."""
+        action = _governance_pending_action()
+        await governed_service.governance_outbox.create_record(
+            self._claimed_record(governed_service, action)
+        )
+        crash_error = AgentErrorEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            error="restart occurred mid-execution",
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, crash_error]
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        await governed_service.maybe_report_governance_result()
+
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "failure_unknown"
+
+    @pytest.mark.asyncio
+    async def test_maybe_report_result_noop_when_not_yet_resolved(
+        self, governed_service
+    ):
+        """No matching observation yet (the action is still pending or
+        running) — must not guess an outcome; just retry on the next
+        finally."""
+        action = _governance_pending_action()
+        await governed_service.governance_outbox.create_record(
+            self._claimed_record(governed_service, action)
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action]
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        await governed_service.maybe_report_governance_result()
+
+        fake_client.report_result.assert_not_awaited()
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CLAIMED
+
+    @pytest.mark.asyncio
+    async def test_maybe_report_result_noop_when_outbox_not_claimed(
+        self, governed_service
+    ):
+        """Only a CLAIMED record represents a governed action actually in
+        flight — any other state (still pending create, already reported,
+        etc.) is not this hook's concern."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        record.state = OutboxState.CREATED
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        await governed_service.maybe_report_governance_result()
+
+        fake_client.report_result.assert_not_awaited()
+
+    # ---------------- cancellation / lifecycle ----------------
+
+    @pytest.mark.asyncio
+    async def test_claim_and_run_governed_cancellation_resolves_handshake(
+        self, governed_service
+    ):
+        """Cancelling the background handshake task (e.g. EventService.
+        close() draining in-flight work) must still resolve the future —
+        otherwise a waiter would hang until its own timeout instead of
+        observing the cancellation immediately."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        record.state = OutboxState.CREATED
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        never_returns: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _hang_forever(*_args, **_kwargs):
+            await never_returns
+
+        fake_client.claim = AsyncMock(side_effect=_hang_forever)
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        governed_service.governance_client = fake_client
+        task = asyncio.create_task(
+            governed_service._claim_and_run_governed(record, "approval-1", future)
+        )
+        await asyncio.sleep(0)  # let it reach the hanging claim() call
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        assert future.result() == GovernanceStartOutcome.REJECTED_CANCELLED
+        never_returns.cancel()
+
+    @pytest.mark.asyncio
+    async def test_is_idle_evictable_false_while_governance_handshake_active(
+        self, governed_service
+    ):
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _hang_forever():
+            await future
+
+        task = asyncio.create_task(_hang_forever())
+        governed_service._active_governance_handshake = _GovernanceHandshake(
+            binding_fingerprint="fp", future=future, task=task
+        )
+
+        assert governed_service.is_idle_evictable() is False
+
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_is_idle_evictable_false_while_governance_background_work_pending(
+        self, governed_service
+    ):
+        """Not just the handshake — a fire-and-forget create/report task
+        must also hold off idle eviction, or an evict-then-close() sweep
+        would silently cancel work that was never flagged as in-flight."""
+        release = asyncio.Event()
+
+        async def _hang_until_released():
+            await release.wait()
+
+        create_task = asyncio.create_task(_hang_until_released())
+        governed_service._pending_governance_create_tasks.add(create_task)
+
+        assert governed_service.is_idle_evictable() is False
+
+        release.set()
+        await create_task
+        # Production code discards via a done-callback (see
+        # maybe_register_governance_approval()) — do it explicitly here
+        # since this test adds the task to the set directly.
+        governed_service._pending_governance_create_tasks.discard(create_task)
+        assert governed_service.is_idle_evictable() is True
+
+        release = asyncio.Event()
+        report_task = asyncio.create_task(_hang_until_released())
+        governed_service._pending_governance_report_tasks.add(report_task)
+
+        assert governed_service.is_idle_evictable() is False
+
+        release.set()
+        await report_task
+        governed_service._pending_governance_report_tasks.discard(report_task)
+        assert governed_service.is_idle_evictable() is True
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_pending_create_task(self, governed_service):
+        """maybe_register_governance_approval()'s fire-and-forget create
+        task is independent of the claim/run handshake, but must be
+        cancelled-and-drained the same way — otherwise it can keep writing
+        to self.governance_outbox after close() considers the service torn
+        down."""
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _hang_forever():
+            await future
+
+        task = asyncio.create_task(_hang_forever())
+        governed_service._pending_governance_create_tasks.add(task)
+        task.add_done_callback(
+            governed_service._pending_governance_create_tasks.discard
+        )
+        governed_service._conversation = None  # keep close() minimal
+
+        await governed_service.close()
+
+        assert task.cancelled()
+        assert governed_service._pending_governance_create_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_in_flight_governance_handshake(self, governed_service):
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _hang_forever():
+            await future
+
+        task = asyncio.create_task(_hang_forever())
+        governed_service._active_governance_handshake = _GovernanceHandshake(
+            binding_fingerprint="fp", future=future, task=task
+        )
+        governed_service._conversation = None  # keep close() minimal
+
+        await governed_service.close()
+
+        assert task.cancelled() or task.done()
+        assert governed_service._active_governance_handshake is None
+
+    @pytest.mark.asyncio
+    async def test_close_reconciles_an_orphaned_claimed_record(self, governed_service):
+        """If a central claim succeeded (outbox CLAIMED) but this service
+        is shutting down before any conclusive result was ever reported —
+        whether the handshake was cancelled before self.run() started, or
+        a governed run was cancelled mid-execution — close() must
+        proactively report failure_unknown rather than leave central
+        holding an execution lease with no path to resolution."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        governed_service._conversation = None  # keep close() minimal
+
+        await governed_service.close()
+
+        fake_client.report_result.assert_awaited_once()
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "failure_unknown"
+        assert kwargs["execution_attempt_id"] == "attempt-1"
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.RESULT_REPORTED
+
+    @pytest.mark.asyncio
+    async def test_close_does_not_reconcile_a_non_claimed_record(
+        self, governed_service
+    ):
+        """Only a CLAIMED record represents an orphaned central execution
+        lease — any other state (still pending create, already reported,
+        etc.) is not this hook's concern."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        record.state = OutboxState.CREATED
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        governed_service._conversation = None
+
+        await governed_service.close()
+
+        fake_client.report_result.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_pending_reject_report_before_reconciling(
+        self, governed_service
+    ):
+        """A binding-mismatch rejection discovered after claim schedules
+        _report_governance_failure() via on_governed_reject. close() must
+        wait for that report to actually finish before deciding whether
+        the outbox still needs a failure_unknown reconciliation —
+        otherwise the two could send central conflicting outcomes for the
+        same execution_attempt_id.
+
+        close() is started immediately after on_governed_reject fires,
+        without pumping the loop first — exercising the exact window where
+        the call_soon_threadsafe-scheduled closure has been *scheduled*
+        but not yet *executed*. The atomic closure that resolves the
+        handshake and registers the report task together (no await between
+        the two steps) guarantees close() can only ever observe "both
+        happened" or "neither" — never one without the other — so this
+        must still end up waiting for and draining the report correctly
+        even started this early.
+        """
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+
+        release_report = asyncio.Event()
+
+        async def _slow_report_result(*_args, **_kwargs):
+            await release_report.wait()
+            return {}
+
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-1",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+        fake_client.report_result = AsyncMock(side_effect=_slow_report_result)
+        governed_service.governance_client = fake_client
+
+        async def _fake_run(*, on_governed_reject, **_kwargs):
+            on_governed_reject(ActionBindingMismatchError("replaced"))
+
+        governed_service.run = AsyncMock(side_effect=_fake_run)
+        governed_service._conversation = None  # keep close() minimal
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+
+        close_task = asyncio.create_task(governed_service.close())
+        await asyncio.sleep(0)
+        assert not close_task.done()  # still waiting on the pending report
+
+        release_report.set()
+        await close_task
+
+        # Exactly one report, not a second conflicting one from
+        # _reconcile_governance_after_close() racing the first.
+        fake_client.report_result.assert_awaited_once()
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "failure_definite"
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.RESULT_REPORTED
+
+    @pytest.mark.asyncio
+    async def test_close_sees_a_task_registered_via_call_soon_threadsafe(
+        self, governed_service
+    ):
+        """Deterministic, mechanism-level regression: the test above relies
+        on on_governed_reject's own closure having already been scheduled
+        before close() is started, so a natural ready-queue ordering could
+        coincidentally make it pass even without the fix. This test removes
+        that ambiguity by driving the exact primitive directly: schedule a
+        task-registering closure via call_soon_threadsafe with *zero*
+        intervening awaits, then start close() immediately — the narrowest
+        possible version of the window close() must not fall through."""
+        governed_service._conversation = None  # keep close() minimal
+        release_task = asyncio.Event()
+
+        async def _slow_task() -> None:
+            await release_task.wait()
+
+        def _register_late_task() -> None:
+            task = asyncio.create_task(_slow_task())
+            governed_service._pending_governance_report_tasks.add(task)
+            task.add_done_callback(
+                governed_service._pending_governance_report_tasks.discard
+            )
+
+        asyncio.get_running_loop().call_soon_threadsafe(_register_late_task)
+        # No await between the scheduling call above and starting close()
+        # below — the closure has not run yet at this point.
+        close_task = asyncio.create_task(governed_service.close())
+        await asyncio.sleep(0)
+        assert not close_task.done(), (
+            "close() must have observed the task this closure registers, "
+            "not decided there was nothing pending before the closure ever "
+            "ran"
+        )
+
+        release_task.set()
+        await close_task
+
+    @pytest.mark.asyncio
+    async def test_late_reject_after_registration_closed_does_not_register_a_report(
+        self, governed_service
+    ):
+        """The other side of the window above: once close() has committed
+        to being the sole reporter (_governance_report_registration_closed
+        set), a late on_governed_reject — e.g. from a synchronous
+        conversation.run() still executing on its own worker thread, which
+        close() cannot forcibly stop (see close()'s run-task-drain
+        comment) — must not register a second, untracked report that could
+        conflict with close()'s own reconciliation outcome."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-1",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+
+        captured_on_reject = None
+
+        async def _fake_run(*, on_governed_reject, **_kwargs):
+            nonlocal captured_on_reject
+            captured_on_reject = on_governed_reject
+
+        governed_service.run = AsyncMock(side_effect=_fake_run)
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+        assert captured_on_reject is not None
+
+        # Simulate close() having already reached the point where it
+        # commits to _reconcile_governance_after_close() being authoritative.
+        governed_service._governance_report_registration_closed = True
+
+        captured_on_reject(ActionBindingMismatchError("replaced"))
+        await asyncio.sleep(0)
+
+        assert governed_service._pending_governance_report_tasks == set()
+        fake_client.report_result.assert_not_awaited()
+        # The handshake future is still resolved -- only the *report*
+        # registration is suppressed, not the outcome itself.
+        assert future.result() == GovernanceStartOutcome.REJECTED_BINDING_MISMATCH
+
+    @pytest.mark.asyncio
+    async def test_late_reject_after_a_real_close_call_does_not_register_a_report(
+        self, governed_service
+    ):
+        """Strengthens the test above by actually running close() to
+        completion first, instead of only setting the flag by hand —
+        proving the suppression genuinely survives a real close() call
+        (which also exercises its own failure_unknown reconciliation
+        report for the orphaned CLAIMED record), not just this test's own
+        assumption about the flag's effect."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-1",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+
+        captured_on_reject = None
+
+        async def _fake_run(*, on_governed_reject, **_kwargs):
+            nonlocal captured_on_reject
+            captured_on_reject = on_governed_reject
+
+        governed_service.run = AsyncMock(side_effect=_fake_run)
+        governed_service._conversation = None  # keep close() minimal
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+        assert captured_on_reject is not None
+
+        await governed_service.close()  # the real thing, run to completion
+
+        # close()'s own reconciliation already reported the orphaned claim.
+        fake_client.report_result.assert_awaited_once()
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "failure_unknown"
+        fake_client.report_result.reset_mock()
+
+        # Simulates the executor-thread race close()'s own run-task-drain
+        # comment describes: conversation.run() was still executing on its
+        # own worker thread and only calls back into on_governed_reject
+        # after close() has already returned.
+        captured_on_reject(ActionBindingMismatchError("replaced"))
+        await asyncio.sleep(0)
+
+        assert governed_service._pending_governance_report_tasks == set()
+        fake_client.report_result.assert_not_awaited()

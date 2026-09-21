@@ -1,13 +1,14 @@
 import asyncio
 import functools
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -16,6 +17,17 @@ from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
     ConversationLease,
     ConversationOwnershipLostError,
+)
+from openhands.agent_server.governance_client import (
+    GovernanceClient,
+    compute_display_digest,
+)
+from openhands.agent_server.governance_outbox import (
+    TERMINAL_STATES,
+    GovernanceOutbox,
+    OutboxRecord,
+    OutboxState,
+    record_attempt,
 )
 from openhands.agent_server.models import (
     ConfirmationResponseRequest,
@@ -62,9 +74,12 @@ from openhands.sdk.credential import (
     VersionedCredentialBinding,
 )
 from openhands.sdk.event import (
+    ActionEvent,
     AgentErrorEvent,
     ObservationBaseEvent,
+    ObservationEvent,
     StreamingDeltaEvent,
+    UserRejectObservation,
 )
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
@@ -76,6 +91,13 @@ from openhands.sdk.llm.streaming import LLMStreamChunk
 from openhands.sdk.mcp.utils import MCPToolProvider
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
+from openhands.sdk.security.roy_action_binding import (
+    ActionBinding,
+    ActionBindingMismatchError,
+    ActionCountMismatchError,
+    ExecutionLeaseExpiredError,
+    compute_execution_commitment,
+)
 from openhands.sdk.security.roy_self_approval import check_not_self_approval
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
@@ -94,6 +116,142 @@ logger = get_logger(__name__)
 
 class CredentialBindingActivationTooLate(RuntimeError):
     pass
+
+
+class GovernanceStartOutcome(StrEnum):
+    """What ``run_and_wait_for_start()`` resolved to — see that method's
+    docstring for the full handshake this enum is the result of."""
+
+    STARTED = "started"
+    REJECTED_CLAIM_FAILED = "rejected_claim_failed"
+    REJECTED_BINDING_MISMATCH = "rejected_binding_mismatch"
+    REJECTED_LEASE_EXPIRED = "rejected_lease_expired"
+    REJECTED_ACTION_COUNT_MISMATCH = "rejected_action_count_mismatch"
+    REJECTED_CANCELLED = "rejected_cancelled"
+    REJECTED_INTERNAL_ERROR = "rejected_internal_error"
+    PENDING_UNKNOWN = "pending_unknown"
+
+
+class GovernanceApprovalRequiredError(RuntimeError):
+    """Raised by ``respond_to_confirmation()`` when team mode is active and
+    an ``accept=True`` request omits ``central_approval_id``.
+
+    A valid ``X-Governance-Bridge-Token`` (Phase A) only proves the caller
+    is allowed to reach this endpoint at all — it says nothing about
+    whether *this specific action* was actually approved by
+    central-governance-api. Without this check, team mode's bridge-token
+    gate is not actually a governance gate: any bridge-token holder could
+    omit ``central_approval_id`` and fall through to the plain accept path
+    below, executing the pending action without ever having gone through
+    claim/binding verification."""
+
+
+class GovernanceStartRejectedError(RuntimeError):
+    """Raised by ``respond_to_confirmation()`` when a team-mode accept's
+    claim/binding handshake (``run_and_wait_for_start()``) resolves to
+    anything other than ``STARTED`` — including ``PENDING_UNKNOWN`` (the
+    handshake timed out rather than being rejected, but is still not a
+    success the caller can act on). Carries the ``GovernanceStartOutcome``
+    itself so ``api.py``'s handler can map it to a stable status/error_code
+    without re-deriving it from a message string."""
+
+    def __init__(self, outcome: GovernanceStartOutcome) -> None:
+        self.outcome = outcome
+        super().__init__(f"governed confirmation did not start: {outcome.value}")
+
+
+@dataclass
+class _GovernanceHandshake:
+    """Tracks one ``run_and_wait_for_start()`` call — in flight or already
+    settled — so a genuine duplicate (same binding fingerprint) joins the
+    same shared future instead of the caller inferring ``STARTED`` from
+    ``central_approval_id`` alone (comparing only the approval id would let
+    a duplicate return ``STARTED`` before the background task had even
+    attempted the claim) *and* instead of dispatching a brand new claim/run
+    attempt once the original has already reached a terminal outcome — see
+    ``run_and_wait_for_start()``'s reuse check."""
+
+    binding_fingerprint: str
+    future: asyncio.Future
+    task: asyncio.Task
+
+
+def _resolve_handshake_once(
+    future: asyncio.Future, outcome: GovernanceStartOutcome | None = None
+) -> None:
+    """The only function allowed to complete a governance-handshake future
+    — guarantees every ``_run_governed()`` exit path (normal return,
+    exception, cancellation) resolves it exactly once, so a caller waiting
+    on ``run_and_wait_for_start()`` is never left hanging past its own
+    timeout for a reason other than a genuine timeout.
+
+    Thread-safe: schedules the actual ``set_result`` onto the future's own
+    event loop via ``call_soon_threadsafe`` rather than calling it directly,
+    because the caller may be running on a worker thread (``EventService``
+    dispatches sync-only agents' ``conversation.run()`` through an
+    executor — see ``run()``'s existing dispatch logic below — and
+    ``asyncio.Future`` is not thread-safe).
+    """
+    if future.done():
+        return
+    loop = future.get_loop()
+
+    def _do_resolve() -> None:
+        if not future.done():
+            future.set_result(outcome)
+
+    loop.call_soon_threadsafe(_do_resolve)
+
+
+def _apply_created(record: OutboxRecord, central_approval_id: str) -> OutboxRecord:
+    record.central_approval_id = central_approval_id
+    record.state = OutboxState.CREATED
+    return record
+
+
+def _apply_claim(
+    record: OutboxRecord, execution_attempt_id: str, executing_lease_expires_at: str
+) -> OutboxRecord:
+    record.execution_attempt_id = execution_attempt_id
+    record.executing_lease_expires_at = executing_lease_expires_at
+    record.state = OutboxState.CLAIMED
+    return record
+
+
+def _classify_governed_action_outcome(
+    action_event_id: str, tool_call_id: str | None, events: Sequence[Event]
+) -> str | None:
+    """Central's ``report-result`` outcome for a governed action, read from
+    this device's own persisted event history — never guessed. Conservative
+    by construction: only ever returns ``"success"``
+    or ``"failure_definite"`` when a matching ``ObservationEvent`` actually
+    exists (its ``is_error`` flag decides which); an ``AgentErrorEvent``
+    (the synthetic error ``start()`` writes on crash-recovery, matched by
+    ``tool_call_id`` per ``ConversationState.get_unmatched_actions()``'s own
+    convention — it carries no ``action_id``) means the process died and
+    there is no way to tell whether the tool's side effect happened first,
+    so it maps to ``"failure_unknown"``, not ``"failure_definite"``. A
+    ``UserRejectObservation`` here would mean this action was rejected
+    *after* already passing the binding check and starting to run, which
+    should not happen — also reported as ``"failure_unknown"`` rather than
+    silently dropped. Returns ``None`` (not yet resolved, try again later)
+    when none of these have appeared yet.
+    """
+    for event in events:
+        if isinstance(event, ObservationEvent) and event.action_id == action_event_id:
+            return "failure_definite" if event.observation.is_error else "success"
+        if (
+            isinstance(event, UserRejectObservation)
+            and event.action_id == action_event_id
+        ):
+            return "failure_unknown"
+        if (
+            isinstance(event, AgentErrorEvent)
+            and tool_call_id is not None
+            and event.tool_call_id == tool_call_id
+        ):
+            return "failure_unknown"
+    return None
 
 
 def _without_agent_context_secret(
@@ -131,6 +289,18 @@ class EventService:
     )
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
+    # Sourced from the same validated Config the REST layer's bridge-token
+    # gate reads (request.app.state.config) — via ConversationService.
+    # get_instance(), which snapshots these at the same point it snapshots
+    # every other Config-derived field (owner_instance_id, lease_ttl_seconds
+    # above, etc.). Deliberately NOT read from process environment: team
+    # mode configured via a JSON config file, a programmatic Config(...),
+    # or deferred-init must agree with the REST route's own authorization
+    # check, which reads the same Config — a mismatch here is a governance
+    # bypass, not just a DI tidiness issue.
+    governance_deployment_mode: Literal["personal", "team"] = "personal"
+    governance_client: GovernanceClient | None = None
+    governance_origin_device_id: str = "unset-device-id"
     _conversation: LocalConversation | None = field(default=None, init=False)
     _pub_sub: PubSub[Event] = field(
         default_factory=lambda: PubSub[Event](max_subscribers=50), init=False
@@ -162,10 +332,49 @@ class EventService:
     _last_active_monotonic: float = field(default_factory=time.monotonic, init=False)
     # Subscribers attached at startup; later ones (e.g. websockets) are external.
     _internal_subscriber_ids: set[UUID] = field(default_factory=set, init=False)
+    # Tracks the in-flight run_and_wait_for_start() call, if any — see
+    # _GovernanceHandshake's docstring for why comparing central_approval_id
+    # alone isn't enough to detect a genuine duplicate.
+    _active_governance_handshake: _GovernanceHandshake | None = field(
+        default=None, init=False
+    )
+    _governance_outbox_instance: GovernanceOutbox | None = field(
+        default=None, init=False
+    )
+    # A binding/lease/count rejection discovered after claim schedules
+    # _report_governance_failure() via on_governed_reject — tracked here so
+    # close() can await it before deciding whether the outbox is still
+    # orphaned (_reconcile_governance_after_close()). Without this, close()
+    # could race with an in-flight report and the two could send central
+    # conflicting outcomes for the same execution_attempt_id.
+    _pending_governance_report_tasks: set[asyncio.Task] = field(
+        default_factory=set, init=False
+    )
+    # maybe_register_governance_approval()'s fire-and-forget
+    # _create_governance_approval() task — tracked so close() can
+    # cancel-and-drain it the same way as _lease_task/_goal_loop_task,
+    # instead of letting it keep writing to self.governance_outbox after
+    # this service is considered closed.
+    _pending_governance_create_tasks: set[asyncio.Task] = field(
+        default_factory=set, init=False
+    )
+    # Set by close() once it commits to being the sole source of truth for
+    # reporting an orphaned claim. A synchronous conversation.run() on a
+    # worker thread cannot be forcibly stopped by cancelling its wrapper
+    # task, so on_governed_reject can still fire after close() has already
+    # moved on to _reconcile_governance_after_close() — this flag stops
+    # that late callback from registering a second, competing report.
+    _governance_report_registration_closed: bool = field(default=False, init=False)
 
     @property
     def conversation_dir(self):
         return self.conversations_dir / self.stored.id.hex
+
+    @property
+    def governance_outbox(self) -> GovernanceOutbox:
+        if self._governance_outbox_instance is None:
+            self._governance_outbox_instance = GovernanceOutbox(self.conversation_dir)
+        return self._governance_outbox_instance
 
     async def load_meta(self):
         meta_file = self.conversation_dir / "meta.json"
@@ -1184,6 +1393,14 @@ class EventService:
                     )
                     self._conversation._on_event(error_event)
 
+        # Crash-recovery counterpart to _run_and_publish()'s finally hook:
+        # the synthetic AgentErrorEvent written above (if any) is exactly
+        # the kind of evidence _classify_governed_action_outcome() reads —
+        # without this call, a governed action whose process died mid-
+        # execution would never get reported to central unless a *later*
+        # run happened to trigger the finally hook again.
+        await self.maybe_report_governance_result()
+
         # Publish initial state update
         await self._publish_state_update()
 
@@ -1191,6 +1408,9 @@ class EventService:
         self,
         acp_internal_rerun_generation: int | None = None,
         approver_identity: str | None = None,
+        expected_binding: ActionBinding | None = None,
+        on_governed_start: Callable[[], None] | None = None,
+        on_governed_reject: Callable[[BaseException], None] | None = None,
     ):
         """Run the conversation asynchronously in the background.
 
@@ -1223,6 +1443,30 @@ class EventService:
                 either way; only which of the two call sites ends up raising
                 it, and thus whether the REST caller sees the clean 403 or a
                 generic ERROR status, is affected).
+            expected_binding: Forwarded to the conversation's own
+                ``run()``/``arun()`` (see ``roy_action_binding.py``). A
+                no-op when ``None`` (personal mode/today's behavior,
+                unaffected). Not double-checked here the way
+                ``approver_identity`` is — the pending-action snapshot this
+                check needs is itself part of the atomic transition inside
+                ``run()``/``arun()``'s own state lock, so re-reading it here
+                first would not be authoritative anyway (see
+                ``run_and_wait_for_start()``, which is the intended caller
+                for this parameter).
+            on_governed_start: Invoked synchronously, still inside
+                ``run()``/``arun()``'s own state lock, the moment a governed
+                confirmation's binding check passes and execution status has
+                just become ``RUNNING`` — i.e. the earliest point at which
+                the caller can be told "this will actually execute". Must
+                be cheap and non-throwing (see ``_resolve_handshake_once``,
+                the only implementation this parameter is used with).
+            on_governed_reject: The mirror image of ``on_governed_start``,
+                invoked instead of it if ``expected_binding``'s check fails.
+                This is the only way a caller of this method — which itself
+                returns as soon as the background task is *scheduled*, not
+                when that task actually reaches the binding check — can
+                observe the rejection (see ``run_and_wait_for_start()``,
+                the intended caller for this parameter).
 
         Raises:
             ValueError: If the service is inactive, conversation is already
@@ -1289,31 +1533,50 @@ class EventService:
                         and type(conversation).arun is not BaseConversation.arun
                         and type(conversation.agent).astep is not AgentBase.astep
                     )
-                    # approver_identity is a LocalConversation-specific
-                    # extension (roy_self_approval.py), not part of
-                    # BaseConversation's abstract signature — only thread it
-                    # through when the caller actually supplied one, so a
-                    # bare run()/arun() call still dispatches exactly as
-                    # before against any conversation-like object that
-                    # doesn't know this kwarg exists (e.g. test doubles
+                    # approver_identity/expected_binding/on_governed_start
+                    # are LocalConversation-specific extensions
+                    # (roy_self_approval.py / roy_action_binding.py), not
+                    # part of BaseConversation's abstract signature — only
+                    # thread through the ones the caller actually supplied,
+                    # so a bare run()/arun() call still dispatches exactly
+                    # as before against any conversation-like object that
+                    # doesn't know these kwargs exist (e.g. test doubles
                     # exercising this dispatch logic in isolation).
+                    passthrough_kwargs: dict[str, object] = {}
+                    if approver_identity is not None:
+                        passthrough_kwargs["approver_identity"] = approver_identity
+                    if expected_binding is not None:
+                        passthrough_kwargs["expected_binding"] = expected_binding
+                    if on_governed_start is not None:
+                        passthrough_kwargs["on_governed_start"] = on_governed_start
+                    if on_governed_reject is not None:
+                        passthrough_kwargs["on_governed_reject"] = on_governed_reject
                     if has_native_arun:
-                        if approver_identity is not None:
-                            await conversation.arun(
-                                approver_identity=approver_identity
-                            )
-                        else:
-                            await conversation.arun()
-                    elif approver_identity is not None:
+                        await conversation.arun(**passthrough_kwargs)
+                    elif passthrough_kwargs:
                         await loop.run_in_executor(
                             self._run_executor,
-                            functools.partial(
-                                conversation.run,
-                                approver_identity=approver_identity,
-                            ),
+                            functools.partial(conversation.run, **passthrough_kwargs),
                         )
                     else:
                         await loop.run_in_executor(self._run_executor, conversation.run)
+                except (
+                    ActionBindingMismatchError,
+                    ExecutionLeaseExpiredError,
+                    ActionCountMismatchError,
+                ):
+                    # Mirrors LocalConversation.run()/arun()'s own equivalent
+                    # except clause: raised before execution_status was ever
+                    # assigned RUNNING (see roy_action_binding.py's placement
+                    # in the state-lock critical section), so there is
+                    # nothing here to force back to ERROR either — doing so
+                    # would overwrite a perfectly valid
+                    # WAITING_FOR_CONFIRMATION. _run_governed() (this
+                    # exception's actual caller, via run_and_wait_for_start)
+                    # has its own try/except around this same call and is
+                    # the one that resolves the governance handshake and
+                    # routes to pre-claim-abort/report-result accordingly.
+                    raise
                 except Exception as exc:
                     logger.exception("Error during conversation run")
                     # Backstop: a run that raised before reaching its own error
@@ -1344,6 +1607,20 @@ class EventService:
 
                     # Clear task reference and publish state update
                     self._run_task = None
+                    # Phase B hook: team mode + exactly one pending action +
+                    # no existing outbox record yet -> register a central
+                    # approval. A no-op in every other case (see the
+                    # method's own docstring for the full gate). Runs
+                    # before publishing state so a listener reacting to
+                    # WAITING_FOR_CONFIRMATION can assume registration was
+                    # at least attempted.
+                    await self.maybe_register_governance_approval()
+                    # Phase D-lite hook: if a previously-claimed governed
+                    # action's fate can now be read from the event log
+                    # (success or a normal tool-level failure), report it
+                    # to central. A no-op otherwise — see the method's own
+                    # docstring.
+                    await self.maybe_report_governance_result()
                     await self._publish_state_update()
 
                     # Re-arm a run for input stranded while this task was
@@ -1400,6 +1677,565 @@ class EventService:
 
             # Create task but don't await it - runs in background
             self._run_task = asyncio.create_task(_run_and_publish())
+
+    def _snapshot_pending_actions_sync(self) -> list[ActionEvent]:
+        """Off-loop helper for ``maybe_register_governance_approval()``.
+        Must run via executor, never called directly from the event-loop
+        thread: ``ConversationState``'s real lock (``FIFOLock``) is a plain
+        ``threading.Lock`` under the hood, so acquiring it synchronously on
+        the loop thread would stall the *entire* server process for as
+        long as a worker-thread ``conversation.run()`` happens to hold it —
+        the finally block's own ``self._run_task = None`` leaves a window
+        where a fresh run can start on another thread before this hook
+        gets to look."""
+        assert self._conversation is not None
+        with self._conversation._state as state:
+            return ConversationState.get_unmatched_actions(state.active_branch())
+
+    async def maybe_register_governance_approval(self) -> None:
+        """Phase B hook: called from ``_run_and_publish()``'s ``finally``
+        (see ``run()`` above) after every run, whether it ended normally,
+        errored, or is now waiting for confirmation.
+
+        A no-op unless ALL of: team mode is active, execution status is
+        currently ``WAITING_FOR_CONFIRMATION``, and there is exactly one
+        pending action (see roy_action_binding.py's ``ActionCountMismatch
+        Error`` — this MVP slice does not support batch confirmations, so
+        it simply never engages rather than guessing). If an outbox record
+        already exists for a *different* action and has reached a terminal
+        state, it is archived (kept on disk as an audit trail, see
+        ``GovernanceOutbox.archive_and_clear()``) so this conversation's
+        next confirmation round can be governed too — a conversation is not
+        limited to a single governed action over its whole lifetime. If an
+        outbox record already exists for the *same* action but is still
+        ``PENDING_CREATE`` (the create call was interrupted by a crash, or
+        by ``close()`` cancelling the create task before it heard back),
+        this hook retries it with the same request_id/idempotency key —
+        this hook runs after every single run cycle, including crash-
+        recovery, so it doubles as the only retry path a stuck
+        PENDING_CREATE has in this MVP slice. Fire-and-forget the actual
+        central-governance-api call (network I/O) so this method itself
+        returns quickly and never blocks the run's own finally/state-
+        publish path.
+        """
+        if self.governance_deployment_mode != "team" or self._conversation is None:
+            return
+        if (
+            await self._get_execution_status()
+            != ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        ):
+            return
+        loop = asyncio.get_running_loop()
+        pending = await loop.run_in_executor(None, self._snapshot_pending_actions_sync)
+        if len(pending) != 1:
+            logger.info(
+                "team mode: %d pending actions (need exactly 1) — governance "
+                "hook not engaging for conversation %s",
+                len(pending),
+                self.stored.id,
+            )
+            return
+        (action,) = pending
+        existing = self.governance_outbox.load()
+        if existing is not None:
+            if existing.action_event_id == action.id:
+                if existing.state == OutboxState.PENDING_CREATE:
+                    # The create call itself never got a confirmed
+                    # response last time (a crash, or close() cancelling
+                    # the create task while it was still in flight) —
+                    # retry it with the same request_id/idempotency key
+                    # rather than leaving this conversation permanently
+                    # unable to be governed for this action. Nothing else
+                    # in this MVP slice retries a stuck PENDING_CREATE.
+                    self._schedule_governance_create_task(
+                        self._send_create_approval(existing)
+                    )
+                # Already created (or in flight past create) for this
+                # exact action — not a new confirmation round, nothing
+                # more to do.
+                return
+            if existing.state not in TERMINAL_STATES:
+                logger.warning(
+                    "team mode: outbox already tracks a different, "
+                    "non-terminal governance workflow for conversation %s "
+                    "— not creating a second one",
+                    self.stored.id,
+                )
+                return
+            await self.governance_outbox.archive_and_clear()
+        self._schedule_governance_create_task(self._create_governance_approval(action))
+
+    def _schedule_governance_create_task(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._pending_governance_create_tasks.add(task)
+        task.add_done_callback(self._pending_governance_create_tasks.discard)
+
+    async def _create_governance_approval(self, action: ActionEvent) -> None:
+        client = self.governance_client
+        if client is None:
+            logger.error(
+                "governance_deployment_mode is 'team' but GovernanceClient "
+                "env vars are not fully configured; not creating a central "
+                "approval for conversation %s",
+                self.stored.id,
+            )
+            return
+        conversation_id = str(self.stored.id)
+        digest_salt = uuid4().hex
+        # Deliberately NOT action.action.model_dump(...): that is the raw
+        # canonical tool call (may contain shell commands, file contents,
+        # URLs, tokens) and roy_action_binding.py's own ActionBinding
+        # docstring documents that canonical payloads never leave this
+        # device — central only ever sees redacted display fields. A real
+        # per-tool redaction/display projection is not built yet; until it
+        # exists, send an explicit placeholder rather than either the raw payload
+        # (a leak) or a silently-empty dict (which could be misread as
+        # "this action has no risk-relevant parameters"). `action_summary`
+        # (the LLM's own natural-language description) is still sent
+        # separately and is the current best available display content.
+        action_payload: dict[str, Any] = {
+            "redaction_status": "not_yet_implemented",
+            "tool_name": action.tool_name,
+        }
+        action_payload_digest = compute_display_digest(
+            action_type="tool_call",
+            tool_name=action.tool_name,
+            policy_revision="agent-server-mvp-v1",
+            action_summary=action.summary or action.tool_name,
+            action_payload=action_payload,
+            digest_salt=digest_salt,
+        )
+        record = OutboxRecord(
+            request_id=uuid4().hex,
+            conversation_id=conversation_id,
+            action_event_id=action.id,
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            action_type="tool_call",
+            policy_revision="agent-server-mvp-v1",
+            action_summary=action.summary or action.tool_name,
+            action_payload=action_payload,
+            digest_salt=digest_salt,
+            action_payload_digest=action_payload_digest,
+            execution_commitment=compute_execution_commitment(action, conversation_id),
+            origin_device_id=self.governance_origin_device_id,
+        )
+        try:
+            await self.governance_outbox.create_record(record)
+        except FileExistsError:
+            # Lost a race with another call to this same method — the
+            # existing record is authoritative, nothing more to do.
+            return
+        await self._send_create_approval(record)
+
+    async def _send_create_approval(self, record: OutboxRecord) -> None:
+        """POSTs ``record``'s own already-persisted fields to central via
+        ``create_approval()``, keyed by the record's own ``request_id`` —
+        stable whether this is the record's first attempt (see
+        ``_create_governance_approval``) or a retry of one still stuck in
+        ``PENDING_CREATE`` (see ``maybe_register_governance_approval``),
+        so central's idempotency check treats both the same."""
+        client = self.governance_client
+        if client is None:
+            return
+        try:
+            response = await client.create_approval(
+                {
+                    "request_id": record.request_id,
+                    "origin_device_id": record.origin_device_id,
+                    "conversation_id": record.conversation_id,
+                    "action_event_id": record.action_event_id,
+                    "tool_call_id": record.tool_call_id,
+                    "action_type": record.action_type,
+                    "tool_name": record.tool_name,
+                    "policy_revision": record.policy_revision,
+                    "action_summary": record.action_summary,
+                    "action_payload": record.action_payload,
+                    "digest_salt": record.digest_salt,
+                    "action_payload_digest": record.action_payload_digest,
+                },
+                idempotency_key=f"create-{record.request_id}",
+            )
+        except Exception:
+            logger.exception(
+                "central-governance-api create failed for conversation %s; "
+                "leaving outbox in pending_create for a future run to retry",
+                record.conversation_id,
+            )
+            return
+        await self.governance_outbox.mutate(lambda r: _apply_created(r, response["id"]))
+
+    def _snapshot_events_sync(self) -> list[Event]:
+        """Off-loop helper for ``maybe_report_governance_result()`` — see
+        ``_snapshot_pending_actions_sync()``'s docstring for why this must
+        run via executor rather than directly on the event-loop thread."""
+        assert self._conversation is not None
+        with self._conversation._state as state:
+            return list(state.events)
+
+    async def maybe_report_governance_result(self) -> None:
+        """Phase D-lite hook: called from ``_run_and_publish()``'s
+        ``finally`` alongside ``maybe_register_governance_approval()``.
+
+        Without this, ``report-result`` is only ever called for a
+        binding/lease/count rejection discovered *after* claim (see
+        ``_report_governance_failure``) — a governed action that actually
+        ran to completion (success or a
+        normal tool-level failure) never told central anything past
+        ``on_governed_start``, leaving the central record stuck at
+        executing/leased until expiry. A no-op unless there is a ``CLAIMED``
+        outbox record AND its action's fate can already be read
+        unambiguously from the event log (see
+        ``_classify_governed_action_outcome`` — never guesses ``"success"``
+        without a matching observation); otherwise this is simply retried
+        on the next ``finally``.
+        """
+        if self.governance_deployment_mode != "team" or self._conversation is None:
+            return
+        record = self.governance_outbox.load()
+        if record is None or record.state != OutboxState.CLAIMED:
+            return
+        loop = asyncio.get_running_loop()
+        events = await loop.run_in_executor(None, self._snapshot_events_sync)
+        outcome = _classify_governed_action_outcome(
+            record.action_event_id, record.tool_call_id, events
+        )
+        if outcome is None:
+            return
+        client = self.governance_client
+        if client is None:
+            return
+        assert record.central_approval_id is not None
+        assert record.execution_attempt_id is not None
+        try:
+            await client.report_result(
+                record.central_approval_id,
+                idempotency_key=f"report-{record.execution_attempt_id}",
+                execution_attempt_id=record.execution_attempt_id,
+                outcome=outcome,
+            )
+            await self.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
+            )
+        except Exception:
+            logger.exception(
+                "failed to report governed execution result for approval %s",
+                record.central_approval_id,
+            )
+            await self.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+            )
+
+    async def _reconcile_governance_after_close(self) -> None:
+        """Called at the end of ``close()``, after both the governance
+        handshake task and the run task (if any) have been cancelled and
+        drained. If a central claim succeeded (outbox state ``CLAIMED``)
+        but this service is shutting down before ``maybe_report_
+        governance_result()`` ever found conclusive evidence — the
+        handshake was cancelled before ``self.run()`` even started, or a
+        governed run was cancelled mid-execution with nothing observed yet
+        — the central execution lease would otherwise be orphaned with no
+        path to resolution. Best-effort and unconditional: report
+        ``"failure_unknown"`` rather than leave central waiting on a
+        process that is being torn down right now.
+        """
+        client = self.governance_client
+        if client is None:
+            return
+        record = self.governance_outbox.load()
+        if record is None or record.state != OutboxState.CLAIMED:
+            return
+        assert record.central_approval_id is not None
+        assert record.execution_attempt_id is not None
+        try:
+            await client.report_result(
+                record.central_approval_id,
+                idempotency_key=f"report-{record.execution_attempt_id}",
+                execution_attempt_id=record.execution_attempt_id,
+                outcome="failure_unknown",
+            )
+            await self.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
+            )
+        except Exception:
+            logger.exception(
+                "failed to reconcile orphaned governance claim %s during close",
+                record.central_approval_id,
+            )
+            await self.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+            )
+
+    async def run_and_wait_for_start(
+        self, *, central_approval_id: str, timeout_seconds: float = 20.0
+    ) -> GovernanceStartOutcome:
+        """Team-mode entry point for ``respond_to_confirmation``'s
+        ``accept=True`` path: waits until this governed confirmation has
+        either genuinely started executing or been rejected, instead of
+        returning as soon as a background task is merely scheduled — a
+        "schedule and return 200" version wouldn't give the caller a
+        meaningful answer under central governance: a claim, a lease, and
+        a report/reconciliation obligation may all already exist by the
+        time a caller doing nothing but scheduling would have found out
+        that the binding check was going to fail.
+
+        ``_run_lock`` here only ever guards *registering* the handshake and
+        scheduling ``_claim_and_run_governed`` — never the claim call
+        itself (network I/O) — so this cannot block an unrelated
+        ``send_message``/``pause`` call on this conversation for the
+        duration of a round trip to central-governance-api.
+        """
+        if self._closing:
+            raise ValueError("inactive_service")
+        outbox_record = self.governance_outbox.load()
+        if outbox_record is None or outbox_record.central_approval_id != (
+            central_approval_id
+        ):
+            raise ValueError(
+                f"no governance outbox record matches approval "
+                f"{central_approval_id} for conversation {self.stored.id}"
+            )
+        binding_fingerprint = ActionBinding(
+            central_approval_id=central_approval_id,
+            action_event_id=outbox_record.action_event_id,
+            execution_commitment=outbox_record.execution_commitment,
+        ).fingerprint()
+
+        async with self._run_lock:
+            # Re-checked under the lock (same pattern as run()'s own two-
+            # stage check): close() and this method both touch
+            # _active_governance_handshake, and close() only ever snapshots
+            # it once, early on — a handshake created here after that
+            # snapshot would never be seen by close(), leaving its claim
+            # uncaptured by this shutdown's reconciliation.
+            if self._closing:
+                raise ValueError("inactive_service")
+            existing = self._active_governance_handshake
+            if existing is not None and existing.binding_fingerprint == (
+                binding_fingerprint
+            ):
+                # Reuse unconditionally, whether the handshake is still in
+                # flight or already settled. Awaiting an already-done
+                # future just replays its settled outcome synchronously —
+                # without this, a retried call for the exact same binding
+                # (central replaying create/claim with the same
+                # idempotency key after e.g. a PENDING_UNKNOWN timeout, or
+                # any other caller retry) would dispatch a brand new
+                # _claim_and_run_governed() attempt for an execution that
+                # already reached a terminal outcome, turning an already-
+                # consumed central approval into a replayable execution
+                # credential (it could re-run self.run() against a
+                # conversation that has since moved past
+                # WAITING_FOR_CONFIRMATION entirely).
+                future = existing.future
+            elif existing is not None and not existing.future.done():
+                raise ValueError(
+                    "a different governance execution is already in "
+                    "flight for this conversation"
+                )
+            else:
+                future = asyncio.get_running_loop().create_future()
+                task = asyncio.create_task(
+                    self._claim_and_run_governed(
+                        outbox_record, central_approval_id, future
+                    )
+                )
+                self._active_governance_handshake = _GovernanceHandshake(
+                    binding_fingerprint=binding_fingerprint,
+                    future=future,
+                    task=task,
+                )
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(future), timeout=timeout_seconds
+            )
+        except TimeoutError:
+            # Not a rejection — the handshake future is untouched (shield()
+            # protects it from this timeout's cancellation) and the
+            # underlying claim/run continues; the outbox is the source of
+            # truth for whatever eventually happens.
+            return GovernanceStartOutcome.PENDING_UNKNOWN
+
+    async def _claim_and_run_governed(
+        self,
+        outbox_record: OutboxRecord,
+        central_approval_id: str,
+        future: asyncio.Future,
+    ) -> None:
+        """Task body scheduled by ``run_and_wait_for_start()``. Guarantees
+        ``future`` resolves exactly once (via ``_resolve_handshake_once``)
+        regardless of which step fails — claim, or the governed
+        ``run()`` itself."""
+        try:
+            client = self.governance_client
+            if client is None:
+                logger.error(
+                    "governance_deployment_mode is 'team' but GovernanceClient "
+                    "env vars are not fully configured; refusing to claim %s",
+                    central_approval_id,
+                )
+                _resolve_handshake_once(
+                    future, GovernanceStartOutcome.REJECTED_INTERNAL_ERROR
+                )
+                return
+
+            try:
+                await self.governance_outbox.mutate(
+                    lambda r: record_attempt(r, new_state=OutboxState.CLAIM_INFLIGHT)
+                )
+                claim_response = await client.claim(
+                    central_approval_id,
+                    idempotency_key=f"claim-{outbox_record.request_id}",
+                )
+            except Exception:
+                logger.exception(
+                    "claim failed for governance approval %s", central_approval_id
+                )
+                await self.governance_outbox.mutate(
+                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                )
+                _resolve_handshake_once(
+                    future, GovernanceStartOutcome.REJECTED_CLAIM_FAILED
+                )
+                return
+
+            execution_attempt_id = claim_response["execution_attempt_id"]
+            lease_expires_at_raw = claim_response["executing_lease_expires_at"]
+            await self.governance_outbox.mutate(
+                lambda r: _apply_claim(r, execution_attempt_id, lease_expires_at_raw)
+            )
+
+            binding = ActionBinding(
+                central_approval_id=central_approval_id,
+                action_event_id=outbox_record.action_event_id,
+                execution_commitment=outbox_record.execution_commitment,
+                execution_attempt_id=execution_attempt_id,
+                executing_lease_expires_at=datetime.fromisoformat(lease_expires_at_raw),
+            )
+
+            # `self.run()` only *schedules* the actual conversation run as a
+            # background task and returns immediately (see its own docstring) —
+            # the binding check this whole handshake exists to gate on happens
+            # deep inside that background task, on whichever thread ends up
+            # running it (a worker thread for a sync-only agent's conversation.
+            # run(), the event-loop thread for arun()). So on_governed_start/
+            # on_governed_reject, not this call's own return or exceptions, are
+            # the only way to observe that check's outcome — capture the loop
+            # here so both callbacks can safely hand work back to it regardless
+            # of which thread invokes them.
+            loop = asyncio.get_running_loop()
+
+            def _on_start() -> None:
+                _resolve_handshake_once(future, GovernanceStartOutcome.STARTED)
+
+            def _on_reject(exc: BaseException) -> None:
+                if isinstance(exc, ActionBindingMismatchError):
+                    outcome = GovernanceStartOutcome.REJECTED_BINDING_MISMATCH
+                elif isinstance(exc, ActionCountMismatchError):
+                    outcome = GovernanceStartOutcome.REJECTED_ACTION_COUNT_MISMATCH
+                elif isinstance(exc, ExecutionLeaseExpiredError):
+                    outcome = GovernanceStartOutcome.REJECTED_LEASE_EXPIRED
+                else:
+                    outcome = GovernanceStartOutcome.REJECTED_INTERNAL_ERROR
+
+                # call_soon_threadsafe (not run_coroutine_threadsafe): this
+                # callback may run on a worker thread, so it hands the real
+                # work back to the loop thread. Once running there it
+                # resolves the future directly and registers the report
+                # task back-to-back with no await between them, so close()
+                # (itself only ever running on the loop thread) can never
+                # observe one without the other.
+                def _handle_reject_on_loop() -> None:
+                    if not future.done():
+                        future.set_result(outcome)
+                    # close() has already committed to being the sole
+                    # reporter for this claim (see
+                    # _governance_report_registration_closed's field
+                    # docstring) — registering a report here now would be a
+                    # second, untracked, competing outcome for central.
+                    if self._governance_report_registration_closed:
+                        return
+                    task = asyncio.create_task(
+                        self._report_governance_failure(
+                            central_approval_id, execution_attempt_id
+                        )
+                    )
+                    self._pending_governance_report_tasks.add(task)
+                    task.add_done_callback(
+                        self._pending_governance_report_tasks.discard
+                    )
+
+                loop.call_soon_threadsafe(_handle_reject_on_loop)
+
+            try:
+                await self.run(
+                    expected_binding=binding,
+                    on_governed_start=_on_start,
+                    on_governed_reject=_on_reject,
+                )
+            except Exception:
+                # Only pre-dispatch failures reach here (inactive_service,
+                # conversation_already_running, a self-approval block) — a
+                # binding-check failure is only ever observed via
+                # on_governed_reject above, never as an exception on this call.
+                logger.exception(
+                    "run() rejected governed start for approval %s",
+                    central_approval_id,
+                )
+                _resolve_handshake_once(
+                    future, GovernanceStartOutcome.REJECTED_INTERNAL_ERROR
+                )
+        except asyncio.CancelledError:
+            # Deliberately NOT a bare `finally`: after `await self.run(...)`
+            # returns normally (the common case — self.run() only
+            # *schedules* the real run as a separate task and returns
+            # almost immediately, well before on_governed_start/
+            # on_governed_reject have had any chance to fire — see the
+            # comment above `loop = asyncio.get_running_loop()``), this
+            # try body reaches its end with the handshake future still
+            # genuinely unresolved. A bare `finally` here would
+            # unconditionally resolve it to REJECTED_CANCELLED at that
+            # point, pre-empting the real STARTED/REJECTED_* outcome the
+            # callback is about to deliver. Only a genuine cancellation of
+            # *this* task — e.g. EventService.close() draining it — should
+            # force-resolve the future here; every other exit path above
+            # already resolved it itself via _resolve_handshake_once(),
+            # which is idempotent.
+            _resolve_handshake_once(future, GovernanceStartOutcome.REJECTED_CANCELLED)
+            raise
+
+    async def _report_governance_failure(
+        self, central_approval_id: str, execution_attempt_id: str
+    ) -> None:
+        """Best-effort report-result(failure_definite) for a binding/lease
+        rejection discovered *after* claim already succeeded — a narrow
+        window that's unavoidable without a heavier synchronous protocol.
+        This does not block the handshake response; failures here leave
+        the outbox in NEEDS_ATTENTION for manual/relay follow-up (the
+        relay loop itself is not part of this MVP slice).
+        """
+        client = self.governance_client
+        if client is None:
+            return
+        try:
+            await client.report_result(
+                central_approval_id,
+                idempotency_key=f"report-{execution_attempt_id}",
+                execution_attempt_id=execution_attempt_id,
+                outcome="failure_definite",
+            )
+            await self.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
+            )
+        except Exception:
+            logger.exception(
+                "failed to report binding-mismatch failure for approval %s",
+                central_approval_id,
+            )
+            await self.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+            )
 
     async def start_goal_loop(
         self,
@@ -1662,8 +2498,35 @@ class EventService:
         REST-facing method, and it lets the SDK capture the pending-action
         snapshot atomically under its own state lock instead of this method
         taking a separate, unsynchronized snapshot beforehand.
+
+        Raises:
+            GovernanceApprovalRequiredError: If team mode is active and
+                ``request.central_approval_id`` is missing — accept is
+                refused rather than silently falling through to the plain
+                (ungoverned) path below.
+            GovernanceStartRejectedError: If ``request.central_approval_id``
+                is set and the claim/binding handshake did not result in
+                the run actually starting — see ``run_and_wait_for_start()``.
         """
         if request.accept:
+            if self.governance_deployment_mode == "team":
+                if request.central_approval_id is None:
+                    raise GovernanceApprovalRequiredError(
+                        "team mode requires central_approval_id on accept"
+                    )
+                outcome = await self.run_and_wait_for_start(
+                    central_approval_id=request.central_approval_id
+                )
+                # PENDING_UNKNOWN (the handshake timed out, not rejected —
+                # see run_and_wait_for_start()'s own docstring) is not
+                # STARTED either: the caller must not treat it as a plain
+                # success, since claim/binding may still be unresolved.
+                # GovernanceStartRejectedError carries the exact outcome so
+                # api.py's handler can map it to its own distinct,
+                # non-terminal response rather than folding it into STARTED.
+                if outcome != GovernanceStartOutcome.STARTED:
+                    raise GovernanceStartRejectedError(outcome)
+                return
             try:
                 await self.run(approver_identity=request.approver_identity)
             except ValueError as e:
@@ -1815,6 +2678,48 @@ class EventService:
                 await self._goal_loop_task
         self._goal_loop_task = None
 
+        # maybe_register_governance_approval()'s fire-and-forget approval-
+        # creation tasks are independent of the claim/run handshake below —
+        # cancel-and-drain them the same way so none of them keeps writing
+        # to self.governance_outbox after this service is closed.
+        if self._pending_governance_create_tasks:
+            create_tasks = list(self._pending_governance_create_tasks)
+            for task in create_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*create_tasks, return_exceptions=True)
+
+        # Same treatment for an in-flight governance claim/run handshake
+        # (run_and_wait_for_start()'s background task) — without this, a
+        # caller still waiting on that handshake would only ever time out
+        # once its own deadline expires. Cancel-and-drain here only reaches
+        # the task itself: _claim_and_run_governed() *dispatches* self.run()
+        # and then returns — the real on_governed_start/on_governed_reject
+        # callback lives inside the separately-scheduled run task, so by
+        # the time we get here the handshake task is very often already
+        # done while the future it was working toward is still unresolved.
+        # Not cleared yet — the future is only force-resolved once, below,
+        # after the run task and any pending report task have both had a
+        # real chance to deliver the actual outcome first.
+        #
+        # Snapshotting under _run_lock (the same lock
+        # run_and_wait_for_start() holds while creating a handshake and
+        # re-checks _closing under) serializes the two: either this
+        # snapshot runs first and sees no handshake (and the concurrent
+        # run_and_wait_for_start() call then sees _closing=True, set
+        # above, once it gets the lock, and is rejected before creating
+        # one), or run_and_wait_for_start() creates the handshake first
+        # and this snapshot — waiting its turn for the same lock — is
+        # guaranteed to see it. Without sharing the lock, a handshake
+        # created between _closing being set and this snapshot running
+        # would be invisible to this shutdown's reconciliation.
+        async with self._run_lock:
+            pending_handshake = self._active_governance_handshake
+        if pending_handshake is not None and not pending_handshake.task.done():
+            pending_handshake.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_handshake.task
+
         if self._lease_task is not None:
             self._lease_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -1844,6 +2749,70 @@ class EventService:
             except Exception as exc:
                 logger.warning("Run task did not exit cleanly during close: %s", exc)
             self._run_task = None
+
+        # If on_governed_reject fired as part of the run task's own
+        # execution just drained above, its call_soon_threadsafe-scheduled
+        # closure (_handle_reject_on_loop) is guaranteed to have been
+        # *scheduled* onto this loop's ready queue by now — but not
+        # necessarily to have *run* yet: draining self._run_task only
+        # guarantees the run task's own coroutine has settled, not that
+        # every callback it scheduled along the way has already executed.
+        # Yield once so the loop processes its ready queue — including
+        # that closure — before the snapshot below, rather than depending
+        # on an unstated ordering guarantee between two independently-
+        # scheduled callbacks.
+        await asyncio.sleep(0)
+
+        # From here on, close() is committed to being the sole reporter for
+        # any orphaned claim via _reconcile_governance_after_close() below.
+        # A synchronous conversation.run() still executing on its own
+        # worker thread (see the comment above the run-task drain — that
+        # thread cannot be forcibly stopped by cancelling its wrapper task)
+        # can still call on_governed_reject after this point; the flag
+        # stops that late callback from registering a second, untracked
+        # report that could conflict with the one close() is about to send.
+        self._governance_report_registration_closed = True
+
+        # Wait for any in-flight on_governed_reject-triggered report (see
+        # _pending_governance_report_tasks's docstring) to finish *before*
+        # deciding below whether the outbox is still orphaned — otherwise
+        # close() could race that report and the two could send central
+        # conflicting outcomes for the same execution_attempt_id. Each task
+        # already handles its own errors internally (see
+        # _report_governance_failure), so nothing further to do with the
+        # gathered results here.
+        if self._pending_governance_report_tasks:
+            await asyncio.gather(
+                *self._pending_governance_report_tasks, return_exceptions=True
+            )
+
+        # The run task and any pending report task have now both had a
+        # real chance to deliver the actual STARTED/REJECTED_* outcome via
+        # on_governed_start/on_governed_reject. Force-resolve only if that
+        # genuinely never happened — idempotent, so this is a no-op
+        # whenever the real callback already fired (the common case).
+        # Without this, a handshake whose task completed early (the usual
+        # case — self.run() only dispatches and returns) but whose real
+        # callback never got a chance to run before shutdown would leave
+        # any waiter to find out only via its own timeout, contradicting
+        # this method's own promise to unblock it immediately.
+        if pending_handshake is not None:
+            _resolve_handshake_once(
+                pending_handshake.future, GovernanceStartOutcome.REJECTED_CANCELLED
+            )
+        self._active_governance_handshake = None
+
+        # After the handshake, the run task, and any pending report task
+        # (if any) have all been cancelled/drained/awaited above, check
+        # whether a central claim succeeded but never reached a conclusive
+        # result — either because the handshake was cancelled before
+        # self.run() ever started, or because a governed run was cancelled
+        # mid-execution with no observation yet. Without this, that claim's
+        # execution lease is orphaned: the conversation may still be
+        # WAITING_FOR_CONFIRMATION (not RUNNING), so a future restart's
+        # crash-recovery path would never notice anything wrong and never
+        # report it either.
+        await self._reconcile_governance_after_close()
 
         await self._pub_sub.close()
         if self._conversation:
@@ -2020,10 +2989,20 @@ class EventService:
         goal_active = (
             self._goal_loop_task is not None and not self._goal_loop_task.done()
         )
+        governance_active = (
+            self._active_governance_handshake is not None
+            and not self._active_governance_handshake.task.done()
+        )
+        governance_background_work_active = bool(
+            self._pending_governance_create_tasks
+            or self._pending_governance_report_tasks
+        )
         if (
             self._closing
             or run_active
             or goal_active
+            or governance_active
+            or governance_background_work_active
             or self._rerun_requested
             or self._acp_internal_rerun_requested
             or self.has_external_subscribers()

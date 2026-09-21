@@ -295,7 +295,7 @@ class TestServiceParallelization:
         # Mock the service getters
         with (
             patch(
-                "openhands.agent_server.api.get_default_conversation_service",
+                "openhands.agent_server.conversation_service.ConversationService.get_instance",
                 return_value=mock_conversation_service,
             ),
             patch(
@@ -339,7 +339,7 @@ class TestServiceParallelization:
         # Mock the service getters
         with (
             patch(
-                "openhands.agent_server.api.get_default_conversation_service",
+                "openhands.agent_server.conversation_service.ConversationService.get_instance",
                 return_value=mock_conversation_service,
             ),
             patch(
@@ -370,7 +370,7 @@ class TestServiceParallelization:
         # Mock all services as None (disabled)
         with (
             patch(
-                "openhands.agent_server.api.get_default_conversation_service",
+                "openhands.agent_server.conversation_service.ConversationService.get_instance",
                 return_value=mock_conversation_service,
             ),
             patch("openhands.agent_server.api.get_vscode_service", return_value=None),
@@ -400,7 +400,7 @@ class TestServiceParallelization:
 
         with (
             patch(
-                "openhands.agent_server.api.get_default_conversation_service",
+                "openhands.agent_server.conversation_service.ConversationService.get_instance",
                 return_value=mock_conversation_service,
             ),
             patch("openhands.agent_server.api.get_vscode_service", return_value=None),
@@ -674,6 +674,123 @@ class TestSelfApprovalDeniedHandler:
         # The requester identity ('roy') must not leak into the response
         # body — it is only safe to have it in the server-side log.
         assert "roy" not in body["detail"]
+
+
+class TestActionBindingErrorHandlers:
+    """roy_action_binding.py's three exceptions must reach an HTTP caller
+    as clean 409s, generic-detail (no leaked binding/action content), not
+    the catch-all 500 — same treatment as SelfApprovalDeniedError above."""
+
+    def test_action_binding_mismatch_maps_to_409(self):
+        from openhands.sdk.security.roy_action_binding import (
+            ActionBindingMismatchError,
+        )
+
+        config = Config(static_files_path=None)
+        app = create_app(config)
+
+        @app.get("/__test__/raise_action_binding_mismatch")
+        def _raise():
+            raise ActionBindingMismatchError(
+                "pending action was replaced since central approval was granted"
+            )
+
+        client = TestClient(app)
+        response = client.get("/__test__/raise_action_binding_mismatch")
+
+        assert response.status_code == 409
+        body = response.json()
+        assert body["error_code"] == "action_binding_mismatch"
+        assert "replaced" not in body["detail"]
+
+    def test_execution_lease_expired_maps_to_409(self):
+        from openhands.sdk.security.roy_action_binding import (
+            ExecutionLeaseExpiredError,
+        )
+
+        config = Config(static_files_path=None)
+        app = create_app(config)
+
+        @app.get("/__test__/raise_execution_lease_expired")
+        def _raise():
+            raise ExecutionLeaseExpiredError("lease expired")
+
+        client = TestClient(app)
+        response = client.get("/__test__/raise_execution_lease_expired")
+
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "execution_lease_expired"
+
+    def test_action_count_mismatch_maps_to_409(self):
+        from openhands.sdk.security.roy_action_binding import (
+            ActionCountMismatchError,
+        )
+
+        config = Config(static_files_path=None)
+        app = create_app(config)
+
+        @app.get("/__test__/raise_action_count_mismatch")
+        def _raise():
+            raise ActionCountMismatchError(2)
+
+        client = TestClient(app)
+        response = client.get("/__test__/raise_action_count_mismatch")
+
+        assert response.status_code == 409
+        body = response.json()
+        assert body["error_code"] == "action_count_mismatch"
+        # The actual count must not leak into the response body.
+        assert "2" not in body["detail"]
+
+
+class TestGovernanceStartRejectedHandler:
+    """respond_to_confirmation()'s GovernanceStartRejectedError, mapped by
+    _governance_start_rejected_handler to a stable status/error_code per
+    GovernanceStartOutcome."""
+
+    def test_pending_unknown_maps_to_202_not_a_success_or_error(self):
+        """A handshake that merely timed out (not a rejection) must get
+        its own distinct, non-terminal response — not 200 (a caller could
+        wrongly treat that as a confirmed start) and not folded into one
+        of the hard-rejection codes below."""
+        from openhands.agent_server.event_service import (
+            GovernanceStartOutcome,
+            GovernanceStartRejectedError,
+        )
+
+        config = Config(static_files_path=None)
+        app = create_app(config)
+
+        @app.get("/__test__/raise_governance_pending_unknown")
+        def _raise():
+            raise GovernanceStartRejectedError(GovernanceStartOutcome.PENDING_UNKNOWN)
+
+        client = TestClient(app)
+        response = client.get("/__test__/raise_governance_pending_unknown")
+
+        assert response.status_code == 202
+        assert response.json()["error_code"] == "governance_pending"
+
+    def test_binding_mismatch_outcome_maps_to_409(self):
+        from openhands.agent_server.event_service import (
+            GovernanceStartOutcome,
+            GovernanceStartRejectedError,
+        )
+
+        config = Config(static_files_path=None)
+        app = create_app(config)
+
+        @app.get("/__test__/raise_governance_start_rejected")
+        def _raise():
+            raise GovernanceStartRejectedError(
+                GovernanceStartOutcome.REJECTED_BINDING_MISMATCH
+            )
+
+        client = TestClient(app)
+        response = client.get("/__test__/raise_governance_start_rejected")
+
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "action_binding_mismatch"
 
 
 class TestGovernanceBridgeTokenGate:

@@ -150,9 +150,7 @@ class _ConversationInfoBase(BaseModel):
     execution_status: ConversationExecutionStatus = Field(
         default=ConversationExecutionStatus.IDLE
     )
-    confirmation_policy: ConfirmationPolicyBase = Field(
-        default_factory=NeverConfirm
-    )
+    confirmation_policy: ConfirmationPolicyBase = Field(default_factory=NeverConfirm)
     security_analyzer: SecurityAnalyzerBase | None = Field(
         default=None,
         description="Optional security analyzer to evaluate action risks.",
@@ -410,6 +408,20 @@ class ConfirmationResponseRequest(BaseModel):
     ``openhands.sdk.security.roy_self_approval``); a match responds with a
     ``403`` (``SelfApprovalDeniedError``, mapped in ``api.py``) instead of
     executing the pending action.
+    """
+    central_approval_id: str | None = None
+    """The central-governance-api approval id this ``accept=True`` is
+    resuming, under ``Config.governance_deployment_mode == "team"``.
+
+    Optional and ``None`` by default — personal mode / today's behavior is
+    unaffected. When set, this call waits for the claim + action-binding
+    handshake to actually resolve (see
+    ``EventService.run_and_wait_for_start``) before returning, instead of
+    just scheduling the run: a claim failure or a binding/lease/count
+    mismatch discovered during that handshake is surfaced as an error
+    response here rather than silently falling through to a generic
+    ``ERROR`` execution status. Never used with ``accept=False`` (rejection
+    is never gated by central governance in this MVP slice).
     """
 
 

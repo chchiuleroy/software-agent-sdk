@@ -402,6 +402,59 @@ class Config(BaseModel):
     ) -> SecretStr | None:
         return reject_blank_secret(value, field_name="governance_bridge_token")
 
+    governance_central_api_base_url: str | None = Field(
+        default=None,
+        description=(
+            "Base URL of central-governance-api (e.g. "
+            "'http://127.0.0.1:8899'), used only when "
+            "governance_deployment_mode is 'team'. This agent-server process "
+            "is the sole caller of central-governance-api's create/claim/"
+            "report-result/cancel/reconciliation-findings endpoints — see "
+            "governance_client.py's module docstring for why there is no "
+            "separate bridge identity for these calls."
+        ),
+    )
+    governance_central_api_token_url: str | None = Field(
+        default=None,
+        description=(
+            "OIDC token endpoint (e.g. Keycloak's "
+            "'.../protocol/openid-connect/token') this process uses to mint "
+            "its own client_credentials access token for "
+            "governance_central_api_base_url calls."
+        ),
+    )
+    governance_client_id: str | None = Field(
+        default=None,
+        description=(
+            "OIDC client_credentials client_id this agent-server process "
+            "authenticates as when calling central-governance-api. Must be "
+            "the *same* principal for every call this process makes — "
+            "central-governance-api's own authorization rules require the "
+            "CLAIM/REPORT_RESULT/late-report caller to match the CREATE "
+            "caller (see central-governance-api's approvals/authorize.py)."
+        ),
+    )
+    governance_client_secret: SecretStr | None = Field(
+        default=None,
+        description="client_credentials secret paired with governance_client_id.",
+    )
+    governance_origin_device_id: str | None = Field(
+        default=None,
+        description=(
+            "Value sent as CreateApprovalRequest.origin_device_id. This MVP "
+            "slice does not auto-register a device via central-governance-"
+            "api's POST /devices/register — set this to a stable, "
+            "operator-chosen identifier for this agent-server installation."
+        ),
+    )
+
+    @field_validator("governance_client_secret")
+    @classmethod
+    def _reject_blank_governance_client_secret(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        return reject_blank_secret(value, field_name="governance_client_secret")
+
     web_url: str | None = Field(
         default_factory=_default_web_url,
         description=(

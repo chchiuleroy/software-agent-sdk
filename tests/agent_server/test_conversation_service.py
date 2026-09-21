@@ -14,6 +14,7 @@ import pytest
 from litellm.types.utils import ChatCompletionMessageToolCall, Function
 from pydantic import SecretStr
 
+from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_lease import (
     LEASE_FILE_NAME,
     ConversationOwnershipLostError,
@@ -4164,3 +4165,165 @@ async def test_search_live_conversation_does_not_wait_for_state_lock(tmp_path):
             holder.join(timeout=2)
 
     assert [item.id for item in page.items] == [conversation_info.id]
+
+
+class TestGetInstanceGovernanceSnapshot:
+    """ConversationService.get_instance() must be the single authoritative
+    source EventService uses for team-mode governance — the same validated
+    Config the REST layer's bridge-token gate reads (request.app.state.
+    config), not process environment variables. Without this, team mode
+    configured via a JSON config file, a programmatic Config(...), or
+    deferred-init could disagree with the REST route's check, letting a
+    bridge-token holder bypass central approval entirely."""
+
+    def test_snapshots_team_mode_and_builds_a_governance_client(self, tmp_path):
+        config = Config(
+            conversations_path=tmp_path,
+            governance_deployment_mode="team",
+            governance_central_api_base_url="https://central.example",
+            governance_central_api_token_url="https://idp.example/token",
+            governance_client_id="agent-server",
+            governance_client_secret=SecretStr("s3cr3t"),
+            governance_origin_device_id="device-1",
+        )
+
+        service = ConversationService.get_instance(config)
+
+        assert service.governance_deployment_mode == "team"
+        assert service.governance_client is not None
+        assert service.governance_origin_device_id == "device-1"
+
+    def test_personal_mode_default_has_no_governance_client(self, tmp_path):
+        config = Config(conversations_path=tmp_path)
+
+        service = ConversationService.get_instance(config)
+
+        assert service.governance_deployment_mode == "personal"
+        assert service.governance_client is None
+        assert service.governance_origin_device_id == "unset-device-id"
+
+    def test_team_mode_without_client_credentials_still_has_no_client(self, tmp_path):
+        """governance_deployment_mode='team' alone does not fabricate a
+        client — GovernanceApprovalRequiredError's fail-closed gate is what
+        actually protects a misconfigured team-mode deployment, not this
+        snapshot step silently guessing."""
+        config = Config(conversations_path=tmp_path, governance_deployment_mode="team")
+
+        service = ConversationService.get_instance(config)
+
+        assert service.governance_deployment_mode == "team"
+        assert service.governance_client is None
+
+    @pytest.mark.asyncio
+    async def test_started_event_service_inherits_the_same_governance_fields(
+        self, tmp_path
+    ):
+        """The split-brain this whole fix closes: an EventService actually
+        constructed for a live conversation must see the identical
+        governance_deployment_mode/client/origin_device_id the
+        ConversationService itself snapshotted from Config — not re-derive
+        them from a separate, possibly-stale source."""
+        config = Config(
+            conversations_path=tmp_path,
+            governance_deployment_mode="team",
+            governance_central_api_base_url="https://central.example",
+            governance_central_api_token_url="https://idp.example/token",
+            governance_client_id="agent-server",
+            governance_client_secret=SecretStr("s3cr3t"),
+            governance_origin_device_id="device-1",
+        )
+        service = ConversationService.get_instance(config)
+
+        async with service:
+            workspace_dir = tmp_path / "workspace"
+            workspace_dir.mkdir()
+            info, _ = await service.start_conversation(
+                StartConversationRequest(
+                    agent=Agent(llm=LLM(model="gpt-4o", usage_id="test"), tools=[]),
+                    workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+                    confirmation_policy=NeverConfirm(),
+                )
+            )
+            event_service = await service.get_event_service(info.id)
+            assert event_service is not None
+            assert event_service.governance_deployment_mode == "team"
+            assert event_service.governance_client is service.governance_client
+            assert event_service.governance_origin_device_id == "device-1"
+
+    @pytest.mark.asyncio
+    async def test_aexit_closes_the_owned_governance_client(self, tmp_path):
+        """ConversationService builds this GovernanceClient (see
+        _governance_client_from_config()) and every EventService it starts
+        shares the same instance by reference — only the
+        ConversationService itself, on its own teardown, may close it, or
+        its underlying connection pool leaks across a deferred-init
+        teardown/reinit cycle."""
+        config = Config(
+            conversations_path=tmp_path,
+            governance_deployment_mode="team",
+            governance_central_api_base_url="https://central.example",
+            governance_central_api_token_url="https://idp.example/token",
+            governance_client_id="agent-server",
+            governance_client_secret=SecretStr("s3cr3t"),
+        )
+        service = ConversationService.get_instance(config)
+        assert service.governance_client is not None
+        service.governance_client.aclose = AsyncMock(
+            wraps=service.governance_client.aclose
+        )
+
+        async with service:
+            pass
+
+        service.governance_client.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aexit_is_a_noop_without_a_governance_client(self, tmp_path):
+        """Personal mode (governance_client is None) must not raise on
+        teardown."""
+        config = Config(conversations_path=tmp_path)
+        service = ConversationService.get_instance(config)
+        assert service.governance_client is None
+
+        async with service:
+            pass  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_aexit_does_not_close_governance_client_while_a_service_is_retained(
+        self, tmp_path
+    ):
+        """A partially-failed __aexit__() keeps the failed EventService
+        around for a later retry (see test_shutdown_retains_credential_
+        close_failure_for_retry) — that retained service still holds a
+        reference to this same GovernanceClient, so closing it here would
+        break its own eventual retry teardown. Only the fully-successful
+        call (every EventService closed) may close the shared client."""
+        config = Config(
+            conversations_path=tmp_path,
+            governance_deployment_mode="team",
+            governance_central_api_base_url="https://central.example",
+            governance_central_api_token_url="https://idp.example/token",
+            governance_client_id="agent-server",
+            governance_client_secret=SecretStr("s3cr3t"),
+        )
+        service = ConversationService.get_instance(config)
+        assert service.governance_client is not None
+        service.governance_client.aclose = AsyncMock(
+            wraps=service.governance_client.aclose
+        )
+        await service.__aenter__()
+
+        conversation_id = uuid4()
+        runtime = AsyncMock(spec=EventService)
+        runtime.__aexit__.side_effect = [OSError("save failed"), None]
+        assert service._event_services is not None
+        service._event_services[conversation_id] = runtime
+
+        with pytest.raises(OSError, match="save failed"):
+            await service.__aexit__(None, None, None)
+
+        service.governance_client.aclose.assert_not_awaited()
+
+        await service.__aexit__(None, None, None)
+
+        service.governance_client.aclose.assert_awaited_once()

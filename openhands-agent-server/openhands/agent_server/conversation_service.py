@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID, uuid4
 from weakref import WeakValueDictionary
 
@@ -25,6 +25,7 @@ from openhands.agent_server.event_service import (
     EventService,
     _without_agent_context_secret,
 )
+from openhands.agent_server.governance_client import GovernanceClient
 from openhands.agent_server.models import (
     ConversationInfo,
     ConversationPage,
@@ -288,6 +289,29 @@ class InvalidParentConversation(ValueError):
 
 def _same_workspace(a: LocalWorkspace, b: LocalWorkspace) -> bool:
     return Path(a.working_dir).resolve() == Path(b.working_dir).resolve()
+
+
+def _governance_client_from_config(config: Config) -> GovernanceClient | None:
+    """Built once per ``ConversationService`` instance (mirroring how every
+    other field on this class is a one-time snapshot of ``config`` — see
+    ``get_instance()``), from the same validated ``Config`` the REST
+    layer's bridge-token gate reads. ``None`` when any required field is
+    unset, matching ``governance_deployment_mode``'s own fail-closed intent
+    rather than raising at startup for a deployment that never uses team
+    mode."""
+    if not (
+        config.governance_central_api_base_url
+        and config.governance_central_api_token_url
+        and config.governance_client_id
+        and config.governance_client_secret
+    ):
+        return None
+    return GovernanceClient(
+        base_url=config.governance_central_api_base_url,
+        token_url=config.governance_central_api_token_url,
+        client_id=config.governance_client_id,
+        client_secret=config.governance_client_secret.get_secret_value(),
+    )
 
 
 def _apply_acp_skill_sourcing(
@@ -691,6 +715,16 @@ class ConversationService:
         default=Path("/tmp/conversation-worktrees")
     )
     acp_skill_sourcing: ACPSkillSourcing = "native"
+    # Snapshotted from the same validated Config as every other field above
+    # (see get_instance()) and threaded into each EventService this
+    # service starts — the single authoritative source for team-mode
+    # governance, matching what the REST layer's bridge-token gate reads
+    # from request.app.state.config. GovernanceClient is built once here
+    # (matching its own docstring's "one instance per agent-server
+    # process" commitment) rather than re-read on every call.
+    governance_deployment_mode: Literal["personal", "team"] = "personal"
+    governance_client: GovernanceClient | None = None
+    governance_origin_device_id: str = "unset-device-id"
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
     _conversation_records: dict[UUID, _ConversationRecord] = field(
         default_factory=dict, init=False
@@ -2270,6 +2304,14 @@ class ConversationService:
                 None,
             )
             raise credential_failure or failures[0]
+        # Every EventService this ConversationService started shares this
+        # same GovernanceClient instance by reference (see get_instance()) —
+        # only close it once every EventService has actually torn down (the
+        # early raise above means services retained for a future retry
+        # never reach here, so their still-live governance_client keeps
+        # working for that retry's own teardown attempt).
+        if self.governance_client is not None:
+            await self.governance_client.aclose()
 
     @classmethod
     def get_instance(cls, config: Config) -> "ConversationService":
@@ -2298,6 +2340,11 @@ class ConversationService:
             conversation_idle_ttl_seconds=config.conversation_idle_ttl_seconds,
             conversation_worktree_root=config.conversation_worktree_root,
             acp_skill_sourcing=config.acp_skill_sourcing,
+            governance_deployment_mode=config.governance_deployment_mode,
+            governance_client=_governance_client_from_config(config),
+            governance_origin_device_id=(
+                config.governance_origin_device_id or "unset-device-id"
+            ),
         )
 
     async def _start_event_service(
@@ -2326,6 +2373,9 @@ class ConversationService:
             credential_bindings=credential_bindings,
             owner_instance_id=self.owner_instance_id,
             lease_ttl_seconds=self.lease_ttl_seconds,
+            governance_deployment_mode=self.governance_deployment_mode,
+            governance_client=self.governance_client,
+            governance_origin_device_id=self.governance_origin_device_id,
         )
         # Lease renewal is handled by the centralized
         # _renew_all_leases_loop task on ConversationService.

@@ -5,7 +5,7 @@ import copy
 import functools
 import json
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePath
 from typing import Any, Final, TypeGuard, cast
 
@@ -93,6 +93,13 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
 )
+from openhands.sdk.security.roy_action_binding import (
+    ActionBinding,
+    ActionBindingMismatchError,
+    ActionCountMismatchError,
+    ExecutionLeaseExpiredError,
+    check_action_binding,
+)
 from openhands.sdk.security.roy_admin_audit import (
     record_admin_audit_event,
     record_user_approval_event,
@@ -140,6 +147,24 @@ _RUNTIME_MCP_TIMEOUT_SECS = 30
 ACP_STOP_HOOK_FEEDBACK_PREFIX = "[Stop hook feedback]"
 
 ASK_AGENT_LLM_USAGE_ID: Final[str] = "ask-agent-llm"
+
+
+def _invoke_governance_callback(callback: Callable[..., None], *args: object) -> None:
+    """Invoke an ``on_governed_start``/``on_governed_reject`` callback
+    without letting it mask the caller's own control flow. A raising
+    callback must never replace the ``ActionBindingMismatchError`` etc.
+    being propagated (the ``on_governed_reject`` call site: without this,
+    the callback's own exception — e.g. ``run_coroutine_threadsafe()``
+    raising because the event loop is closing — would suppress the
+    original binding exception and reach ``EventService.run()``'s generic
+    catch-all instead of its dedicated handler), nor get mistaken for a
+    genuine run failure by the outer generic exception handler (the
+    ``on_governed_start`` call site, which fires after ``RUNNING`` is
+    already assigned)."""
+    try:
+        callback(*args)
+    except Exception:
+        logger.exception("governance callback raised; ignoring")
 
 
 def _agent_already_surfaced_error(events: Sequence[Event], since: int = 0) -> bool:
@@ -1920,7 +1945,13 @@ class LocalConversation(BaseConversation):
             self._step_holds_state_lock = held_flag
 
     @observe(name="conversation.run")
-    def run(self, approver_identity: str | None = None) -> None:
+    def run(
+        self,
+        approver_identity: str | None = None,
+        expected_binding: ActionBinding | None = None,
+        on_governed_start: Callable[[], None] | None = None,
+        on_governed_reject: Callable[[BaseException], None] | None = None,
+    ) -> None:
         """Runs the conversation until the agent finishes.
 
         In confirmation mode:
@@ -1940,6 +1971,27 @@ class LocalConversation(BaseConversation):
                 (the default — today's GUI never sends this) skips the
                 self-approval check entirely (fail-open, same as an unset
                 ``ROY_GOVERNANCE_IDENTITY`` requester side).
+            expected_binding: What a central-governance-api approval was
+                actually granted for, if this call is resuming a
+                confirmation under team-mode central governance (see
+                roy_action_binding.py). ``None`` (the default) skips this
+                check entirely — unaffected personal-mode/today's behavior.
+            on_governed_start: Invoked synchronously, with no arguments,
+                still inside the state lock, the instant ``expected_binding``
+                passes its check and execution status has just become
+                ``RUNNING`` — the earliest point at which a caller waiting
+                on this specific governed resumption can be told "this will
+                actually execute". Never invoked when ``expected_binding``
+                is ``None``. Must be cheap and must not raise.
+            on_governed_reject: Invoked synchronously, with the exception
+                instance, still inside the state lock, if
+                ``expected_binding``'s check fails — the mirror image of
+                ``on_governed_start`` for the rejection path, since a caller
+                of ``run()``/``arun()`` running this in a background task
+                (see agent-server's ``EventService``) has no other way to
+                observe an exception raised deep inside that task. The
+                exception is always re-raised afterward regardless of what
+                this callback does. Must be cheap and must not raise.
         """
         # Ensure agent is fully initialized (loads plugins and initializes agent)
         self._ensure_agent_ready()
@@ -1956,9 +2008,7 @@ class LocalConversation(BaseConversation):
                 == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
             ):
                 try:
-                    check_not_self_approval(
-                        self._requester_identity, approver_identity
-                    )
+                    check_not_self_approval(self._requester_identity, approver_identity)
                 except SelfApprovalDeniedError:
                     # This check runs before the try/finally further below
                     # that normally resets _cancel_token on every exit path
@@ -2030,17 +2080,43 @@ class LocalConversation(BaseConversation):
                         self._state.execution_status
                         == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
                     ):
-                        self._state.execution_status = (
-                            ConversationExecutionStatus.RUNNING
-                        )
-                        # Snapshot + audit right at the transition, under the
-                        # same lock, so this always matches what's actually
-                        # about to run and fires for any caller (REST or a
-                        # script calling run() on this SDK object directly) —
-                        # not just the agent server's confirmation endpoint.
+                        # Snapshot + binding check right at the transition,
+                        # under the same lock that is about to flip status to
+                        # RUNNING — no window for the pending action set to
+                        # change between "this is what a central approval was
+                        # granted for" and "this is what's about to execute".
+                        # A no-op when expected_binding is None (see
+                        # roy_action_binding.py). Deliberately reads the
+                        # pending set *before* the RUNNING assignment below so
+                        # a mismatch raises without this call having mutated
+                        # any state yet — nothing needs to be undone.
                         approved_actions = ConversationState.get_unmatched_actions(
                             self._state.active_branch()
                         )
+                        try:
+                            check_action_binding(
+                                expected_binding, approved_actions, str(self._state.id)
+                            )
+                        except (
+                            ActionBindingMismatchError,
+                            ExecutionLeaseExpiredError,
+                            ActionCountMismatchError,
+                        ) as binding_exc:
+                            if on_governed_reject is not None:
+                                _invoke_governance_callback(
+                                    on_governed_reject, binding_exc
+                                )
+                            raise
+                        self._state.execution_status = (
+                            ConversationExecutionStatus.RUNNING
+                        )
+                        if on_governed_start is not None:
+                            _invoke_governance_callback(on_governed_start)
+                        # Audit right at the transition, under the same lock,
+                        # so this always matches what's actually about to run
+                        # and fires for any caller (REST or a script calling
+                        # run() on this SDK object directly) — not just the
+                        # agent server's confirmation endpoint.
                         record_user_approval_event(
                             conversation_id=str(self._state.id),
                             accepted=True,
@@ -2108,6 +2184,19 @@ class LocalConversation(BaseConversation):
                             )
                         )
                         break
+        except (
+            ActionBindingMismatchError,
+            ExecutionLeaseExpiredError,
+            ActionCountMismatchError,
+        ):
+            # Raised before execution_status was ever assigned RUNNING (see
+            # this check's placement above, ahead of that assignment) —
+            # nothing to undo. Must not fall into the generic handler below,
+            # which would overwrite a perfectly valid WAITING_FOR_CONFIRMATION
+            # with ERROR; the conversation stays exactly where it was,
+            # waiting for a fresh confirmation decision. Mirrors
+            # SelfApprovalDeniedError's equivalent early-exit handling above.
+            raise
         except Exception as e:
             with self._state:
                 self._state.execution_status = ConversationExecutionStatus.ERROR
@@ -2139,7 +2228,13 @@ class LocalConversation(BaseConversation):
             self._cancel_token = None
 
     @observe(name="conversation.arun")
-    async def arun(self, approver_identity: str | None = None) -> None:
+    async def arun(
+        self,
+        approver_identity: str | None = None,
+        expected_binding: ActionBinding | None = None,
+        on_governed_start: Callable[[], None] | None = None,
+        on_governed_reject: Callable[[BaseException], None] | None = None,
+    ) -> None:
         """Async variant of :meth:`run`.
 
         Uses ``agent.astep()`` for non-blocking LLM I/O while keeping the
@@ -2160,6 +2255,10 @@ class LocalConversation(BaseConversation):
         Args:
             approver_identity: See :meth:`run` — same self-approval check,
                 same fail-open default.
+            expected_binding: See :meth:`run` — same action-binding check,
+                same no-op default.
+            on_governed_start: See :meth:`run` — same contract.
+            on_governed_reject: See :meth:`run` — same contract.
         """
         self._arun_task = asyncio.current_task()
         self._cancel_token = CancellationToken()
@@ -2182,9 +2281,7 @@ class LocalConversation(BaseConversation):
                 == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
             ):
                 try:
-                    check_not_self_approval(
-                        self._requester_identity, approver_identity
-                    )
+                    check_not_self_approval(self._requester_identity, approver_identity)
                 except SelfApprovalDeniedError:
                     # See the equivalent comment in run(): this runs before
                     # the try/finally further below that normally resets
@@ -2279,14 +2376,38 @@ class LocalConversation(BaseConversation):
                         self._state.execution_status
                         == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
                     ):
+                        # Snapshot + binding check right at the transition —
+                        # see the equivalent comment in run(): reading the
+                        # pending set and checking expected_binding happen
+                        # under the same lock, before the RUNNING assignment,
+                        # so a mismatch raises without anything to undo. A
+                        # no-op when expected_binding is None.
+                        approved_actions = ConversationState.get_unmatched_actions(
+                            self._state.active_branch()
+                        )
+                        try:
+                            check_action_binding(
+                                expected_binding, approved_actions, str(self._state.id)
+                            )
+                        except (
+                            ActionBindingMismatchError,
+                            ExecutionLeaseExpiredError,
+                            ActionCountMismatchError,
+                        ) as binding_exc:
+                            if on_governed_reject is not None:
+                                _invoke_governance_callback(
+                                    on_governed_reject, binding_exc
+                                )
+                            raise
                         self._state.execution_status = (
                             ConversationExecutionStatus.RUNNING
                         )
-                        # Snapshot under the lock (cheap, in-memory), but
-                        # schedule the actual write onto the executor without
-                        # awaiting it *here* — this lock is held across the
-                        # astep() await a few lines below on purpose (see
-                        # that comment: FIFOLock is thread- not
+                        if on_governed_start is not None:
+                            _invoke_governance_callback(on_governed_start)
+                        # Schedule the actual audit write onto the executor
+                        # without awaiting it *here* — this lock is held
+                        # across the astep() await a few lines below on
+                        # purpose (see that comment: FIFOLock is thread- not
                         # task-reentrant, so awaiting anything while holding
                         # it lets another task on this event-loop thread
                         # silently re-enter and corrupt history). The future
@@ -2295,9 +2416,6 @@ class LocalConversation(BaseConversation):
                         # method's `finally` — see that comment for why this
                         # is stronger than plain fire-and-forget but still
                         # not an fsync-level durability guarantee.
-                        approved_actions = ConversationState.get_unmatched_actions(
-                            self._state.active_branch()
-                        )
                         pending_audit_futures.append(
                             asyncio.get_running_loop().run_in_executor(
                                 None,
@@ -2306,9 +2424,7 @@ class LocalConversation(BaseConversation):
                                     conversation_id=str(self._state.id),
                                     accepted=True,
                                     reason=None,
-                                    tool_names=[
-                                        a.tool_name for a in approved_actions
-                                    ],
+                                    tool_names=[a.tool_name for a in approved_actions],
                                     tool_call_ids=[
                                         a.tool_call_id for a in approved_actions
                                     ],
@@ -2639,6 +2755,17 @@ class LocalConversation(BaseConversation):
 
                 self._state.execution_status = ConversationExecutionStatus.PAUSED
                 self._on_event(InterruptEvent())
+        except (
+            ActionBindingMismatchError,
+            ExecutionLeaseExpiredError,
+            ActionCountMismatchError,
+        ):
+            # See the equivalent except clause in run(): raised before
+            # execution_status was ever assigned RUNNING, so there is
+            # nothing to undo — must not fall into the generic handler
+            # below, which would overwrite a valid WAITING_FOR_CONFIRMATION
+            # with ERROR.
+            raise
         except Exception as e:
             with self._state:
                 updated_agent_state = dict(self._state.agent_state)
