@@ -40,6 +40,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from openhands.sdk.security.roy_action_binding import (
+    ActionBinding,
+    ActionBindingMismatchError,
+)
 from openhands.sdk.utils.files import atomic_write_text
 
 
@@ -61,11 +65,21 @@ class OutboxState(StrEnum):
 # States a relay loop should keep retrying from — everything else is either
 # a terminal success/cancel or NEEDS_ATTENTION (deliberately excluded: a
 # permanent failure must not be auto-retried, see governance_client.py's
-# GovernancePermanentError docstring).
+# GovernancePermanentError docstring). CLAIMED included: a crash between
+# claim succeeding and self.run() ever being dispatched for it (or a
+# local, non-central failure on a prior redispatch attempt — e.g.
+# conversation_already_running from an unrelated race) must not leave the
+# record stuck here until the central lease simply expires — see
+# EventService._ensure_claim_redispatch_task()'s own docstring for the
+# retry mechanism this enables. A record only ever leaves CLAIMED via a
+# genuine outcome (EXECUTION_STARTED, or a report/reconciliation call
+# that moves it to a terminal state or NEEDS_ATTENTION), so retrying here
+# is always either a no-op (already moved on) or a real second attempt.
 RETRIABLE_STATES = frozenset(
     {
         OutboxState.PENDING_CREATE,
         OutboxState.CLAIM_INFLIGHT,
+        OutboxState.CLAIMED,
         OutboxState.RESULT_PENDING,
         OutboxState.RECONCILIATION_PENDING,
     }
@@ -105,6 +119,14 @@ class OutboxRecord:
     last_attempt_at: str | None = None
     last_error_code: str | None = None
     needs_attention_reason: str | None = None
+    # The outcome ("success" / "failure_definite" / "failure_unknown")
+    # durably persisted *before* calling report_result(), so a crash
+    # between "decided to report X" and "central acknowledged X" resumes
+    # as "retry report_result with this exact outcome" — see this
+    # module's own docstring's "every external call is preceded by
+    # durably persisting intent" invariant. Only meaningful while
+    # state == RESULT_PENDING; stale otherwise.
+    pending_report_outcome: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True, default=str)
@@ -194,3 +216,62 @@ def record_attempt(
     if new_state is not None:
         record.state = new_state
     return record
+
+
+def check_governed_binding_required(
+    record: OutboxRecord | None, expected: ActionBinding | None
+) -> None:
+    """Closes the SDK-layer gap ``roy_action_binding.py``'s own module
+    docstring states plainly rather than solves: ``EventService.run()``'s
+    ``expected_binding=None`` is a no-op by design (personal mode/today's
+    behavior, unaffected), so any agent-server entry point that calls
+    ``run()`` without threading through a real binding — ``send_message
+    (run=True)``, the goal loop, the ACP-rerun path in ``run()``'s own
+    ``finally`` — bypasses central governance entirely for a conversation
+    that already has one pending. ``run_and_wait_for_start()`` (the
+    intended, correctly-bound caller) is unaffected: it always builds and
+    passes a real ``ActionBinding`` for the exact outbox record this
+    checks against.
+
+    A no-op only when there is no outbox record, or its state is
+    terminal (nothing left to protect). Deliberately fails *closed* while
+    ``PENDING_CREATE`` (no ``central_approval_id`` minted yet — the
+    create call to central hasn't succeeded, is still in flight, or is
+    being retried) rather than treating "nothing to compare against yet"
+    as "nothing to protect": no caller can hold a genuine binding for an
+    approval that doesn't exist yet, so every call — bindingless or not —
+    is rejected until create succeeds and a real ``central_approval_id``
+    exists to bind against. (An earlier version of this function treated
+    ``PENDING_CREATE`` as a no-op on the theory that ``check_action_
+    binding()``'s SDK-layer check remained the only defense in that
+    window — but that check is itself a no-op for exactly the bindingless
+    callers this function exists to catch, so the two "defenses" were the
+    same no-op wearing two names.)
+
+    Deliberately compares only ``central_approval_id`` and
+    ``action_event_id`` — the two fields that identify *which* governed
+    workflow is in flight — rather than recomputing the full
+    ``ActionBinding.fingerprint()`` (which also folds in
+    ``execution_attempt_id``/``executing_lease_expires_at``, populated
+    only after claim). Detecting a stale/replayed claim-level fingerprint
+    is ``run_and_wait_for_start()``'s own job; this check's only job is
+    "does the caller know this conversation is currently gated on a
+    specific central approval at all".
+
+    Raises:
+        ActionBindingMismatchError: a non-terminal governed action is
+            pending and ``expected`` is missing or names a different
+            workflow.
+    """
+    if record is None or record.state in TERMINAL_STATES:
+        return
+    if (
+        expected is None
+        or expected.central_approval_id != record.central_approval_id
+        or expected.action_event_id != record.action_event_id
+    ):
+        raise ActionBindingMismatchError(
+            "conversation has a governed action pending central approval; "
+            "run() must be called through run_and_wait_for_start() with a "
+            "matching expected_binding, not directly"
+        )

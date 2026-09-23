@@ -20,13 +20,16 @@ from openhands.agent_server.conversation_lease import (
 )
 from openhands.agent_server.governance_client import (
     GovernanceClient,
+    GovernancePermanentError,
     compute_display_digest,
 )
 from openhands.agent_server.governance_outbox import (
+    RETRIABLE_STATES,
     TERMINAL_STATES,
     GovernanceOutbox,
     OutboxRecord,
     OutboxState,
+    check_governed_binding_required,
     record_attempt,
 )
 from openhands.agent_server.models import (
@@ -109,6 +112,23 @@ LEASE_RENEW_INTERVAL_SECONDS = 15.0
 # Bounds initial-state push so subscribe_to_events does not stall on a
 # subscriber whose __call__ blocks (e.g. WS with a full TCP send buffer).
 INITIAL_STATE_PUSH_TIMEOUT_SECONDS = 0.5
+# How often the per-conversation outbox relay loop (team mode only) wakes up
+# to retry a record stuck in one of governance_outbox.RETRIABLE_STATES. Not
+# tied to LEASE_RENEW_INTERVAL_SECONDS — this is a slower, coarser sweep
+# (retrying a central-governance-api call has real network cost, unlike a
+# local lease renewal) and the two loops serve unrelated purposes.
+GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS = 30.0
+# Defensive floor between successive /wait long-polls in
+# _wait_for_decision_loop when a call returns changed=False. In the normal
+# case that call already blocked server-side for up to
+# Settings.wait_max_timeout_seconds (~25-30s), so re-issuing it "immediately"
+# per that method's own docstring is correct and this floor is a no-op in
+# practice. It only bites if the server (or a test double) returns
+# changed=False without actually blocking, which would otherwise spin the
+# loop with no event-loop yield point — deliberately much smaller than
+# GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS so it doesn't stack a second
+# ~30s delay on top of a long-poll that already took ~30s.
+WAIT_FOR_DECISION_MIN_RETRY_DELAY_SECONDS = 1.0
 
 
 logger = get_logger(__name__)
@@ -215,6 +235,14 @@ def _apply_claim(
     record.execution_attempt_id = execution_attempt_id
     record.executing_lease_expires_at = executing_lease_expires_at
     record.state = OutboxState.CLAIMED
+    return record
+
+
+def _with_pending_report_outcome(record: OutboxRecord, outcome: str) -> OutboxRecord:
+    """Sets the outcome about to be reported — see OutboxRecord.
+    pending_report_outcome's own docstring for why this must be persisted
+    before the report_result() call it precedes, not after."""
+    record.pending_report_outcome = outcome
     return record
 
 
@@ -365,6 +393,31 @@ class EventService:
     # moved on to _reconcile_governance_after_close() — this flag stops
     # that late callback from registering a second, competing report.
     _governance_report_registration_closed: bool = field(default=False, init=False)
+    # Background relay loop (team mode only, see _outbox_relay_loop()) that
+    # periodically retries an outbox record stuck in one of
+    # governance_outbox.RETRIABLE_STATES — the existing per-run hooks
+    # (maybe_register_governance_approval/maybe_report_governance_result)
+    # only ever fire from inside this conversation's own run() finally
+    # block, so a record stuck after a crash with no new run activity has
+    # no other retry path in this MVP slice (see this task's own docstring
+    # for the full gap this closes).
+    _outbox_relay_task: asyncio.Task | None = field(default=None, init=False)
+    # Phase E: long-polls central for the CREATE -> decide transition (see
+    # _wait_for_decision_loop()'s own docstring for why this is a separate
+    # task from _outbox_relay_task rather than folded into it — different
+    # call shape, long-poll vs a fast periodic check). Only ever one
+    # in-flight per conversation, mirroring the outbox's own single-
+    # pending-action MVP scope.
+    _wait_for_decision_task: asyncio.Task | None = field(default=None, init=False)
+    # Redispatches an already-CLAIMED record (execution_attempt_id/lease
+    # already on disk, no re-claim needed) into self.run() — see
+    # _ensure_claim_redispatch_task()'s own docstring for why this is a
+    # dedicated slot rather than reusing _active_governance_handshake:
+    # that slot deliberately replays an already-settled outcome forever
+    # (correct for a REST caller retrying an already-consumed approval),
+    # which is exactly wrong for this one (a pre-dispatch local failure
+    # here must free up for a genuine retry, not be cached as terminal).
+    _claim_redispatch_task: asyncio.Task | None = field(default=None, init=False)
 
     @property
     def conversation_dir(self):
@@ -598,6 +651,316 @@ class EventService:
             while True:
                 await asyncio.sleep(LEASE_RENEW_INTERVAL_SECONDS)
                 self.renew_lease()
+        except asyncio.CancelledError:
+            raise
+
+    async def _outbox_relay_loop(self) -> None:
+        """Background relay for a governance outbox record stuck in one of
+        governance_outbox.RETRIABLE_STATES with no run activity to trigger
+        the existing per-run hooks — maybe_register_governance_approval()
+        and maybe_report_governance_result() only ever fire from inside
+        this conversation's own run() finally block (see run()'s own
+        code), so a record stuck after a crash with no subsequent run has
+        no other retry path in this MVP slice. Team-mode only; start()
+        only creates this task when governance_deployment_mode == "team".
+        """
+        try:
+            while True:
+                await asyncio.sleep(GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS)
+                try:
+                    await self._relay_outbox_once()
+                except Exception:
+                    # Every call _relay_outbox_once() makes already has its
+                    # own try/except that resolves to either "leave state
+                    # as-is, retry next cycle" or a NEEDS_ATTENTION
+                    # transition — reaching here means a bug in this loop
+                    # itself (or the outbox file layer), not a central-
+                    # governance-api failure. Log and keep the loop alive
+                    # rather than silently stopping all future retries for
+                    # the rest of this conversation's lifetime.
+                    logger.exception(
+                        "outbox relay attempt failed for conversation %s",
+                        self.stored.id,
+                    )
+        except asyncio.CancelledError:
+            raise
+
+    async def _relay_outbox_once(self) -> None:
+        """One relay attempt: retries whichever central-governance-api
+        call an outbox record's current RETRIABLE_STATES state implies is
+        still outstanding. A no-op if there is no outbox record, or its
+        state is not one of RETRIABLE_STATES — terminal states need no
+        retry, and NEEDS_ATTENTION is deliberately excluded from that
+        constant (see its own docstring) because a permanent failure must
+        never be auto-retried.
+        """
+        record = self.governance_outbox.load()
+        if record is None or record.state not in RETRIABLE_STATES:
+            return
+        client = self.governance_client
+        if client is None:
+            return
+
+        if record.state == OutboxState.PENDING_CREATE:
+            # _send_create_approval() already implements this exact
+            # retry — same idempotency key, same persist-then-classify
+            # error handling — reused rather than duplicated here.
+            await self._send_create_approval(record)
+            return
+
+        if record.state == OutboxState.CLAIM_INFLIGHT:
+            assert record.central_approval_id is not None
+            try:
+                claim_response = await client.claim(
+                    record.central_approval_id,
+                    idempotency_key=f"claim-{record.request_id}",
+                )
+            except GovernancePermanentError:
+                logger.exception(
+                    "outbox relay: claim permanently failed for approval %s",
+                    record.central_approval_id,
+                )
+                await self.governance_outbox.mutate(
+                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                )
+                return
+            except Exception:
+                # Transient (network/5xx) or unclassified — leave state as
+                # CLAIM_INFLIGHT so the next relay cycle retries with the
+                # same idempotency key rather than giving up.
+                logger.warning(
+                    "outbox relay: claim retry failed for approval %s, "
+                    "will retry again next cycle",
+                    record.central_approval_id,
+                    exc_info=True,
+                )
+                await self.governance_outbox.mutate(record_attempt)
+                return
+            execution_attempt_id = claim_response["execution_attempt_id"]
+            lease_expires_at_raw = claim_response["executing_lease_expires_at"]
+            updated = await self.governance_outbox.mutate(
+                lambda r: _apply_claim(r, execution_attempt_id, lease_expires_at_raw)
+            )
+            # This relay cycle recovered from a crash that happened
+            # *during* the original claim call — nothing else will ever
+            # call self.run() for this approval on its own (Phase E's
+            # /wait bridge only drives the initial accept, not a claim
+            # recovered here), so without this the record would sit at
+            # CLAIMED until the central lease simply expires. Dispatch
+            # directly with the execution_attempt_id/lease this call just
+            # obtained (updated, not the stale `record` loaded at the top
+            # of this method) rather than falling through to the CLAIMED
+            # branch below on the *next* cycle — no reason to wait another
+            # GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS when this call
+            # already has everything it needs right now.
+            self._ensure_claim_redispatch_task(updated)
+            return
+
+        if record.state == OutboxState.CLAIMED:
+            # A crash between _apply_claim() and self.run() ever being
+            # dispatched for it (inside _claim_and_run_governed()), or a
+            # previous redispatch attempt from this exact branch that hit
+            # a local, non-central failure (see _dispatch_claimed_run()'s
+            # own comment on why that must not be treated as terminal) —
+            # either way, retry every cycle until it genuinely resolves
+            # (moves to EXECUTION_STARTED, or a terminal/NEEDS_ATTENTION
+            # state via report/reconciliation).
+            self._ensure_claim_redispatch_task(record)
+            return
+
+        if record.state == OutboxState.RESULT_PENDING:
+            assert record.central_approval_id is not None
+            assert record.execution_attempt_id is not None
+            assert record.pending_report_outcome is not None
+            try:
+                await client.report_result(
+                    record.central_approval_id,
+                    idempotency_key=f"report-{record.execution_attempt_id}",
+                    execution_attempt_id=record.execution_attempt_id,
+                    outcome=record.pending_report_outcome,
+                )
+                await self.governance_outbox.mutate(
+                    lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
+                )
+            except GovernancePermanentError:
+                logger.exception(
+                    "outbox relay: report-result permanently failed for "
+                    "approval %s",
+                    record.central_approval_id,
+                )
+                await self.governance_outbox.mutate(
+                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                )
+            except Exception:
+                logger.warning(
+                    "outbox relay: report-result retry failed for approval "
+                    "%s, will retry again next cycle",
+                    record.central_approval_id,
+                    exc_info=True,
+                )
+                await self.governance_outbox.mutate(record_attempt)
+            return
+
+        # RECONCILIATION_PENDING: no code path writes this state yet (the
+        # reconciliation-findings flow is not wired up in this MVP slice —
+        # see the wiki's "Phase E" gap list), so there is nothing to relay
+        # for it. Included in RETRIABLE_STATES for forward-compatibility
+        # with that future work, not because this branch is reachable
+        # today.
+
+    def _ensure_wait_for_decision_task(self, central_approval_id: str) -> None:
+        """Starts _wait_for_decision_loop() if one isn't already running
+        for this conversation. Idempotent by design: _send_create_approval
+        calls this on every CREATE success, including a relay retry of a
+        stuck PENDING_CREATE — this must not spawn a second concurrent
+        long-poll for the same approval."""
+        if (
+            self._wait_for_decision_task is not None
+            and not self._wait_for_decision_task.done()
+        ):
+            return
+        self._wait_for_decision_task = asyncio.create_task(
+            self._wait_for_decision_loop(central_approval_id)
+        )
+
+    def _ensure_claim_redispatch_task(self, record: OutboxRecord) -> None:
+        """Redispatches an already-CLAIMED record (``execution_attempt_id``
+        / ``executing_lease_expires_at`` already on disk) straight into
+        ``self.run()`` via ``_dispatch_claimed_run()`` — deliberately
+        without re-claiming: unlike a fresh ``CLAIM_INFLIGHT`` recovery,
+        the claim here already genuinely succeeded, so re-claiming would
+        just be a redundant central call racing this record's own
+        ``execution_attempt_id`` against whatever a second claim response
+        returns. Closes the gap where a crash between ``_apply_claim()``
+        and ``self.run()`` (inside ``_claim_and_run_governed()``) leaves a
+        record with nothing left to ever call ``run()`` for it again —
+        ``maybe_report_governance_result()`` only fires from inside this
+        conversation's own run() finally block (see its own docstring),
+        so a record stuck at ``CLAIMED`` with no run ever having started
+        has no other path forward. Called from both ``start()``'s crash-
+        recovery and ``_relay_outbox_once()``'s ``CLAIMED``/post-claim-
+        success handling — the latter is why this must be safely
+        re-callable every relay cycle, not a one-shot attempt.
+
+        Idempotent while genuinely in flight, like
+        ``_ensure_wait_for_decision_task()``. Deliberately *not* built on
+        ``_active_governance_handshake``'s fingerprint reuse the way
+        ``run_and_wait_for_start()`` is: that reuse deliberately replays
+        an already-*settled* outcome forever, so a REST caller retrying
+        an already-consumed approval can't re-execute it (see that
+        method's own docstring) — correct there, wrong here. A pre-
+        dispatch failure from this method (e.g. ``conversation_already_
+        running`` from an unrelated crash-recovery race, not a genuine
+        binding/lease rejection — see ``_dispatch_claimed_run()``'s own
+        comment) must free this slot back up once the task is done, so
+        the *next* relay cycle gets a real retry instead of replaying a
+        cached rejection forever — that distinction is what actually
+        closes the delegated review's finding that a redrive with only
+        one shot at success is not meaningfully different from never
+        redriving at all.
+        """
+        if (
+            self._claim_redispatch_task is not None
+            and not self._claim_redispatch_task.done()
+        ):
+            return
+        central_approval_id = record.central_approval_id
+        execution_attempt_id = record.execution_attempt_id
+        lease_expires_at_raw = record.executing_lease_expires_at
+        assert central_approval_id is not None
+        assert execution_attempt_id is not None
+        assert lease_expires_at_raw is not None
+        self._claim_redispatch_task = asyncio.create_task(
+            self._dispatch_claimed_run(
+                record,
+                central_approval_id,
+                execution_attempt_id,
+                lease_expires_at_raw,
+                future=None,
+            )
+        )
+
+    async def _wait_for_decision_loop(self, central_approval_id: str) -> None:
+        """Phase E: long-polls central's ``GET .../wait`` for the CREATE ->
+        decide transition (``pending`` -> ``accepted``/``rejected``/other),
+        then drives this conversation accordingly. Without this, nothing
+        in this MVP slice ever calls run_and_wait_for_start()/
+        reject_pending_actions() on the decision's own initiative — only a
+        caller that already knows central_approval_id (e.g. a manual
+        respond_to_confirmation REST call after someone tells it the
+        approval id out of band) could drive it before this existed.
+
+        A separate task from _outbox_relay_loop, not a branch inside it:
+        that loop is a fast periodic sweep across every RETRIABLE_STATES
+        record (see its own docstring); this is a single long-poll HTTP
+        call that blocks server-side for up to
+        Settings.wait_max_timeout_seconds, started once per CREATE (see
+        _send_create_approval's own call site) and re-issued in a loop
+        only because a ``changed=False`` timeout is "try again", not a
+        terminal answer — folding this into the relay loop's own fixed
+        sleep-then-check cadence would mean either blocking that loop's
+        other RETRIABLE_STATES work for the duration of each long-poll, or
+        reimplementing a second concurrency model inside it.
+        """
+        client = self.governance_client
+        if client is None:
+            return
+        try:
+            while True:
+                record = self.governance_outbox.load()
+                if record is None or record.state != OutboxState.CREATED:
+                    # Outbox moved on for a reason this loop didn't cause
+                    # (archived for a new action, or a relay cycle already
+                    # advanced it past CREATED) — nothing left to wait for.
+                    return
+                try:
+                    response = await client.wait(
+                        central_approval_id, known_status="pending"
+                    )
+                except Exception:
+                    logger.warning(
+                        "wait-for-decision: /wait call failed for approval "
+                        "%s, retrying",
+                        central_approval_id,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS)
+                    continue
+                if not response.get("changed"):
+                    # Server-side timeout with no change — not an error,
+                    # the correct response is to just ask again (see
+                    # GovernanceClient.wait()'s own docstring). The sleep
+                    # here is a small defensive floor, not a backoff: see
+                    # WAIT_FOR_DECISION_MIN_RETRY_DELAY_SECONDS's own
+                    # comment for why it's deliberately short.
+                    await asyncio.sleep(WAIT_FOR_DECISION_MIN_RETRY_DELAY_SECONDS)
+                    continue
+                status = response.get("status")
+                if status == "accepted":
+                    await self.run_and_wait_for_start(
+                        central_approval_id=central_approval_id
+                    )
+                elif status == "rejected":
+                    await self.reject_pending_actions(
+                        "rejected via central governance"
+                    )
+                else:
+                    # cancelled/expired, or a status this MVP slice's
+                    # state machine doesn't expect to see land here —
+                    # nothing this device can safely automate a response
+                    # to; flag for a human rather than guessing.
+                    logger.warning(
+                        "wait-for-decision: approval %s resolved to "
+                        "unexpected status %r; marking needs_attention",
+                        central_approval_id,
+                        status,
+                    )
+                    await self.governance_outbox.mutate(
+                        lambda r: record_attempt(
+                            r, new_state=OutboxState.NEEDS_ATTENTION
+                        )
+                    )
+                return
         except asyncio.CancelledError:
             raise
 
@@ -1332,6 +1695,45 @@ class EventService:
         self._conversation._state.set_write_guard(self._write_guard)
         if not self._external_lease_renewal:
             self._lease_task = asyncio.create_task(self._renew_lease_loop())
+        if self.governance_deployment_mode == "team":
+            self._outbox_relay_task = asyncio.create_task(self._outbox_relay_loop())
+            # Crash-recovery for Phase E: an outbox record already at
+            # CREATED means a prior process instance sent create and was
+            # waiting on decide when it stopped (crash, or a deploy
+            # restart) — resume watching it rather than leaving it to sit
+            # until the next relay cycle's PENDING_CREATE-only retry path
+            # (which wouldn't touch CREATED at all; see
+            # _relay_outbox_once's own state-by-state handling).
+            existing_record = self.governance_outbox.load()
+            if (
+                existing_record is not None
+                and existing_record.state == OutboxState.CREATED
+                and existing_record.central_approval_id is not None
+            ):
+                self._ensure_wait_for_decision_task(
+                    existing_record.central_approval_id
+                )
+            elif (
+                existing_record is not None
+                and existing_record.state == OutboxState.CLAIMED
+                and existing_record.central_approval_id is not None
+            ):
+                # A prior process instance's claim succeeded but
+                # self.run() was never reached before it stopped — dispatch
+                # immediately (no network call needed, execution_attempt_id
+                # /lease are already on disk) rather than waiting up to
+                # GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS for the relay's
+                # own CLAIMED handling to notice. See
+                # _ensure_claim_redispatch_task()'s own docstring for why
+                # this record would otherwise sit stuck until the central
+                # lease simply expires. A CLAIM_INFLIGHT record (claim
+                # itself still uncertain) is deliberately left to the
+                # relay's own periodic re-claim-with-classification
+                # handling below rather than duplicated here — that retry
+                # needs an actual network call either way, so there is no
+                # equivalent "immediate and free" case to special-case at
+                # startup the way there is for an already-CLAIMED record.
+                self._ensure_claim_redispatch_task(existing_record)
 
         # Register state change callback to automatically publish updates
         self._conversation._state.set_on_state_change(self._conversation._on_event)
@@ -1491,6 +1893,25 @@ class EventService:
                     getattr(self._conversation, "_requester_identity", None),
                     approver_identity,
                 )
+                # Closes the SDK呼叫端繞過 gap: send_message(run=True), the
+                # goal loop, and the ACP-rerun path in this method's own
+                # finally all call run() without threading through
+                # expected_binding, which is a no-op when None by design
+                # (see this parameter's own docstring below) — without
+                # this check, any of those call sites would silently
+                # bypass central governance for a conversation that
+                # already has a non-terminal governed action pending. Only
+                # engages in team mode (governance_outbox.load() is always
+                # None in personal mode, so check_governed_binding_
+                # required() is a no-op there regardless of this guard —
+                # explicit gate here anyway to avoid an unnecessary sync
+                # file read on every personal-mode confirmation). See
+                # that function's own docstring for what it does and does
+                # not check.
+                if self.governance_deployment_mode == "team":
+                    check_governed_binding_required(
+                        self.governance_outbox.load(), expected_binding
+                    )
             if self._closing:
                 raise ValueError("inactive_service")
             if (
@@ -1864,6 +2285,13 @@ class EventService:
             )
             return
         await self.governance_outbox.mutate(lambda r: _apply_created(r, response["id"]))
+        # Phase E: start waiting for the decide event now that there is a
+        # central_approval_id to wait on — covers both this method's first-
+        # attempt caller (_create_governance_approval) and its relay-retry
+        # caller (maybe_register_governance_approval's stuck-PENDING_CREATE
+        # path / _relay_outbox_once), so either path arriving at CREATED
+        # ends up watched.
+        self._ensure_wait_for_decision_task(response["id"])
 
     def _snapshot_events_sync(self) -> list[Event]:
         """Off-loop helper for ``maybe_report_governance_result()`` — see
@@ -1893,7 +2321,16 @@ class EventService:
         if self.governance_deployment_mode != "team" or self._conversation is None:
             return
         record = self.governance_outbox.load()
-        if record is None or record.state != OutboxState.CLAIMED:
+        # CLAIMED: on_governed_start's own EXECUTION_STARTED mutate (see
+        # that closure's comment) hasn't landed yet, or never will
+        # (accepted best-effort window). EXECUTION_STARTED: the common
+        # case once that mutate has landed. Either way this method's job
+        # is the same — check whether the event log now has a conclusive
+        # outcome for this action.
+        if record is None or record.state not in (
+            OutboxState.CLAIMED,
+            OutboxState.EXECUTION_STARTED,
+        ):
             return
         loop = asyncio.get_running_loop()
         events = await loop.run_in_executor(None, self._snapshot_events_sync)
@@ -1907,6 +2344,22 @@ class EventService:
             return
         assert record.central_approval_id is not None
         assert record.execution_attempt_id is not None
+        # Durably persist the *intent* to report this exact outcome before
+        # making the call — mirrors _claim_and_run_governed()'s
+        # CLAIM_INFLIGHT step (see this module's own docstring's "every
+        # external call is preceded by durably persisting intent"
+        # invariant). Without this, a crash between the call succeeding at
+        # central and this process recording that fact locally would leave
+        # no record of which outcome was actually reported, and a naive
+        # retry could re-classify a different outcome from a since-changed
+        # event log — this way, _outbox_relay_loop()'s retry always
+        # replays the exact same outcome via the same idempotency key.
+        await self.governance_outbox.mutate(
+            lambda r: record_attempt(
+                _with_pending_report_outcome(r, outcome),
+                new_state=OutboxState.RESULT_PENDING,
+            )
+        )
         try:
             await client.report_result(
                 record.central_approval_id,
@@ -1917,7 +2370,7 @@ class EventService:
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
             )
-        except Exception:
+        except GovernancePermanentError:
             logger.exception(
                 "failed to report governed execution result for approval %s",
                 record.central_approval_id,
@@ -1925,6 +2378,18 @@ class EventService:
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
             )
+        except Exception:
+            # Transient (network/5xx) or unclassified — leave state as
+            # RESULT_PENDING so _outbox_relay_loop() retries with the same
+            # idempotency key on its next cycle, rather than giving up
+            # after a single attempt the way this method previously did.
+            logger.warning(
+                "failed to report governed execution result for approval %s, "
+                "will retry via outbox relay",
+                record.central_approval_id,
+                exc_info=True,
+            )
+            await self.governance_outbox.mutate(record_attempt)
 
     async def _reconcile_governance_after_close(self) -> None:
         """Called at the end of ``close()``, after both the governance
@@ -1943,10 +2408,28 @@ class EventService:
         if client is None:
             return
         record = self.governance_outbox.load()
-        if record is None or record.state != OutboxState.CLAIMED:
+        # See maybe_report_governance_result()'s identical check for why
+        # both CLAIMED and EXECUTION_STARTED are accepted here.
+        if record is None or record.state not in (
+            OutboxState.CLAIMED,
+            OutboxState.EXECUTION_STARTED,
+        ):
             return
         assert record.central_approval_id is not None
         assert record.execution_attempt_id is not None
+        # Same persist-intent-first pattern as maybe_report_governance_
+        # result() — see that method's comment for why. NEEDS_ATTENTION on
+        # any failure here (rather than leaving it RESULT_PENDING for a
+        # relay retry, as maybe_report_governance_result() does) is
+        # deliberate: the outbox relay loop was already stopped just above
+        # in close(), so nothing would ever retry a RESULT_PENDING left
+        # behind by a process that is tearing down right now.
+        await self.governance_outbox.mutate(
+            lambda r: record_attempt(
+                _with_pending_report_outcome(r, "failure_unknown"),
+                new_state=OutboxState.RESULT_PENDING,
+            )
+        )
         try:
             await client.report_result(
                 record.central_approval_id,
@@ -2106,104 +2589,204 @@ class EventService:
                 lambda r: _apply_claim(r, execution_attempt_id, lease_expires_at_raw)
             )
 
-            binding = ActionBinding(
-                central_approval_id=central_approval_id,
-                action_event_id=outbox_record.action_event_id,
-                execution_commitment=outbox_record.execution_commitment,
-                execution_attempt_id=execution_attempt_id,
-                executing_lease_expires_at=datetime.fromisoformat(lease_expires_at_raw),
+            await self._dispatch_claimed_run(
+                outbox_record,
+                central_approval_id,
+                execution_attempt_id,
+                lease_expires_at_raw,
+                future,
             )
-
-            # `self.run()` only *schedules* the actual conversation run as a
-            # background task and returns immediately (see its own docstring) —
-            # the binding check this whole handshake exists to gate on happens
-            # deep inside that background task, on whichever thread ends up
-            # running it (a worker thread for a sync-only agent's conversation.
-            # run(), the event-loop thread for arun()). So on_governed_start/
-            # on_governed_reject, not this call's own return or exceptions, are
-            # the only way to observe that check's outcome — capture the loop
-            # here so both callbacks can safely hand work back to it regardless
-            # of which thread invokes them.
-            loop = asyncio.get_running_loop()
-
-            def _on_start() -> None:
-                _resolve_handshake_once(future, GovernanceStartOutcome.STARTED)
-
-            def _on_reject(exc: BaseException) -> None:
-                if isinstance(exc, ActionBindingMismatchError):
-                    outcome = GovernanceStartOutcome.REJECTED_BINDING_MISMATCH
-                elif isinstance(exc, ActionCountMismatchError):
-                    outcome = GovernanceStartOutcome.REJECTED_ACTION_COUNT_MISMATCH
-                elif isinstance(exc, ExecutionLeaseExpiredError):
-                    outcome = GovernanceStartOutcome.REJECTED_LEASE_EXPIRED
-                else:
-                    outcome = GovernanceStartOutcome.REJECTED_INTERNAL_ERROR
-
-                # call_soon_threadsafe (not run_coroutine_threadsafe): this
-                # callback may run on a worker thread, so it hands the real
-                # work back to the loop thread. Once running there it
-                # resolves the future directly and registers the report
-                # task back-to-back with no await between them, so close()
-                # (itself only ever running on the loop thread) can never
-                # observe one without the other.
-                def _handle_reject_on_loop() -> None:
-                    if not future.done():
-                        future.set_result(outcome)
-                    # close() has already committed to being the sole
-                    # reporter for this claim (see
-                    # _governance_report_registration_closed's field
-                    # docstring) — registering a report here now would be a
-                    # second, untracked, competing outcome for central.
-                    if self._governance_report_registration_closed:
-                        return
-                    task = asyncio.create_task(
-                        self._report_governance_failure(
-                            central_approval_id, execution_attempt_id
-                        )
-                    )
-                    self._pending_governance_report_tasks.add(task)
-                    task.add_done_callback(
-                        self._pending_governance_report_tasks.discard
-                    )
-
-                loop.call_soon_threadsafe(_handle_reject_on_loop)
-
-            try:
-                await self.run(
-                    expected_binding=binding,
-                    on_governed_start=_on_start,
-                    on_governed_reject=_on_reject,
-                )
-            except Exception:
-                # Only pre-dispatch failures reach here (inactive_service,
-                # conversation_already_running, a self-approval block) — a
-                # binding-check failure is only ever observed via
-                # on_governed_reject above, never as an exception on this call.
-                logger.exception(
-                    "run() rejected governed start for approval %s",
-                    central_approval_id,
-                )
-                _resolve_handshake_once(
-                    future, GovernanceStartOutcome.REJECTED_INTERNAL_ERROR
-                )
         except asyncio.CancelledError:
             # Deliberately NOT a bare `finally`: after `await self.run(...)`
             # returns normally (the common case — self.run() only
             # *schedules* the real run as a separate task and returns
             # almost immediately, well before on_governed_start/
-            # on_governed_reject have had any chance to fire — see the
-            # comment above `loop = asyncio.get_running_loop()``), this
-            # try body reaches its end with the handshake future still
-            # genuinely unresolved. A bare `finally` here would
-            # unconditionally resolve it to REJECTED_CANCELLED at that
-            # point, pre-empting the real STARTED/REJECTED_* outcome the
-            # callback is about to deliver. Only a genuine cancellation of
-            # *this* task — e.g. EventService.close() draining it — should
-            # force-resolve the future here; every other exit path above
-            # already resolved it itself via _resolve_handshake_once(),
-            # which is idempotent.
+            # on_governed_reject have had any chance to fire — see
+            # _dispatch_claimed_run()'s own comment on capturing the
+            # loop), this try body reaches its end with the handshake
+            # future still genuinely unresolved. A bare `finally` here
+            # would unconditionally resolve it to REJECTED_CANCELLED at
+            # that point, pre-empting the real STARTED/REJECTED_* outcome
+            # the callback is about to deliver. Only a genuine
+            # cancellation of *this* task — e.g. EventService.close()
+            # draining it — should force-resolve the future here; every
+            # other exit path above already resolved it itself via
+            # _resolve_handshake_once(), which is idempotent.
             _resolve_handshake_once(future, GovernanceStartOutcome.REJECTED_CANCELLED)
             raise
+
+    async def _dispatch_claimed_run(
+        self,
+        outbox_record: OutboxRecord,
+        central_approval_id: str,
+        execution_attempt_id: str,
+        lease_expires_at_raw: str,
+        future: asyncio.Future | None,
+    ) -> None:
+        """Builds the ``ActionBinding`` for an already-claimed record and
+        calls ``self.run()`` to actually start it, wiring
+        ``on_governed_start``/``on_governed_reject`` identically
+        regardless of caller. Shared by two callers with different
+        expectations about the outcome:
+
+        - ``_claim_and_run_governed()`` (``future`` is a real handshake a
+          REST caller is awaiting via ``run_and_wait_for_start()``) — a
+          pre-dispatch failure here is genuinely terminal for that
+          caller's request, so it resolves ``future`` to
+          ``REJECTED_INTERNAL_ERROR``.
+        - ``_ensure_claim_redispatch_task()`` (``future`` is ``None`` — a
+          crash-recovery redispatch of an already-``CLAIMED`` record with
+          no caller waiting on a result) — a pre-dispatch failure there
+          (e.g. ``conversation_already_running`` from an unrelated
+          concurrent recovery path) is a local, transient conflict, not
+          central rejecting the action, so it must NOT be treated as
+          terminal: this method just logs and returns, leaving the
+          outbox at ``CLAIMED`` (still in ``RETRIABLE_STATES``) for the
+          next relay cycle to genuinely retry. See that method's own
+          docstring for why this differs from
+          ``run_and_wait_for_start()``'s own handshake-reuse semantics.
+
+        A binding-check failure discovered *inside* ``self.run()``'s own
+        dispatch is unaffected by which caller this is — it is only ever
+        observed via ``on_governed_reject`` below, never as an exception
+        on the ``self.run()`` call itself, and central is always told
+        about it via ``_report_governance_failure()`` regardless of
+        whether anyone is waiting on ``future``.
+        """
+
+        def _resolve(outcome: GovernanceStartOutcome) -> None:
+            if future is not None:
+                _resolve_handshake_once(future, outcome)
+
+        binding = ActionBinding(
+            central_approval_id=central_approval_id,
+            action_event_id=outbox_record.action_event_id,
+            execution_commitment=outbox_record.execution_commitment,
+            execution_attempt_id=execution_attempt_id,
+            executing_lease_expires_at=datetime.fromisoformat(lease_expires_at_raw),
+        )
+
+        # `self.run()` only *schedules* the actual conversation run as a
+        # background task and returns immediately (see its own docstring) —
+        # the binding check this whole handshake exists to gate on happens
+        # deep inside that background task, on whichever thread ends up
+        # running it (a worker thread for a sync-only agent's conversation.
+        # run(), the event-loop thread for arun()). So on_governed_start/
+        # on_governed_reject, not this call's own return or exceptions, are
+        # the only way to observe that check's outcome — capture the loop
+        # here so both callbacks can safely hand work back to it regardless
+        # of which thread invokes them.
+        loop = asyncio.get_running_loop()
+
+        def _on_start() -> None:
+            _resolve(GovernanceStartOutcome.STARTED)
+
+            # Best-effort persistence of EXECUTION_STARTED — NOT a
+            # durability guarantee. This callback fires synchronously,
+            # still inside the conversation's own state lock (see
+            # run()'s docstring for on_governed_start), so it must stay
+            # cheap and non-throwing; a real durable write here would
+            # mean doing file I/O inside that lock. Scheduling the
+            # mutate onto the loop instead leaves a narrow window: a
+            # crash between the binding check passing here and this
+            # scheduled mutate actually completing leaves the outbox
+            # at CLAIMED rather than EXECUTION_STARTED. That is an
+            # accepted trade-off (see the wiki's design notes this
+            # task closes) — CLAIMED is what crash-recovery already
+            # handles via maybe_report_governance_result()'s own event-
+            # log classification, so no execution outcome is ever lost
+            # or duplicated by this window; only this one intermediate
+            # progress marker's visibility to central is at risk, and
+            # only in that narrow window. Tracked in
+            # _pending_governance_report_tasks (same set close() drains
+            # before _reconcile_governance_after_close(), even though
+            # this isn't a "report" task — reusing it here still lets
+            # close() wait for this mutate rather than possibly racing
+            # it) so normal (non-crash) shutdown never loses this
+            # marker either.
+            def _mark_started_on_loop() -> None:
+                task = asyncio.create_task(
+                    self.governance_outbox.mutate(
+                        lambda r: record_attempt(
+                            r, new_state=OutboxState.EXECUTION_STARTED
+                        )
+                    )
+                )
+                self._pending_governance_report_tasks.add(task)
+                task.add_done_callback(
+                    self._pending_governance_report_tasks.discard
+                )
+
+            loop.call_soon_threadsafe(_mark_started_on_loop)
+
+        def _on_reject(exc: BaseException) -> None:
+            if isinstance(exc, ActionBindingMismatchError):
+                outcome = GovernanceStartOutcome.REJECTED_BINDING_MISMATCH
+            elif isinstance(exc, ActionCountMismatchError):
+                outcome = GovernanceStartOutcome.REJECTED_ACTION_COUNT_MISMATCH
+            elif isinstance(exc, ExecutionLeaseExpiredError):
+                outcome = GovernanceStartOutcome.REJECTED_LEASE_EXPIRED
+            else:
+                outcome = GovernanceStartOutcome.REJECTED_INTERNAL_ERROR
+
+            # call_soon_threadsafe (not run_coroutine_threadsafe): this
+            # callback may run on a worker thread, so it hands the real
+            # work back to the loop thread. Once running there it
+            # resolves the future directly and registers the report
+            # task back-to-back with no await between them, so close()
+            # (itself only ever running on the loop thread) can never
+            # observe one without the other.
+            def _handle_reject_on_loop() -> None:
+                if future is not None and not future.done():
+                    future.set_result(outcome)
+                # close() has already committed to being the sole
+                # reporter for this claim (see
+                # _governance_report_registration_closed's field
+                # docstring) — registering a report here now would be a
+                # second, untracked, competing outcome for central.
+                if self._governance_report_registration_closed:
+                    return
+                task = asyncio.create_task(
+                    self._report_governance_failure(
+                        central_approval_id, execution_attempt_id
+                    )
+                )
+                self._pending_governance_report_tasks.add(task)
+                task.add_done_callback(
+                    self._pending_governance_report_tasks.discard
+                )
+
+            loop.call_soon_threadsafe(_handle_reject_on_loop)
+
+        try:
+            await self.run(
+                expected_binding=binding,
+                on_governed_start=_on_start,
+                on_governed_reject=_on_reject,
+            )
+        except Exception:
+            if future is not None:
+                # Only pre-dispatch failures reach here (inactive_service,
+                # conversation_already_running, a self-approval block) — a
+                # binding-check failure is only ever observed via
+                # on_governed_reject above, never as an exception on this
+                # call.
+                logger.exception(
+                    "run() rejected governed start for approval %s",
+                    central_approval_id,
+                )
+                _resolve(GovernanceStartOutcome.REJECTED_INTERNAL_ERROR)
+            else:
+                # No caller waiting (a crash-recovery redispatch) — see
+                # this method's own docstring for why this must not be
+                # treated as a terminal outcome for the approval, just
+                # this one attempt.
+                logger.warning(
+                    "claim redispatch failed for approval %s, will retry "
+                    "again next relay cycle",
+                    central_approval_id,
+                    exc_info=True,
+                )
 
     async def _report_governance_failure(
         self, central_approval_id: str, execution_attempt_id: str
@@ -2348,6 +2931,27 @@ class EventService:
             while True:
                 try:
                     await self.run()
+                except (
+                    ActionBindingMismatchError,
+                    ActionCountMismatchError,
+                    ExecutionLeaseExpiredError,
+                ):
+                    # Team mode blocked this run() because a governed
+                    # action requires central approval that has not been
+                    # granted — an expected governance gate (see
+                    # check_governed_binding_required(), which this
+                    # method's own bindingless self.run() call is exactly
+                    # the kind of caller that check exists to stop), not a
+                    # goal-loop bug. Halt the same way the PAUSED/ERROR
+                    # branch below does, rather than falling through to
+                    # this method's outer `except Exception` handler,
+                    # which would misleadingly log an expected governance
+                    # gate as "Goal loop failed".
+                    logger.info(
+                        "Goal loop halted: awaiting central governance approval"
+                    )
+                    await _emit_status(active=False, status="interrupted")
+                    return
                 except ValueError as e:
                     if str(e) != "conversation_already_running":
                         raise
@@ -2689,6 +3293,22 @@ class EventService:
                     task.cancel()
             await asyncio.gather(*create_tasks, return_exceptions=True)
 
+        # Phase E's wait-for-decision task must be stopped *before* the
+        # _active_governance_handshake snapshot just below — otherwise it
+        # could observe an "accepted" decision and call
+        # run_and_wait_for_start() (creating a brand-new handshake) after
+        # that snapshot has already been taken, leaving this shutdown's
+        # reconciliation blind to it entirely. If it already got as far as
+        # awaiting run_and_wait_for_start() before this cancel reaches it,
+        # that inner call's own _run_lock-guarded _closing check (see its
+        # own docstring) rejects it instead — so cancelling this outer
+        # loop-driving task can never race a handshake it already started.
+        if self._wait_for_decision_task is not None:
+            self._wait_for_decision_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._wait_for_decision_task
+            self._wait_for_decision_task = None
+
         # Same treatment for an in-flight governance claim/run handshake
         # (run_and_wait_for_start()'s background task) — without this, a
         # caller still waiting on that handshake would only ever time out
@@ -2725,6 +3345,31 @@ class EventService:
             with suppress(asyncio.CancelledError):
                 await self._lease_task
             self._lease_task = None
+
+        # Stop the outbox relay loop before _reconcile_governance_after_
+        # close() runs below — otherwise a relay cycle could fire
+        # concurrently with reconcile's own report_result() call for the
+        # same record, sending central two racing outcomes for one
+        # execution_attempt_id.
+        if self._outbox_relay_task is not None:
+            self._outbox_relay_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._outbox_relay_task
+            self._outbox_relay_task = None
+
+        # Stopped only after the relay loop above — otherwise a relay
+        # cycle could still call _ensure_claim_redispatch_task() and spawn
+        # a brand-new one right after this drain. Like the handshake task
+        # (dispatches self.run() and returns almost immediately), this is
+        # not where the real execution outcome is observed — just where a
+        # crash-recovery redispatch attempt itself is drained so it can't
+        # keep mutating self.governance_outbox after this service is
+        # considered closed.
+        if self._claim_redispatch_task is not None:
+            self._claim_redispatch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._claim_redispatch_task
+            self._claim_redispatch_task = None
 
         # Drain in-flight run before teardown so MCP close doesn't race
         # with a tool call mid-step.
@@ -2992,6 +3637,9 @@ class EventService:
         governance_active = (
             self._active_governance_handshake is not None
             and not self._active_governance_handshake.task.done()
+        ) or (
+            self._claim_redispatch_task is not None
+            and not self._claim_redispatch_task.done()
         )
         governance_background_work_active = bool(
             self._pending_governance_create_tasks

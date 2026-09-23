@@ -244,6 +244,71 @@ async def test_token_endpoint_malformed_response_is_permanent():
     await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_request_omits_timeout_kwarg_by_default():
+    """httpx distinguishes an explicit timeout=None (disables timeout
+    entirely) from omitting the kwarg (falls back to the client's own
+    constructor default) — regression test for the bug where _request()
+    used to pass timeout=None unconditionally, silently disabling the
+    30s default timeout on every ordinary call (create/claim/
+    report_result), not just wait()'s own deliberate override."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        return httpx.Response(200, json={"status": "ok"})
+
+    client = _make_client(handler)
+    original_request = client._http.request
+    captured: list[dict] = []
+
+    async def spy_request(*args, **kwargs):
+        captured.append(kwargs)
+        return await original_request(*args, **kwargs)
+
+    client._http.request = spy_request  # type: ignore[method-assign]
+
+    await client.claim("a1", idempotency_key="k1")
+
+    # _access_token()'s own token fetch goes through self._http.post(),
+    # which httpx implements in terms of .request() internally — filter
+    # that call out (its kwargs include "data", the claim call's don't)
+    # to isolate the one _request() call this test actually cares about.
+    claim_calls = [kw for kw in captured if "data" not in kw]
+    assert len(claim_calls) == 1
+    assert "timeout" not in claim_calls[0]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_wait_passes_explicit_timeout_override():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        return httpx.Response(
+            200, json={"id": "a1", "status": "pending", "changed": False}
+        )
+
+    client = _make_client(handler)
+    original_request = client._http.request
+    captured: list[dict] = []
+
+    async def spy_request(*args, **kwargs):
+        captured.append(kwargs)
+        return await original_request(*args, **kwargs)
+
+    client._http.request = spy_request  # type: ignore[method-assign]
+
+    await client.wait("a1", known_status="pending", timeout_seconds=25)
+
+    # See test_request_omits_timeout_kwarg_by_default's comment for why
+    # the token fetch's own .request() call must be filtered out first.
+    wait_calls = [kw for kw in captured if "data" not in kw]
+    assert len(wait_calls) == 1
+    assert wait_calls[0]["timeout"] == 35.0  # timeout_seconds + 10.0 margin
+    await client.aclose()
+
+
 def test_compute_display_digest_matches_known_vector():
     # This literal was independently computed by calling central-
     # governance-api's own compute_display_digest() (central_governance_

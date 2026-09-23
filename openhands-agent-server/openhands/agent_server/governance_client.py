@@ -264,18 +264,34 @@ class GovernanceClient:
         json_body: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         params: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
+        """``timeout`` overrides this client's own constructor default for
+        this one call — needed by ``wait()``, whose server-side long-poll
+        deadline (``wait_max_timeout_seconds``, currently the same 30s as
+        this client's own default request timeout) would otherwise race
+        this client's timeout against the server actually responding at
+        its own deadline, with no margin for network latency in between."""
         token = await self._access_token()
         headers = {"Authorization": f"Bearer {token}"}
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
+        # httpx distinguishes "omit this kwarg" (falls back to the client's
+        # own constructor timeout) from an explicit timeout=None (disables
+        # timeout entirely — infinite wait). Only build the kwarg when a
+        # caller actually wants an override, so every other call site here
+        # keeps this client's real default instead of silently losing its
+        # timeout protection.
+        request_kwargs: dict[str, Any] = {
+            "json": json_body,
+            "params": params,
+            "headers": headers,
+        }
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
         try:
             response = await self._http.request(
-                method,
-                f"{self._base_url}{path}",
-                json=json_body,
-                params=params,
-                headers=headers,
+                method, f"{self._base_url}{path}", **request_kwargs
             )
         except httpx.HTTPError as exc:
             raise GovernanceTransientError(
@@ -319,6 +335,37 @@ class GovernanceClient:
             f"/api/v1/approvals/{approval_id}/report-result",
             json_body=body,
             idempotency_key=idempotency_key,
+        )
+        return response.json()
+
+    async def wait(
+        self,
+        approval_id: str,
+        *,
+        known_status: str,
+        timeout_seconds: int = 25,
+    ) -> dict[str, Any]:
+        """Long-polls ``GET .../{approval_id}/wait`` — blocks server-side
+        until the approval's status differs from ``known_status``, or
+        ``timeout_seconds`` elapses (server clamps this to its own
+        ``wait_max_timeout_seconds``, currently 30s — see that endpoint's
+        own docstring), whichever comes first. Returns ``{"id", "status",
+        "changed"}``; ``changed=False`` is not an error, just "still
+        pending, call again".
+
+        Not idempotency-key-guarded — a GET that only reads is already
+        safe to call repeatedly (see the endpoint's own docstring for why).
+
+        Adds a fixed 10s margin on top of the server's own deadline for
+        this call's client-side timeout, rather than reusing this client's
+        constructor default — see ``_request()``'s own comment for why an
+        unpadded match would let this client's timeout race the server's.
+        """
+        response = await self._request(
+            "GET",
+            f"/api/v1/approvals/{approval_id}/wait",
+            params={"known_status": known_status, "timeout_seconds": timeout_seconds},
+            timeout=timeout_seconds + 10.0,
         )
         return response.json()
 
