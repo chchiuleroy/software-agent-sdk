@@ -1,45 +1,43 @@
-# Session Context: central-governance-api
-**Date**: 2026-09-15
-**Topic**: v11 §11 實作順序第 2 步——RBAC 授權矩陣與 conditional-update 邏輯（六個 approval-workflow 端點）
+# Session Context: central-governance-api / agent-server integration
+
+**Date**: 2026-09-16
+**Topic**: agent-server 串接 central-governance-api 的評估 → 計畫（v1→v4，五輪小o 審查）→ Phase A 實作落地（三輪 code review，已 commit）。central-governance-api 本身（v11 §11 三步驟 + MVP + GitHub push）已在更早的 session 完成，不在本次範圍。
 
 ## 目標 & 進度
-- ✓ 純邏輯層：`approvals/state_machine.py`（狀態轉移表）+ `approvals/authorize.py`（RBAC 矩陣），零 DB/HTTP 依賴，100 測試全過
-- ✓ 純邏輯層委派小o 唯讀審查一輪，抓到 1 high（`late_report` 授權路徑錯併入 `RECONCILE_AS_REQUESTER`）+4 medium+2 low，全修正
-- ✓ Router 層：`routers/approvals.py`（create/decide/claim/report-result/cancel/reconciliation-findings 六端點）+ `approvals/{digest,idempotency,errors,schemas}.py`
-- ✓ **首次真的接上真實 Postgres 驗證**（本機另起獨立測試叢集，port 5433，跟 Keycloak 正式服務分開），非純 mock
-- ✓ Router 層委派小o 第二輪審查，抓到 3 high（idempotency 併發回退只有文件沒實作／decide 與 report-result 的 conditional UPDATE 皆漏期限判斷）+3 medium，全修正
-- ✓ 121 測試全過（100 純邏輯 + 21 真實 DB 整合），ruff/pyright 0 issue
-- ✓ 三次 git commit：`5c73da8`（第 1 步骨架，上次 session）→ `e2e0a9b`（第 2 步初版）→ `39200a0`（審查修正），皆本機未 push
-- ✓ wiki 已同步（`project_openhands_governance_platform.md`／`concept_delegation_override.md`／`index.md`／`log.md`），lint 0 issues，向量索引已重建
-- ○ devices-register／devices-revoke／audit-events（讀）／`wait`（第 3 步 LISTEN/NOTIFY）尚未開始
-- ○ `(issuer, sub)` tuple 欄位拆分（`requester_subject` 等目前只存拼接字串）——待 Roy 拍板是否現在做
+- ✓ agent-server 串接評估文件（v2，含第一輪小o 審查）：抓到 team mode 舊端點繞過風險、approval-action 綁定缺口、背景 task 生命週期、OIDC 機器/真人身份問題
+- ✓ 低風險垂直切片計畫 v1→v4，四輪小o 審查：
+  - v1→v2：小o 指出「_run_lock 誤判為涵蓋真正執行」是小c 看錯程式碼的實質錯誤
+  - v3：小c 先讀完 `ConversationState`/`LocalConversation` 真正的 state lock 機制才動筆，找到正確插入點（`run()`/`arun()` 主迴圈 `approved_actions` 算出來那一行，約 2041 行），小o 認可核心洞見正確，但抓到「中央 API 單一 action schema vs agent-server 可能多個 pending action」的 cardinality 不相容
+  - v4：明確縮小範圍（只處理單一 pending action）+ 把 claim 責任從 bridge 移到 agent-server 自己做，小o 認可兩個方向決定，但抓到「process≠同步呼叫鏈」（`EventService.run()` 排程背景 task 就返回，例外傳不到 REST 層）與「單一 action≠不需要 reservation」兩個新 Critical
+  - **小o 三輪一致確認 Phase A（入口隔離）可以獨立動工**，Phase B-E 需要依 8 項具體門檻重新設計（未做）
+- ✓ **Phase A 實作完成並 commit**（`155bef144`，本機未推送）：team mode 下 `respond_to_confirmation` 的 `accept=True` 路徑加 `X-Governance-Bridge-Token` 檢查，5 個檔案（`config.py`/`dependencies.py`/`event_router.py`/`api.py`/`init_router.py`）+ 2 個測試檔案（74 個新測試）
+- ✓ 三輪 code review 抓到並修復 3 個 Important：deferred init 沒合併新欄位、OpenAPI schema 未正確記錄新 header（`APIKeyHeader` 命名衝突，改用 `Header(alias=...)`）、`Config.model_copy(update=...)` 不重跑 validator 讓空白 token 繞過驗證（抽成共用 `reject_blank_secret()`）
+- ○ **仍未做**：Phase B-E（durable outbox/relay、agent-server 自己 claim、action-bound atomic commit、獨立 bridge worker）完全還沒開工，v4 計畫需要依審查給的 8 項門檻重新設計才能繼續
 
 ## 關鍵決策
-- digest 驗證只在 CREATE 時做一次（伺服器重算 display/binding 欄位雜湊比對），不在 decide 時重驗——因為 CREATE 之後這些欄位永不被本 API 修改，一次驗證即終身有效；明確聲明威脅模型限制（無法綁定 canonical payload，只在 requester 裝置與執行端同信任域的 Track 1 架構下成立）
-- claim/report-result **沒有** governance.admin bypass（執行是裝置綁定的，admin 不能代替別人裝置執行）；cancel **保留** admin bypass（不涉及執行，可當 kill switch）
-- pre-claim-abort 與 cancel 共用 CANCELLED 終態，改用 `AdminAuditEvent`（`event_type` 區分）留下可分辨的紀錄，不新增 DB 欄位/schema
-- 測試策略：pyright/ruff 通不過就是真錯，但「跑得動」≠「邏輯對」——所以另起真實 Postgres 而非只用 mock；`tests/conftest.py` 的 `db_session` fixture 用 SQLAlchemy 2.0 `join_transaction_mode="create_savepoint"`（連線層開真外層 transaction，router 的 `commit()` 只釋放巢狀 SAVEPOINT，測試結束整個 rollback），沒設 `CGA_DATABASE_URL` 時這批測試乾淨 skip 不報錯
+- Roy 明確要求「agent-server 串接先評估看看要怎麼做，也請小o review」——全程評估/計畫階段沒有寫任何 code，直到 v4 計畫確認 Phase A 可獨立動工才真正落地實作
+- 五輪design 審查 + 三輪 code review，是這個子專案目前為止最密集的委派審查循環——每一輪都有實質發現，不是走過場；小c 在 v2→v3 過程中犯過一次實質理解錯誤（`_run_lock` 誤判），已誠實記錄並修正
+- Phase A 的實作範圍嚴格對應審查認可的邊界，沒有搶跑 Phase B-E
+- Roy 明確要求 commit，小c 檢查 diff scope 乾淨（只有預期的 7 個檔案）後才 commit，訊息遵循既有 `governance:` 前綴慣例
 
 ## 重要程式碼 / 修改
-- `src/central_governance_api/approvals/state_machine.py`：狀態轉移表（新檔案）
-- `src/central_governance_api/approvals/authorize.py`：RBAC 矩陣，含 `ApprovalAction.RECONCILE_LATE_REPORT`（新檔案）
-- `src/central_governance_api/approvals/digest.py`：digest 驗證（新檔案）
-- `src/central_governance_api/approvals/idempotency.py`：idempotency 強制（新檔案）
-- `src/central_governance_api/approvals/errors.py`：router 專用例外型別（新檔案）
-- `src/central_governance_api/approvals/schemas.py`：Pydantic request/response，`extra="forbid"`（新檔案）
-- `src/central_governance_api/routers/approvals.py`：六端點主體，`_commit_or_replay()` helper（新檔案）
-- `src/central_governance_api/main.py`：掛上 approvals router + 統一例外→HTTP 對應表
-- `src/central_governance_api/config.py`：新增三個 TTL 設定
-- `tests/conftest.py`：新增 `db_session` fixture（SAVEPOINT 隔離）
-- `tests/test_state_machine.py`／`test_authorize.py`／`test_approvals_router.py`：新增測試檔案
+- `openhands-sdk-governed`（git commit `155bef144`）：
+  - `openhands-agent-server/openhands/agent_server/config.py`：新增 `governance_deployment_mode`/`governance_bridge_token`，共用 `reject_blank_secret()` 函式
+  - `openhands-agent-server/openhands/agent_server/dependencies.py`：`authorize_confirmation_response()`、`governance_bridge_token_header()`
+  - `openhands-agent-server/openhands/agent_server/event_router.py`：`respond_to_confirmation` 路由接上檢查
+  - `openhands-agent-server/openhands/agent_server/api.py`：`SelfApprovalDeniedError` 的 handler 改成 generic detail（連帶修正既有身份洩漏 bug）
+  - `openhands-agent-server/openhands/agent_server/init_router.py`：`InitRequest` 補兩個欄位的 deferred-init 合併邏輯
+  - `tests/agent_server/test_api.py`、`tests/agent_server/test_init_router.py`：74 個新測試
+- 設計文件（未進版控，session scratchpad）：`agent_server_integration_evaluation.md`（v2）、`agent_server_integration_plan_narrow_slice.md`（v1）、`agent_server_integration_plan_v2.md`、`agent_server_integration_plan_v3.md`、`agent_server_integration_plan_v4.md`
 
 ## 錯誤 & 修正
-- `ApprovalDecision.decision` 原本寫入 wire-level 動詞（`accept`），撞 DB CHECK constraint（要 `accepted`）——真實 DB 才抓到，已加 `_DECISION_DB_VALUES` 映射
-- `decide`／`report-result` 的 conditional UPDATE 原本漏了 `expires_at`／`executing_lease_expires_at` 判斷——委派審查抓到，已補 WHERE 條件並各補一個真 DB 整合測試（用 `db_session` 手動把期限改到過去，不需要真併發）
-- `idempotency.py` docstring 宣稱的併發回退機制原本沒真的實作——已加 `_commit_or_replay()`，但這條路徑本身仍缺真正跨連線併發測試（已知限制，SAVEPOINT 隔離測不出真併發）
+- v2→v3：小o 抓到小c 誤判 `EventService._run_lock` 涵蓋真正執行——實際上那個鎖只包排程 task，不包背景 coroutine；小c 誠實記錄這個錯誤並重新讀完 SDK 原始碼才修正
+- v3→v4：`central_governance_api` 的 `CreateApprovalRequest` 是單一 action schema，v3 設計成批次 actions，架構落差非程式碼錯誤，靠縮小範圍（只處理單一 pending action）消滅
+- Phase A code review 第一輪：deferred init 無法設定新欄位；OpenAPI schema 因 `APIKeyHeader` 命名衝突未正確記錄新 header
+- Phase A code review 第二輪：`Config.model_copy(update=...)` 不重跑 field validator，空白 bridge token 能繞過驗證從 `/api/init` 混進去（小o 實際重現：`blank_init_accepted='   '`）
+- 完整 `tests/agent_server/` 套件跑出 20 failed + 6 errors，用 `git stash` 驗證是既有 Windows 環境限制（symlink 權限、POSIX SIGTERM trap、PID 競態），與這次變更無關，非回歸
 
 ## 下次繼續
-- 先確認 Roy 對「`(issuer, sub)` 要不要拆欄位」的拍板結果
-- 若繼續往下：devices-register/devices-revoke/audit-events（讀）—— 較單純的 CRUD 端點
-- 記得：本機臨時 Postgres 測試叢集還開著（port 5433，`central_governance_test` db），下次接續時可直接用 `CGA_DATABASE_URL="postgresql+asyncpg://cga:cga@127.0.0.1:5433/central_governance_test"` 前綴跑測試；若該叢集已被關閉需重新 `initdb`+`pg_ctl start`+`alembic upgrade head`
-- 正式部署仍需 Roy 建立專用 `central_governance` 資料庫與最小權限 DB role（不能沿用 Keycloak 帳號）
+- Phase B-E 需要依小o v4 審查給的 8 項具體門檻重新設計（team mode fail-closed 契約、`_run_lock` 內 ownership reservation、`run_and_wait_for_start` handshake、SDK+EventService 兩層都不能把治理拒絕轉成 ERROR、claim→report/reconciliation 的 durable 狀態機、單一 owner operator principal 契約、retry matrix、不可判定的 crash window 用 `inconclusive`）——這是下一個大工程，尚未開始
+- Phase A 的 commit 已推上 GitHub：`chchiuleroy/software-agent-sdk` 的 `governance-layer` 分支（`git push origin main:governance-layer`，fast-forward `7317527d9..155bef144`，推送前掃過無真實 secret，`git ls-remote` 核對 SHA 一致）
+- 已知非阻擋殘留：`openhands-agent-server/AGENTS.md` 明定的 live-server 測試慣例（`tests/cross/test_remote_conversation_live_server.py`）這次沒補，小o 評估不構成合併阻擋，未來可以補
