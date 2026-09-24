@@ -1,43 +1,36 @@
-# Session Context: central-governance-api / agent-server integration
+# Session Context: central-governance-api / Track 2 Slack design (§5a marathon)
 
-**Date**: 2026-09-16
-**Topic**: agent-server 串接 central-governance-api 的評估 → 計畫（v1→v4，五輪小o 審查）→ Phase A 實作落地（三輪 code review，已 commit）。central-governance-api 本身（v11 §11 三步驟 + MVP + GitHub push）已在更早的 session 完成，不在本次範圍。
+**Date**: 2026-09-24
+**Topic**: 完成 Track 2 Slack 設計文件 v1 的 §5a（per-user process 生命週期管理，含 workspace-level Postgres advisory lock + crash-recovery 設計）——歷經 18 輪委派小o 對抗審查後正式收斂為 implementation-ready，並 commit。本次 session 也涵蓋更早的 GitHub push 核對、`agent-canvas-source` 發布、`prepackage-governed-sdk.mjs` 腳本修復等（詳見 todo.md 完整記錄）。
 
 ## 目標 & 進度
-- ✓ agent-server 串接評估文件（v2，含第一輪小o 審查）：抓到 team mode 舊端點繞過風險、approval-action 綁定缺口、背景 task 生命週期、OIDC 機器/真人身份問題
-- ✓ 低風險垂直切片計畫 v1→v4，四輪小o 審查：
-  - v1→v2：小o 指出「_run_lock 誤判為涵蓋真正執行」是小c 看錯程式碼的實質錯誤
-  - v3：小c 先讀完 `ConversationState`/`LocalConversation` 真正的 state lock 機制才動筆，找到正確插入點（`run()`/`arun()` 主迴圈 `approved_actions` 算出來那一行，約 2041 行），小o 認可核心洞見正確，但抓到「中央 API 單一 action schema vs agent-server 可能多個 pending action」的 cardinality 不相容
-  - v4：明確縮小範圍（只處理單一 pending action）+ 把 claim 責任從 bridge 移到 agent-server 自己做，小o 認可兩個方向決定，但抓到「process≠同步呼叫鏈」（`EventService.run()` 排程背景 task 就返回，例外傳不到 REST 層）與「單一 action≠不需要 reservation」兩個新 Critical
-  - **小o 三輪一致確認 Phase A（入口隔離）可以獨立動工**，Phase B-E 需要依 8 項具體門檻重新設計（未做）
-- ✓ **Phase A 實作完成並 commit**（`155bef144`，本機未推送）：team mode 下 `respond_to_confirmation` 的 `accept=True` 路徑加 `X-Governance-Bridge-Token` 檢查，5 個檔案（`config.py`/`dependencies.py`/`event_router.py`/`api.py`/`init_router.py`）+ 2 個測試檔案（74 個新測試）
-- ✓ 三輪 code review 抓到並修復 3 個 Important：deferred init 沒合併新欄位、OpenAPI schema 未正確記錄新 header（`APIKeyHeader` 命名衝突，改用 `Header(alias=...)`）、`Config.model_copy(update=...)` 不重跑 validator 讓空白 token 繞過驗證（抽成共用 `reject_blank_secret()`）
-- ○ **仍未做**：Phase B-E（durable outbox/relay、agent-server 自己 claim、action-bound atomic commit、獨立 bridge worker）完全還沒開工，v4 計畫需要依審查給的 8 項門檻重新設計才能繼續
+- ✓ **§5a 送審 rounds 2-18，最終判定 0 Critical/0 High/0 Medium/0 Low，implementation-ready**
+- ✓ 核心架構演進：round 6-9「縮短窗口」式 fencing（DB claim 緊鄰外部呼叫、per-host enforcement proxy）皆被判定治標不治本 → round 10-11 改用 Postgres session-level advisory lock（正確 primitive），round 10 先踩到鎖定粒度錯配 Critical，round 11 修正後收斂 → round 12-17 聚焦「crash-recovery completion barrier」（如何證明已送達 Docker daemon 的舊 request 不會延遲落地），三次計時器嘗試（retry/backoff、複用 STOP_STATE_UNKNOWN runbook、quiescence window）皆失敗，round 15 改採誠實策略（transport 證據或真人工調查，查不出來永久 fail-closed）才找對方向 → round 16-17 收斂為三路 outcome mapping（NOT_APPLIED/APPLIED/AMBIGUOUS）+ 單一 normative state-machine table → round 18 修完最後文字同步，0/0/0/0
+- ✓ 設計文件已 commit：`35be037`（central-governance-api，Roy 拍板「現在 commit」，涵蓋 rounds 2-18 全部演進+`.recall/context.md`）
+- ✓ todo.md、roy_km wiki（project 頁/index/overview/log）已完整同步每一輪的發現與修法
+- ○ **Track 2 下一步**：§4a（OAuth token binding/unbind 生命週期）是唯一未設計章節，已明確排除在 ready-to-build 之外——是下一個要做的設計工作
 
 ## 關鍵決策
-- Roy 明確要求「agent-server 串接先評估看看要怎麼做，也請小o review」——全程評估/計畫階段沒有寫任何 code，直到 v4 計畫確認 Phase A 可獨立動工才真正落地實作
-- 五輪design 審查 + 三輪 code review，是這個子專案目前為止最密集的委派審查循環——每一輪都有實質發現，不是走過場；小c 在 v2→v3 過程中犯過一次實質理解錯誤（`_run_lock` 誤判），已誠實記錄並修正
-- Phase A 的實作範圍嚴格對應審查認可的邊界，沒有搶跑 Phase B-E
-- Roy 明確要求 commit，小c 檢查 diff scope 乾淨（只有預期的 7 個檔案）後才 commit，訊息遵循既有 `governance:` 前綴慣例
+- Roy 三次用 `AskUserQuestion` 拍板架構級轉向：①Track 1 委派身份延伸 vs 更簡單的「每個綁定使用者一個 process」架構（選後者）②round 8 發現地基問題後：設計 enforcement proxy 元件（vs 標記已知限制/繼續打轉，選 proxy）③round 9 proxy 也失敗後：改用 Postgres advisory lock 重設（vs 接受殘留風險，選 advisory lock）
+- 每輪委派 `codex exec --sandbox read-only`（背景執行，`run_in_background: true`，絕不用 `&`/`disown`），小c 不預設自己是對的，逐項核對小o 的 finding 後才動筆修下一輪
+- 小o 明講「implementation-ready 代表規格已足以開始實作，不等於 acceptance tests 已通過或已達 production-ready」——已知限制清單（key custody、tombstone GC 政策、tuning 數值、crash-injection test 待執行、UID 隔離、非 Linux SO_PEERCRED 替代方案等）合理保留、不阻擋實作
 
 ## 重要程式碼 / 修改
-- `openhands-sdk-governed`（git commit `155bef144`）：
-  - `openhands-agent-server/openhands/agent_server/config.py`：新增 `governance_deployment_mode`/`governance_bridge_token`，共用 `reject_blank_secret()` 函式
-  - `openhands-agent-server/openhands/agent_server/dependencies.py`：`authorize_confirmation_response()`、`governance_bridge_token_header()`
-  - `openhands-agent-server/openhands/agent_server/event_router.py`：`respond_to_confirmation` 路由接上檢查
-  - `openhands-agent-server/openhands/agent_server/api.py`：`SelfApprovalDeniedError` 的 handler 改成 generic detail（連帶修正既有身份洩漏 bug）
-  - `openhands-agent-server/openhands/agent_server/init_router.py`：`InitRequest` 補兩個欄位的 deferred-init 合併邏輯
-  - `tests/agent_server/test_api.py`、`tests/agent_server/test_init_router.py`：74 個新測試
-- 設計文件（未進版控，session scratchpad）：`agent_server_integration_evaluation.md`（v2）、`agent_server_integration_plan_narrow_slice.md`（v1）、`agent_server_integration_plan_v2.md`、`agent_server_integration_plan_v3.md`、`agent_server_integration_plan_v4.md`
+- `docs/track2-slack-design-v1.md`（central-governance-api，commit `35be037`）：§5a 從 ROUND 1 REVISION 一路修到 ROUND 18 REVISION — IMPLEMENTATION-READY；§9 現況摘要同步更新
+- 核心設計要點（實作前必讀）：
+  - Advisory lock key = `workspace_id`（不是 per-user，round 11 修正的粒度錯配教訓）
+  - 拿鎖後必須在**新 transaction**（鎖之後才開始）重讀 authoritative state，不能沿用排隊前的 transaction
+  - Intent record 拆 `operation_id`（邏輯，跨 retry 不變）vs `intent_attempt_id`（實體 row，DB UNIQUE）；`outcome_classification` vs `gate_state` 兩欄分離
+  - `start`/`stop` 的 ambiguous 解除：tier 1（transport 證明從未送達，立即 NOT_APPLIED）或 tier 2（人工調查證明舊 request 已終止且效果已知，效果=已套用還要 fresh inspect 交叉驗證才能判 APPLIED，矛盾就永久 AMBIGUOUS/held）——**絕不用計時器**
+  - hung-holder runbook：先證明舊 process 已死亡或完成不可繞過的 egress isolation，才能斷 DB session；`hold_state` 有「有 pending intent」跟「無 pending intent」兩條獨立清除路徑
 
 ## 錯誤 & 修正
-- v2→v3：小o 抓到小c 誤判 `EventService._run_lock` 涵蓋真正執行——實際上那個鎖只包排程 task，不包背景 coroutine；小c 誠實記錄這個錯誤並重新讀完 SDK 原始碼才修正
-- v3→v4：`central_governance_api` 的 `CreateApprovalRequest` 是單一 action schema，v3 設計成批次 actions，架構落差非程式碼錯誤，靠縮小範圍（只處理單一 pending action）消滅
-- Phase A code review 第一輪：deferred init 無法設定新欄位；OpenAPI schema 因 `APIKeyHeader` 命名衝突未正確記錄新 header
-- Phase A code review 第二輪：`Config.model_copy(update=...)` 不重跑 field validator，空白 bridge token 能繞過驗證從 `/api/init` 混進去（小o 實際重現：`blank_init_accepted='   '`）
-- 完整 `tests/agent_server/` 套件跑出 20 failed + 6 errors，用 `git stash` 驗證是既有 Windows 環境限制（symlink 權限、POSIX SIGTERM trap、PID 競態），與這次變更無關，非回歸
+- round 10：lock key 誤設成 `(workspace_id, user_id)`，跟既有 workspace-level ownership 架構粒度錯配，round 11 修正
+- round 12-14：連續三次試圖用計時器（retry barrier、STOP_STATE_UNKNOWN 複用、quiescence window）證明「舊 request 不會再落地」，每次都被小o 抓到「時間經過≠證明」的邏輯漏洞，round 15 才改用誠實 fail-closed 策略解決
+- round 16：把「舊 request 已終止」錯誤地一律映射成 NOT_APPLIED，沒區分「沒執行」跟「已執行成功」兩種效果，round 17 改成三路 mapping
+- round 17→18：正式 state-machine table 跟 prose 沒同步（殘留 quiescence-window 措辭、漏了 tier 1 的 direct NOT_APPLIED 路徑），round 18 修完文字同步後才真正收斂
 
 ## 下次繼續
-- Phase B-E 需要依小o v4 審查給的 8 項具體門檻重新設計（team mode fail-closed 契約、`_run_lock` 內 ownership reservation、`run_and_wait_for_start` handshake、SDK+EventService 兩層都不能把治理拒絕轉成 ERROR、claim→report/reconciliation 的 durable 狀態機、單一 owner operator principal 契約、retry matrix、不可判定的 crash window 用 `inconclusive`）——這是下一個大工程，尚未開始
-- Phase A 的 commit 已推上 GitHub：`chchiuleroy/software-agent-sdk` 的 `governance-layer` 分支（`git push origin main:governance-layer`，fast-forward `7317527d9..155bef144`，推送前掃過無真實 secret，`git ls-remote` 核對 SHA 一致）
-- 已知非阻擋殘留：`openhands-agent-server/AGENTS.md` 明定的 live-server 測試慣例（`tests/cross/test_remote_conversation_live_server.py`）這次沒補，小o 評估不構成合併阻擋，未來可以補
+- 設計 §4a（OAuth token binding/unbind 生命週期）——Track 2 唯一剩餘的未設計章節，內容包含：adapter 拿到 token 後怎麼處理（持有 refresh token 當高價值憑證庫 vs 只留 principal id）、`(workspace_id, slack_user_id)` binding key 生命週期、rebind/unbind/deactivation 規則
+- §5a 的已知限制清單（key custody、tombstone GC 具體政策、各項 tuning 數值、crash-injection acceptance test）留給實作階段處理，非本次範圍
+- 若要開始實作 §5a，先讀 `docs/track2-slack-design-v1.md` 的完整 §5a 章節（含全部 18 輪修訂痕跡）跟 §9 現況摘要
