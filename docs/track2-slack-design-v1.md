@@ -193,35 +193,648 @@ Flow sketch:
 6. The user's original message (or a "you're bound now, try again" prompt) proceeds
    through the normal pipeline.
 
-### 4a. New High-severity gaps surfaced by round 1 review (not designed yet)
 
-- **What survives the binding beyond "it happened"?** The draft above says the
-  adapter "registers a device and persists a mapping" but never specifies what it
-  does with the token(s) Keycloak issued. Three options, none chosen yet: (a) keep
-  only the principal/device id and discard tokens — but then the adapter has no way
-  to act as that user on later messages, so this doesn't actually solve §0's
-  delegation gap; (b) persist a refresh token — but this turns the adapter into a
-  high-value credential store needing its own encryption-at-rest, rotation,
-  revocation-on-logout, and leak-response design, none of which exists yet; (c) keep
-  the agent-server on its service-account identity regardless (today's behavior) —
-  in which case Device Flow only builds a side mapping table and does not change
-  who approvals are attributed to. **This decision cannot be deferred past the
-  identity-delegation design in §0** — it's the same problem from a different angle.
-  Also unaddressed: does a successful Keycloak login even carry the roles/audience
-  central-governance-api requires (e.g. an `agent.operator`-equivalent role) — "login
-  succeeded" is not the same claim as "is authorized."
-- **Binding key must include workspace, not just Slack user id.** A bare
-  `slack_user_id` can collide or get misattributed once a second Slack workspace is
-  onboarded; the identity key should be `(workspace_id, user_id)`, and the OHS
-  conversation key should include workspace + channel + thread root, not just a
-  thread id.
-- **Lifecycle not designed**: can a bound identity be rebound to a different
-  Keycloak subject; who can unbind it; what happens on Keycloak account
-  deactivation or on the user leaving the Slack workspace; and — a correctness
-  requirement, not just a nice-to-have — the flow must verify that whoever completes
-  the Device Flow login is the *same* Slack subject that initiated it (prevent
-  code/session mix-up between two different Slack users bound close together in
-  time).
+### 4a. OAuth token-binding/unbind lifecycle — ROUND 8 CLOSURE — IMPLEMENTATION-READY (2026-09-24)
+
+**Round history (compressed further; see `todo.md`/session history for full
+per-round reasoning)**: rounds 1-2 fixed the core identity claim (central sees
+a per-binding **service principal**, human attribution is an audited
+application-layer relation — unquestioned since). Rounds 3-4 made that audit
+join durable and moved it onto the generation/attempt row. Round 5
+restructured the section into a self-contained spec (4a.0-4a.9, ten
+subsections) and achieved **zero new Critical for the first time**. Round 6
+achieved zero Critical again and fixed round 5's remaining findings, leaving 4
+High + 3 Medium + 2 Low that the reviewer characterized as needing four
+precise fixes, not a rewrite. Round 7 made those four fixes — corrected the
+lease-success clock function; gave takeover's transaction a full row-count/CAS
+contract and complete cross-workspace locking; added a terminal outcome and a
+second deferred trigger for rebind's identity-change case; and completed the
+DDL/default-value precision — and **round 7's own review found zero Critical
+for the third consecutive round**, down to 1 High + 1 Medium + 1 Low, with the
+reviewer's explicit verdict: fix these two (a schema-enforcement gap and a
+column-semantics conflict), and implementation-ready follows without needing
+another architectural round. **This round (8) makes those two fixes plus the
+one Low.**
+
+**4a.0 Design principles** — unchanged since round 1: decouple identity
+*verification* (Device Flow, one-time) from the dedicated process's ongoing
+*credential*; the attempt/generation row is the sole source of truth for
+identity, the slot row is a pure pointer; every write to shared, concurrently-
+accessed state is CAS-guarded; reuse §5a's mechanisms wherever the same problem
+shape recurs, introduce a new primitive only where §5a's existing ones don't
+cover a genuinely new dimension.
+
+**4a.1 Schema**
+
+`slack_identity_binding` (pure pointer + routing status — unchanged since round
+5's H3 fix removed all cached identity columns):
+- PK `(workspace_id, slack_user_id)`
+- `status ∈ {ACTIVE, ROUTING_SUSPENDED, UNBOUND}`
+- `active_binding_attempt_id` — nullable FK into `slack_binding_attempt`
+- `binding_revision bigint NOT NULL DEFAULT 0`, incremented on every write
+- `suspended_at`, `suspend_reason`, `last_check_result`, `next_recheck_at`
+- **CHECK**: `(status = 'UNBOUND' AND active_binding_attempt_id IS NULL) OR
+  (status IN ('ACTIVE','ROUTING_SUSPENDED') AND active_binding_attempt_id IS NOT
+  NULL)` — the nullability half of the invariant is a plain, immediate `CHECK`
+  constraint (cheap, always correct, no deferral needed); only the
+  *cross-table* half ("and that attempt is really `BOUND` and really belongs to
+  this slot") needs the deferred trigger, specified in full below.
+
+**Deferred ownership/state trigger — H4 fix, full contract specified**: a
+`CONSTRAINT TRIGGER ... AFTER INSERT OR UPDATE ON slack_identity_binding
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW`. Two gaps the reviewer found in
+round 5's version, both closed:
+1. **Final-row semantics, not per-event `NEW`**: the trigger function does
+   **not** trust the triggering event's `NEW` values — at deferred-check time
+   (transaction commit), it re-`SELECT`s the row's *then-current* state fresh
+   (`SELECT status, active_binding_attempt_id FROM slack_identity_binding WHERE
+   workspace_id = ... AND slack_user_id = ... FOR SHARE`). This matters because
+   a `DEFERRABLE` trigger fires once per queued row-event, and if the same row
+   was updated more than once before commit (not expected in 4a.3's flow, but
+   the trigger must not assume it), checking a stale `NEW` from an earlier event
+   against a row that's since moved on would be wrong. Re-reading the final
+   state is what makes "checked once, at commit, against reality" actually true.
+2. **Cross-table ownership, not just existence**: the check is not just "does
+   `active_binding_attempt_id` reference *some* `BOUND` attempt" — it verifies
+   `attempt.outcome = 'BOUND' AND attempt.workspace_id = slot.workspace_id AND
+   attempt.slack_user_id = slot.slack_user_id`. Without the last two
+   conditions, a pointer could (in principle, if some other bug produced it)
+   reference a `BOUND` attempt belonging to a *different* slot and the naive
+   version of this trigger would wrongly accept it.
+
+**Second deferred trigger, on `slack_binding_attempt` itself — round 7, H3
+fix**: round 6's trigger only fired on writes to `slack_identity_binding`, so a
+bug elsewhere that changed a still-pointed-to attempt's `outcome` away from
+`BOUND` (or its `workspace_id`/`slack_user_id`) **without** touching the slot
+row would leave the invariant broken and undetected — no trigger would ever
+fire to catch it. Fixed with a second `CONSTRAINT TRIGGER ... AFTER UPDATE OF
+outcome, workspace_id, slack_user_id ON slack_binding_attempt DEFERRABLE
+INITIALLY DEFERRED FOR EACH ROW`: at deferred-check time, it re-`SELECT`s
+whether any `slack_identity_binding` row currently has
+`active_binding_attempt_id` equal to this attempt's id; if one does, the same
+ownership check as trigger 1 above is re-verified from this side. Between the
+two triggers — one watching the slot, one watching the attempt — the
+cross-table invariant is caught regardless of which table the offending write
+touched, closing the one-sided coverage gap. (In the enforcement-mechanism
+model in 4a.1 above, where only a small set of named functions may ever write
+either table, this pair of triggers is a defense-in-depth backstop, not the
+only thing standing between the schema and a violation — but it's a schema-
+level guarantee now, not merely implied by "well-behaved callers.")
+
+`slack_binding_attempt` (generation-owned identity, immutable once set —
+schema now fully specified, closing round 5's M5/H6 completeness gaps):
+- PK `attempt_id`
+- `workspace_id`, `slack_user_id` NOT NULL (not unique alone)
+- `requested_at NOT NULL`, `resolved_at` (nullable until terminal) —
+  **CHECK** (round 7, M1 fix): `(outcome = 'PENDING') = (resolved_at IS NULL)`
+  is too strict once `READY_FOR_CUTOVER` exists as a non-terminal-but-resolved
+  intermediate state; the precise rule is `(outcome IN ('PENDING')) →
+  resolved_at IS NULL` and `(outcome NOT IN ('PENDING')) → resolved_at IS NOT
+  NULL` — i.e. `resolved_at` is set the moment the attempt leaves `PENDING`,
+  regardless of which state it moves to, and never before.
+- `outcome ∈ {PENDING, READY_FOR_CUTOVER, BOUND, LOST_RACE,
+  ALREADY_BOUND_ELSEWHERE, IDENTITY_CHANGE_REQUIRES_UNBIND, EXPIRED, CANCELLED,
+  CONFIGURATION_ERROR, VERIFICATION_FAILED, INVALID_OR_EXPIRED_GRANT,
+  SUPERSEDED, REVOKED}` — **`IDENTITY_CHANGE_REQUIRES_UNBIND` is new this round
+  (H4 fix)**: round 6 rejected a rebind whose Device-Flow-resolved human
+  differs from the slot's existing human via "plain rejection" with no
+  terminal outcome defined, which the reviewer correctly flagged would leave
+  the attempt stuck in `PENDING` — blocking the slot's `PENDING`-uniqueness
+  index and risking the sweeper misclassifying a policy rejection as a timeout
+  `EXPIRED`. Fixed: this case now transitions `PENDING →
+  IDENTITY_CHANGE_REQUIRES_UNBIND` (terminal), distinct from
+  `ALREADY_BOUND_ELSEWHERE` (that one means the *human* already holds a
+  *different* slot; this one means the *slot* already belongs to a *different*
+  human) — different reverse-index implications, correctly not conflated.
+- `human_issuer`, `human_sub` — nullable; a `BEFORE UPDATE` trigger rejects any
+  change once non-null (`NULL → value` once, permitted; `value → anything`,
+  rejected)
+- `service_principal_issuer`, `service_principal_sub` — same immutability rule
+- `keycloak_client_id`, `keycloak_client_internal_id` — same immutability rule
+- **CHECK (grouped nullability)**: `(human_issuer IS NULL) = (human_sub IS
+  NULL)`, and separately `(service_principal_issuer IS NULL) =
+  (service_principal_sub IS NULL) AND (service_principal_issuer IS NULL) =
+  (keycloak_client_id IS NULL) AND (service_principal_issuer IS NULL) =
+  (keycloak_client_internal_id IS NULL)` — closes round 5's M5 gap ("must be
+  all-null or all-non-null together"); **and** `outcome IN ('READY_FOR_CUTOVER',
+  'BOUND', 'SUPERSEDED', 'REVOKED') → human_issuer IS NOT NULL AND
+  service_principal_issuer IS NOT NULL` (these fields are **required by** the
+  time `outcome` reaches `READY_FOR_CUTOVER` — **round 7 correction**: round
+  6's "never before" phrasing was wrong and contradicted the actual flow;
+  `human_issuer/sub` is written once Device Flow login succeeds, while the
+  attempt is still `PENDING`, and `service_principal_*`/`keycloak_client_*` are
+  written once the Keycloak client is created, also still `PENDING` — both
+  populate *during* `PENDING`, before the transition to `READY_FOR_CUTOVER`;
+  the `CHECK` only asserts they must be non-null by then, it was never meant to
+  forbid earlier writes, and doesn't).
+- **`UNIQUE (service_principal_issuer, service_principal_sub)`** — unchanged
+  from round 5; also add **CHECK** `(service_principal_issuer IS NULL) OR
+  (service_principal_sub IS NOT NULL)` is already implied by the grouped-
+  nullability check above (listed once, not duplicated).
+- `raw_oauth_error_code text` — the verbatim OAuth error code from Keycloak
+  (`invalid_grant`, `invalid_client`, etc.), retained for diagnosis. **CHECK
+  (round 8 fix — round 7's version was self-contradictory)**: round 7 required
+  this column non-null for `VERIFICATION_FAILED` too, but that outcome is
+  defined as a `200` response with a malformed body or an unresolvable token —
+  there generally *is* no Keycloak OAuth error code in that case, only an
+  internal diagnostic (e.g. "missing access_token field"), so requiring a
+  *verbatim Keycloak code* there was impossible to satisfy honestly. **Split
+  into two columns**: `raw_oauth_error_code` is required exactly for
+  `outcome IN ('CONFIGURATION_ERROR', 'INVALID_OR_EXPIRED_GRANT')` — the two
+  outcomes genuinely driven by a Keycloak-returned OAuth error code — and
+  `NULL` everywhere else. A separate `safe_diagnostic_code text` column is
+  required exactly for `outcome = 'VERIFICATION_FAILED'` — an internal,
+  allowlisted diagnostic string (never the raw response body, per 4a.5/4a.9's
+  redaction rules), `NULL` everywhere else. The two columns are never both
+  required for the same outcome, keeping "verbatim Keycloak code" and
+  "internal diagnostic" honestly distinct rather than overloading one column
+  with two different meanings.
+- `device_code_hmac` — **replaces round 5's `device_code_hash`** (L1 fix,
+  below): an HMAC over the raw `device_code`, keyed with a system-held secret
+  (the same key-custody question §5a already accepts as open, reused, not a
+  new one), not a plain hash. **`user_code` is not persisted at all** — it
+  exists only transiently in the DM sent to the human and in the in-flight
+  poll request; nothing about correlation requires storing it (the
+  `device_code` — RFC 8628's actual correlation key — is what polling uses),
+  so round 5's plan to hash and store it is removed rather than merely
+  hardened, closing the "low-entropy value protected by an ordinary hash"
+  concern by not keeping it around in the first place.
+- `expires_at NOT NULL`, `next_poll_at NOT NULL`
+- `lease_owner` (nullable, `NULL` = unheld), `lease_epoch bigint NOT NULL
+  DEFAULT 0`, `lease_expires_at` (nullable, meaningful only while
+  `lease_owner IS NOT NULL`) — **CHECK (round 7, M1 fix)**: `(lease_owner IS
+  NULL) = (lease_expires_at IS NULL)` — the two are grouped: an unheld lease
+  has neither an owner nor an expiry, a held one has both.
+- `active_binding_attempt_id` on `slack_identity_binding` is `REFERENCES
+  slack_binding_attempt(attempt_id) ON DELETE RESTRICT` — **round 7, M1 fix**:
+  this document's design never hard-deletes an attempt row (every terminal
+  state is a status, not a deletion — consistent with the tombstone convention
+  used elsewhere in this document), so `ON DELETE` is defensive rather than a
+  path this design ever exercises; `RESTRICT` (not `CASCADE`) is chosen so a
+  hypothetical future deletion attempt fails loudly rather than silently
+  orphaning a slot's pointer.
+- **Enforcement mechanism (round 8 fix — round 7's version only restricted
+  `UPDATE`, leaving a direct `INSERT ... VALUES (..., 'BOUND', ...)` free to
+  fabricate an attempt that skips `PENDING` and every transition function
+  entirely)**: every `outcome` transition in 4a.1's table, **including the
+  very first one, `(new row) → PENDING`**, is performed by exactly one named
+  database function per transition family (e.g. `fn_attempt_create` for the
+  initial insert, `fn_attempt_resolve_pending`, `fn_attempt_cutover`,
+  `fn_attempt_retire`), each doing its own CAS/insert and raising on an
+  unexpected affected-row count. `fn_attempt_create` is the **only** path
+  permitted to `INSERT` into `slack_binding_attempt`, and it unconditionally
+  sets `outcome = 'PENDING'` — it takes no `outcome` parameter at all, so
+  there is no argument to pass that could produce anything else. No other
+  code path — no ad hoc `INSERT` or `UPDATE` on the base table — is permitted;
+  this is enforced by revoking `INSERT`, `UPDATE`, and `DELETE` on the base
+  table from the general application role entirely, granting `EXECUTE` only
+  on these specific functions (each `SECURITY DEFINER`, owned by a role with
+  the needed table privileges, with an explicit fixed `search_path` set on the
+  function to avoid search-path-hijacking, and no `PUBLIC EXECUTE` grant) —
+  not merely a coding convention. This is the same mechanism 4a.1's earlier
+  note about `active_human_binding`
+  having no FK already leans on (transactional discipline through a controlled
+  set of write paths) — stated once, explicitly, here, rather than implied.
+- Partial unique index: at most one `PENDING` per `(workspace_id,
+  slack_user_id)`.
+- No uniqueness constraint on `READY_FOR_CUTOVER` (round 5's H1 fix, unchanged
+  — multiple candidates may coexist; the cutover CAS in 4a.3 is the sole
+  arbiter).
+- Partial unique index: at most one `BOUND` per `(workspace_id, slack_user_id)`.
+- Index on `(workspace_id, slack_user_id, outcome)` and on `lease_expires_at`
+  (sweeper/lease-reclaim scan support, named explicitly per M5's request —
+  these aren't new mechanism, just the indexes the already-specified queries
+  need).
+
+`active_human_binding` (human-uniqueness reverse index — unchanged shape from
+round 5, ownership/lifecycle now fully specified per H2/H3 below):
+- PK `(human_issuer, human_sub)`
+- `workspace_id`, `slack_user_id` NOT NULL — which slot currently holds this
+  human
+- No `FOREIGN KEY` to `slack_identity_binding` (M5 fix — a hard FK here would
+  force this row's delete/repoint to be perfectly synchronized with the slot's
+  own status transition inside the *same* statement ordering constraints as
+  everything else; instead, this table's own invariant — "a row exists iff some
+  slot's status is `ACTIVE`/`ROUTING_SUSPENDED` for this human" — is maintained
+  by every write path (4a.3, 4a.4) always touching both tables in the same
+  transaction, the same discipline the rest of this section already relies on
+  rather than a schema-level guarantee). **Round 7, M2 fix — this decision now
+  rests on firmer ground**: it's acceptable specifically *because* (a) 4a.1's
+  enforcement-mechanism note above restricts writes to a small set of named
+  functions, not arbitrary code, and (b) H3's second deferred trigger and H2's
+  reverse-index CAS (4a.4, below) together give the cross-table consistency a
+  hard FK would have provided anyway. **Recommended, not required**: a
+  periodic read-only consistency-audit query that finds dangling rows
+  (`active_human_binding` pointing at a slot that isn't
+  `ACTIVE`/`ROUTING_SUSPENDED`, or whose `BOUND` attempt's human doesn't match),
+  missing rows (a slot `ACTIVE`/`ROUTING_SUSPENDED` with no corresponding
+  reverse-index entry), or a slot pointed at by the wrong human — a detective
+  control catching anything the preventive mechanisms above somehow missed,
+  not a substitute for them.
+
+**`slack_binding_attempt.outcome` transition table** (M5 fix — stated as one
+table, not scattered across prose):
+
+| From | To | Trigger |
+|---|---|---|
+| *(new row)* | `PENDING` | Device Flow initiated |
+| `PENDING` | `READY_FOR_CUTOVER` | login + role check + provisioning all succeed |
+| `PENDING` | `EXPIRED` | lease-fenced expiry (4a.5) or sweeper reclaim |
+| `PENDING` | `CANCELLED` | Keycloak `access_denied` |
+| `PENDING` | `CONFIGURATION_ERROR` | Keycloak `invalid_client`/`unauthorized_client`/`unsupported_grant_type`/`invalid_request` |
+| `PENDING` | `VERIFICATION_FAILED` | 200 response, malformed/unresolvable token |
+| `PENDING` | `INVALID_OR_EXPIRED_GRANT` | Keycloak `invalid_grant`/`expired_token` |
+| `PENDING` | `ALREADY_BOUND_ELSEWHERE` | login succeeds, but that human already holds a different active binding (4a.3) |
+| `PENDING` | `IDENTITY_CHANGE_REQUIRES_UNBIND` | login succeeds, but resolves to a different human than this slot's current binding (4a.3, H4 fix) |
+| `READY_FOR_CUTOVER` | `BOUND` | this attempt wins the cutover CAS (4a.3) |
+| `READY_FOR_CUTOVER` | `LOST_RACE` | this attempt loses the cutover CAS (4a.3) |
+| `BOUND` | `SUPERSEDED` | a later rebind on the same slot wins cutover (4a.3) |
+| `BOUND` | `REVOKED` | slot-level unbind or takeover's old-slot revoke (4a.4) |
+
+Every other value is terminal — no outgoing transitions. Any transition not
+listed above is invalid and must be rejected by the writing code path, not
+merely undocumented.
+
+**4a.2 Locking primitives**
+- §5a's workspace-level advisory lock, unchanged.
+- **Human-level advisory lock — key derivation fixed (H5)**: round 5's
+  `hashtext('human:' || issuer || '#' || sub)` string-concatenation risked a
+  delimiter collision (the same concern `Principal.subject`'s own docstring
+  already flags for exactly this reason). Fixed: the key is derived from a
+  **length-prefixed encoding** of the tuple — conceptually `hash(len(issuer) ||
+  issuer || len(sub) || sub)` — using §5a's own existing 64-bit advisory-lock
+  hash namespace/function, not a new one, so human-keyed and workspace-keyed
+  locks live in different namespaces and two different `(issuer, sub)` pairs
+  can't be confused with each other by *concatenation ambiguity* — the
+  delimiter-collision failure mode this fix specifically targets. **Round 7
+  correction**: this does not make hash collision impossible in general —
+  same wording §5a already uses honestly for its own advisory-lock keys, now
+  matched here rather than overclaimed: a 64-bit hash collision between two
+  *different*, correctly-encoded tuples remains astronomically unlikely but
+  not zero, and its consequence is unnecessary serialization (two unrelated
+  operations briefly blocking each other), not a security bypass — nothing
+  about this design's correctness depends on collisions never happening.
+- **Session/connection contract — explicit, not just implied (H5)**: `
+  pg_advisory_lock` is session-level, so acquiring the human lock **pins the
+  operation to one physical database connection** for the lock's entire hold
+  duration (no statement/transaction pooling in between); release is symmetric
+  (`pg_advisory_unlock` on that same connection) or implicit (the connection
+  closing — including a crash — releases it automatically, exactly the same
+  crash-safety property §5a's own advisory locks already rely on and document;
+  this section adopts that contract rather than restating a separate one).
+- Fixed acquisition order unchanged: human lock first, then workspace lock(s)
+  in ascending `workspace_id` order if more than one is needed.
+
+**4a.3 Bind / rebind / cutover**
+
+Device Flow (protocol in 4a.5) produces an attempt row. On a successful login,
+**before provisioning any Keycloak client** (H5 fix — round 5's spec impossibly
+required a human-uniqueness check "before Device Flow," when the human's
+identity is only known *after* Device Flow succeeds): acquire the human lock
+for the now-known `(human_issuer, human_sub)`, check `active_human_binding` —
+if a row exists pointing at a *different* slot, this attempt →
+`ALREADY_BOUND_ELSEWHERE` (terminal; the human is told to use takeover instead,
+4a.4), release the lock, stop here, **no Keycloak client is created**. If no
+conflicting row exists, proceed: create the new Keycloak client (4a.6's
+`create`), capture its real `(issuer, sub)`, and the attempt reaches
+`READY_FOR_CUTOVER` — any number of these may coexist per slot (round 5's H1
+fix, unchanged).
+
+**Human-identity change on rebind — H3 (round 6), terminal outcome added
+(round 7, H4 fix)**: a rebind attempt whose Device-Flow-resolved
+`(human_issuer, human_sub)` **differs** from the slot's *current* binding's
+human is rejected at the same pre-provisioning check above (deliberately
+distinct from `ALREADY_BOUND_ELSEWHERE`, which means the *human* already holds
+a *different* slot — this case means the *slot* already belongs to a
+*different* human) — the attempt transitions `PENDING →
+IDENTITY_CHANGE_REQUIRES_UNBIND` (terminal; **round 7 fix**: round 6 called
+this a "plain rejection" with no defined outcome, which the reviewer correctly
+flagged would leave the attempt stuck `PENDING`, jamming the slot's
+`PENDING`-uniqueness index and risking the sweeper later misclassifying it as
+a timeout). The human is told: "this slot is bound to a different Keycloak
+identity — unbind first." **v1 does not support identity replacement on an
+existing slot via rebind** — changing which human owns a slot requires an
+explicit unbind, then a fresh bind; the UX cost is a brief interruption
+(routing/credential access stops at unbind, per 4a.4), stated here rather than
+left implicit. This keeps every rebind's human lock scoped to exactly one
+human, never two, and avoids needing dual-human-lock ordering rules entirely.
+
+Cutover — human lock (already held from the check above, if this flow reached
+provisioning), then workspace lock, then one transaction:
+1. Read the current `slack_identity_binding` row, if any; capture
+   `expected_prior_attempt_id` (`NULL` for a first bind).
+2. `INSERT INTO slack_identity_binding (...) VALUES (:w, :u, 'ACTIVE', :new_id,
+   1) ON CONFLICT (workspace_id, slack_user_id) DO UPDATE SET status='ACTIVE',
+   active_binding_attempt_id=:new_id, binding_revision =
+   slack_identity_binding.binding_revision + 1 WHERE
+   slack_identity_binding.active_binding_attempt_id IS NOT DISTINCT FROM
+   :expected_prior_attempt_id` — unchanged since round 5, handles first bind and
+   rebind with one statement shape.
+3. **0 rows affected → lost the race**: `READY_FOR_CUTOVER → LOST_RACE`;
+   schedule immediate Keycloak client cleanup (4a.6); release locks, done.
+4. **1 row affected → won**: if a rebind, old attempt `BOUND → SUPERSEDED`
+   first, then new attempt `READY_FOR_CUTOVER → BOUND` — unchanged ordering
+   from round 5.
+5. `active_human_binding`: `INSERT` a row for this human pointing at
+   `(workspace_id, slack_user_id)` — since the pre-provisioning check already
+   guaranteed no conflicting row exists for this human (and, per H3 above, a
+   rebind never changes which human owns the row), this is always a plain
+   insert on first bind, or a no-op check on rebind (the row already correctly
+   points here) — never a conflict requiring the "bug-guard abort" round 5's
+   version described, because the real check now happens earlier, where it's
+   actually possible to perform it.
+6. Commit — the deferred trigger (4a.1) fires and passes, per its now-fully-
+   specified contract.
+7. After commit, asynchronously: rebind triggers generation retirement (4a.4)
+   against the old generation, unchanged since round 3.
+
+**4a.4 Unbind / generation retirement / takeover**
+
+- **Slot-level unbind**: unchanged from round 5 — revision-fenced `UPDATE`,
+  `BOUND → REVOKED`, `DELETE FROM active_human_binding` matched on both key and
+  current pointer, then the drain-then-revoke tail.
+- **Generation retirement**: unchanged since round 3.
+- **Takeover — H2 (round 6) restructured into one atomic transaction; round 7
+  fixes the row-count/CAS contract inside it and the cross-workspace locking
+  the reviewer found still under-specified.** Round 6 correctly closed the
+  original two-commit crash window (round 5's bug) by moving all of the old
+  slot's revoke and the new slot's cutover into one transaction — the
+  reviewer confirmed that part of the fix stands. What remained unspecified:
+  what each of the transaction's five steps does on an unexpected row count,
+  and the full lock set for a takeover spanning two workspaces.
+
+  Takeover first runs the **entire normal bind flow** for the new slot up
+  through `READY_FOR_CUTOVER` (Device Flow, role check, provisioning — all of
+  4a.3), with one deliberate difference: the human-uniqueness check finding
+  `active_human_binding` pointing at the *old* slot is **expected, not a
+  rejection** — that's precisely what distinguishes a takeover from a plain
+  bind hitting `ALREADY_BOUND_ELSEWHERE`. This part touches nothing belonging
+  to the old slot.
+
+  Only once the new attempt is durably `READY_FOR_CUTOVER`: acquire the human
+  lock, then, per 4a.2's fixed ordering, **both** workspace locks — the old
+  slot's workspace and the new slot's workspace, in ascending `workspace_id`
+  order (**round 7 fix**: round 6 only mentioned the human lock here; a
+  takeover spanning two workspaces was still missing the workspace-level
+  fencing every other cross-workspace-sensitive write in this section already
+  requires). **After acquiring all locks, re-validate before proceeding** —
+  the same "never trust a pre-lock observation" rule 4a.3's cutover already
+  follows: re-read `active_human_binding` and confirm it still points at the
+  expected old slot, and re-read the old slot's current `binding_revision`.
+  If either has changed since this takeover operation's initial read (a
+  second, competing takeover or a manual unbind interleaved), **abort here**
+  — release locks, leave the new attempt at `READY_FOR_CUTOVER` (retriable —
+  a later attempt at cutover, or an operator, can pick it up), and do not
+  proceed to the transaction below.
+
+  One transaction, with an explicit row-count contract at every step — **any
+  step affecting an unexpected number of rows aborts and rolls back the
+  entire transaction**, not just that step:
+  1. Old slot: `UPDATE slack_identity_binding SET status='UNBOUND',
+     active_binding_attempt_id=NULL, binding_revision=binding_revision+1 WHERE
+     workspace_id=:old_w AND slack_user_id=:old_u AND
+     active_binding_attempt_id=:checked_old_attempt_id AND
+     binding_revision=:checked_old_revision` — must affect exactly 1 row.
+  2. Old attempt: `UPDATE ... SET outcome='REVOKED' WHERE attempt_id=? AND
+     outcome='BOUND'` — must affect exactly 1 row (if the old attempt is no
+     longer `BOUND`, something changed it since the re-validation above; abort
+     rather than proceed on a stale assumption).
+  3. New slot: the 4a.3 cutover upsert, `expected_prior_attempt_id = NULL` —
+     must affect exactly 1 row.
+  4. New attempt: `UPDATE ... SET outcome='BOUND' WHERE attempt_id=? AND
+     outcome='READY_FOR_CUTOVER'` — must affect exactly 1 row.
+  5. Reverse index: `UPDATE active_human_binding SET workspace_id=:new_w,
+     slack_user_id=:new_u WHERE human_issuer=? AND human_sub=? AND
+     workspace_id=:old_w AND slack_user_id=:old_u` — **round 7 fix**: the
+     `WHERE` clause now includes the *expected old* `(workspace_id,
+     slack_user_id)`, not just the human key — must affect exactly 1 row. This
+     closes the gap the reviewer found: without the old-slot condition, a
+     second legitimate takeover that already repointed this row first could
+     have its result silently overwritten by a slower, stale first takeover
+     finishing later; requiring the old-slot match means the second-to-commit
+     takeover's step 5 affects 0 rows and the whole transaction rolls back —
+     correctly, since by then the "old slot" it read at validation time is no
+     longer where the reverse index actually points.
+
+  **This closes the crash window entirely, and now closes the same-row-
+  count-precision gap too**: either the whole takeover lands, or none of it
+  does — including no longer being fooled by a stale row-count-blind repoint.
+  The old generation's drain-then-revoke tail (4a.6) runs asynchronously
+  after commit. **If Device Flow or provisioning for the new slot fails
+  before reaching `READY_FOR_CUTOVER`, or if the post-lock re-validation
+  aborts**: nothing has touched the old slot — the human's existing binding
+  is completely unaffected.
+
+**4a.5 Device Flow lease protocol**
+
+Acquire/renew CAS statements unchanged since round 4/5.
+
+**H1 fix (round 7) — the fence needs true wall-clock time, not a time fixed at
+any point before the row is actually matched.** Round 6 moved from
+`transaction_timestamp()` to `statement_timestamp()`, correctly fixing the
+transaction-start problem, but the reviewer found `statement_timestamp()` is
+still fixed at the *statement's* start — if the `UPDATE` has to wait on a row
+lock (e.g. a concurrent sweeper or renewal touching the same attempt row) and
+that wait crosses `expires_at`, the predicate is evaluated against the
+statement's start time, not the moment the lock is actually granted and the
+row re-checked, and a late success could still land. **Fixed: use
+`clock_timestamp()`**, which re-evaluates on each row at actual evaluation
+time rather than being fixed once for the whole statement — `WHERE
+attempt_id=? AND lease_owner=? AND lease_epoch=? AND outcome='PENDING' AND
+expires_at > clock_timestamp()`. This is a single-row CAS, so
+`clock_timestamp()`'s per-row (rather than per-statement) evaluation costs
+nothing extra here and closes the lock-wait window precisely — no longer
+merely available as a stricter option for some future deployment, it's what
+v1 itself now uses.
+
+**Poll-response classification** — unchanged categories from round 4/5, with
+M3's edge cases now specified:
+- `Retry-After` parsing accepts both the HTTP-date and delta-seconds forms; a
+  missing, negative, or unparseable value is ignored (falls back to Keycloak's
+  own advertised `interval`); a parsed value is clamped to a sane maximum (an
+  operator-configurable ceiling, not left unbounded) before being applied as
+  `max(current interval, Retry-After)` for the next poll only.
+- The next scheduled poll is never set later than the attempt's own
+  `expires_at` — if the computed next-poll time would fall after expiry, no
+  further poll is scheduled and the attempt is left to expire normally (4a.5's
+  fenced expiry write handles it) rather than polling past a point that can
+  no longer succeed.
+- `slow_down`'s interval increase is **cumulative** across repeated
+  `slow_down` responses within one attempt (each one further widens the
+  interval, per RFC 8628's own guidance), not reset on each occurrence.
+- `temporarily_unavailable`, bare `5xx`, `408`, and a `429` with no
+  parseable body all fall into the existing ambiguous/network-failure bucket
+  (retry within the lease, no attempt-row transition) — restated explicitly
+  here since round 5 left them implicit.
+- A malformed success body (`VERIFICATION_FAILED`) logs a **safe diagnostic
+  code** (e.g. "missing access_token field," "resolver rejected: bad
+  audience") — never the raw response body, consistent with 4a.9's redaction
+  rules.
+
+**H3 (round 3's Device Flow crash-window loss)** — unchanged decision from
+round 4/5: accepted, honestly bounded, disproportionate to engineer away for a
+cheap, user-retriable operation.
+
+**4a.6 Keycloak durable-intent reconciliation** — unchanged since round 3/4/5.
+
+**4a.7 Emergency deactivation**
+
+Baseline unchanged since round 4 (routing suspension + Keycloak client disable
++ immediately-requested §5a drain). The `revoked_service_principal (issuer,
+sub, revoked_at)` denylist from round 5 is kept; **M2 fix — its contract now
+fully specified**:
+- PK `(issuer, sub)`, both `NOT NULL`.
+- Entries are **permanent** — no automatic expiry or un-revocation. A revoked
+  service principal's underlying Keycloak client is deleted anyway via the
+  ordinary drain-then-revoke tail; the denylist row is retained regardless, as
+  a durable audit fact ("this principal was emergency-revoked, at this time"),
+  not a live access-control list that needs pruning.
+- The denylist check runs in `central-governance-api`'s auth dependency
+  **immediately after** `Principal` resolution and **before** any role/RBAC
+  check — fail fast on revocation before spending any further work on a
+  request that will be rejected regardless.
+- **A DB query failure on this table fails closed** — the request is rejected,
+  not silently allowed through, if the denylist itself can't be checked. This
+  is a deliberate asymmetry from this section's general "external check
+  failure → `UNKNOWN`, don't guess" posture (4a.8): a denylist lookup failing
+  is a check *of this system's own database*, not an external dependency, so
+  there's no honest "maybe it's fine" interpretation the way an external
+  Keycloak/Slack timeout has.
+- **Deployment assumption, stated explicitly, not silently assumed**: emergency
+  deactivation's atomic transaction (denylist insert + slot
+  `ACTIVE → ROUTING_SUSPENDED` + Keycloak disable-intent record) requires
+  `revoked_service_principal`, `slack_identity_binding`, `slack_binding_attempt`,
+  and the Keycloak intent-record table to all live in the **same** Postgres
+  database — if `central-governance-api`'s database is ever physically
+  separated from the Slack adapter's, this section's single-transaction
+  atomicity claim no longer holds and would need a two-phase or saga-style
+  redesign, out of scope for v1.
+- The emergency slot transition is itself revision-fenced exactly like every
+  other slot write (4a.3/4a.4) — round 5's description omitted this
+  consistency requirement; it's restated here, not a new mechanism.
+
+**4a.8 Sweep**
+
+Tri-state classification unchanged since round 3/4/5.
+
+**M1 fix — which of two concurrent, opposite sweep results wins, made
+explicit**: every sweep result (`PRESENT`, `ABSENT`, `UNKNOWN` alike) writes
+the slot via the same revision-fenced `UPDATE`, not only `UNKNOWN`-driven ones
+— round 5's phrasing implied otherwise. Whichever write's CAS lands first
+under `binding_revision` wins; the **loser does not retry its stale
+observation** — a 0-row result means the loser discards its result outright
+and, if it still believes a check is warranted, must perform a **fresh**
+check against current state rather than resubmitting an outdated one. This is
+the same discard-not-retry-blindly discipline already established for
+cutover's `LOST_RACE` (4a.3) and unbind's stale-CAS abort (4a.4), applied
+uniformly to sweep writes too, not a new rule.
+
+**M4 fix — explicit tradeoff statement and v1 starting defaults, not left
+fully blank**: this design's fail-closed-on-first-`UNKNOWN` policy is a
+**deliberate availability/security tradeoff, stated plainly**: during a
+genuine shared-dependency outage (Keycloak, Slack, or DNS down), every binding
+*will* eventually suspend — jitter, the concurrency cap, and the mass-
+suspension alert reduce the speed of that cascade and warn an operator, they
+do not prevent the eventual outcome, and this section does not claim otherwise.
+The concurrency cap is **global to the adapter deployment**, not per-workspace
+(it exists to protect the shared dependency being checked, not for
+per-workspace fairness). **v1 starting defaults — round 7 fix, precise numbers
+rather than "roughly"/"a handful" (the reviewer correctly noted a proportional
+threshold alone breaks at this system's own stated small scale — one binding
+already exceeds a 25% share when there are only a few total)**, explicitly
+named as starting points, not yet operationally validated, overridable:
+- Jitter: **±20%** around the base recheck interval.
+- Global concurrency cap: **4** simultaneous outbound sweep checks across the
+  whole adapter deployment.
+- Mass-suspension alert: fires when, within a rolling **5-minute** window,
+  more than 25% of **the count of bindings that were `ACTIVE` at the window's
+  start** have entered `ROUTING_SUSPENDED` since, **and** that count is **at
+  least 2 bindings** — the absolute floor exists specifically because a
+  proportional-only threshold is meaningless at a scale where a single
+  suspension can already be "25% of everything." **Round 8 fix**: the
+  denominator is fixed to a **snapshot taken at the window's start**, not
+  re-evaluated bindings-currently-active-right-now — the latter would shrink
+  as suspensions happen, making the percentage self-amplifying (each new
+  suspension makes the next one a larger share of an ever-shrinking base)
+  purely as an artifact of the query, not a real change in severity.
+
+These give the system an actual deployable starting contract rather than
+unset knobs, while remaining explicitly provisional pending real operational
+data — the same honest-defaults treatment this section already applies
+elsewhere, not a claim that these particular numbers are correct.
+
+**Realm-admin boundary note** — unchanged since round 4/5.
+
+**4a.9 Redaction**
+
+Superseding round 5's list per L1/L2:
+- **L1 fix**: `user_code` is **not persisted** at all (4a.1 — removed rather
+  than hashed, since nothing requires storing it). `device_code` is never
+  stored raw; only `device_code_hmac` (an HMAC keyed with a system-held
+  secret, not a plain hash — closing the "low-entropy value behind an
+  offline-enumerable hash" concern for good, not just for the weaker
+  `user_code` case).
+- Never logged/traced/exception-embedded, unchanged from round 5's list:
+  access tokens, refresh/ID tokens, raw unvalidated claims,
+  `verification_uri_complete`, Keycloak client secrets and rotation responses,
+  the Admin API's own bearer token and full request/response bodies,
+  `Authorization` headers/form bodies/redirect-query parameters, cookies,
+  tracing baggage/span attributes, Slack bot/app tokens, the agent-server
+  session API key, secret-manager version identifiers, exception
+  chaining/dead-letter payloads.
+- **L2 fix — enforcement points, not just a list of names**: (a) any HTTP
+  client wrapper used for Keycloak/Slack calls must not place a response or
+  request body into a raised exception's message (the pattern
+  `GovernanceClient` currently exhibits — [governance_client.py:238](../../openhands-sdk-governed/openhands-agent-server/openhands/agent_server/governance_client.py),
+  citation confirmed correct this round — must not be copied); (b) a shared
+  logging/telemetry-processor-level scrubber as defense-in-depth, not reliance
+  on per-call-site discipline alone; (c) an **allowlist**, not a denylist, for
+  what fields may appear in exception serialization and dead-letter payloads
+  (allowlisting is safer here — a denylist only catches named things, an
+  allowlist catches everything unnamed by default); (d) crash-dump generation
+  disabled or scrubbed in deployment configuration; (e) a concrete verification
+  practice, **scope expanded (round 7)**: inject a canary secret value in a
+  lower environment and confirm it never surfaces across logs, traces, **and,
+  per the reviewer's addition, also dead-letter storage, database diagnostic
+  columns, and metrics labels/event payloads** — the earlier "logs/traces/
+  exception store" framing missed these; **and confirm crash-dump policy is
+  actually in effect** (trigger a controlled crash in that environment and
+  check no dump is produced or that it's properly scrubbed), not just
+  configured. **Key rotation, addressed explicitly rather than left implicit
+  (round 7)**: v1 does not rotate the `device_code_hmac` key within a
+  deployment's lifecycle; if key rotation is added in a later version, a
+  `device_code_hmac_key_version` column would be needed at that point to
+  support verifying HMACs computed under a prior key — not added now, since
+  v1 has no rotation to support.
+
+**🎉 Status after round 8: §4a is formally judged IMPLEMENTATION-READY
+(2026-09-24).** Round 7 achieved 0 Critical for the third consecutive round,
+down to 1 High + 1 Medium + 1 Low, with the reviewer's own explicit verdict
+that closing these would reach implementation-ready without another
+architectural round. Round 8 closed all three: **(H1)** the transition-
+enforcement mechanism (4a.1) only restricted `UPDATE`, leaving a direct
+`INSERT` free to fabricate an attempt starting at any `outcome` (e.g.
+`BOUND`), bypassing Device Flow, role checks, provisioning, and the cutover
+CAS entirely — fixed by adding `fn_attempt_create` as the sole, argument-
+free-on-`outcome` path permitted to `INSERT`, and revoking
+`INSERT`/`UPDATE`/`DELETE` on the base table from the general application role
+entirely, not just `UPDATE`. **(M1)** `raw_oauth_error_code` was required
+non-null for `VERIFICATION_FAILED`, an outcome defined as *not* having a
+Keycloak OAuth error code (a malformed `200` response) — self-contradictory —
+fixed by splitting into `raw_oauth_error_code` (verbatim Keycloak code,
+required only for the two genuinely OAuth-error-driven outcomes) and a
+separate `safe_diagnostic_code` (required only for `VERIFICATION_FAILED`).
+**(L1)** the mass-suspension alert's denominator ("currently-active bindings")
+was ambiguous and, read one way, self-amplifying as suspensions shrank the
+base — fixed by defining it as a snapshot taken at the rolling window's start.
+**The reviewer's own closing verdict**: "狀態機入口已由資料庫權限與受控函式強制執行、
+OAuth 原始錯誤與內部診斷的資料語意已一致、監控分母也已具備穩定且唯一的定義。本次限定範圍內
+沒有殘留 Critical、High、Medium 或 Low，也沒有需要再開 ROUND 9 架構審查的問題；可以直接
+進入實作與 DDL/權限測試。" Reached implementation-ready after an 8-round review
+marathon (rounds 1-4 establishing and correcting the core identity/attribution
+model and its schema durability; rounds 5-8 closing concurrency-fencing and
+DDL-precision gaps) — this is Track 2's second section (after §5a's 18 rounds)
+to go through this document's full delegated-review-to-convergence process.
 
 ## 5. Multi-tenant granularity — REVISED (2026-09-23): one process per bound
 user, not one container per team
@@ -1904,16 +2517,28 @@ found it still did, specifically for §4a, and round 8 fixed that framing)**:
   confirmed against source) — per-bound-user, talking to that user's own
   dedicated agent-server process.
 - §4: the Device Authorization Grant flow's core mechanics (device-code
-  request/poll against Keycloak) are settled. **§4a is explicitly excluded
-  from "ready to build" (round 8, closes round 7's M4 — a leftover
-  contradiction where §4a's own heading still says "not designed yet" while
-  this status section implied §1-4 as a whole was ready)**: what the adapter
-  does with the issued token(s), the `(workspace_id, slack_user_id)` binding
-  key shape, and the rebind/unbind/deactivation lifecycle are all still open,
-  exactly as §4a itself states — none of that is resolved by the per-user
-  process architecture in §5, which only established *that* each bound user
-  gets a dedicated process, not the binding-and-token-handling details of
-  how that process gets provisioned with the right credential.
+  request/poll against Keycloak) are settled. **§4a: IMPLEMENTATION-READY as
+  of round 8 (2026-09-24)**, after an 8-round delegated-review marathon —
+  Track 2's second section (after §5a's 18 rounds) to reach this bar. Rounds
+  1-2 fixed the core identity claim (central sees a per-binding **service
+  principal**, human attribution is an audited application-layer relation, not
+  an identity-token equivalence). Rounds 3-4 made that audit join durable and
+  moved it onto the generation/attempt row. Round 5 restructured the section
+  into a self-contained specification (§4a.0-4a.9) and reached zero-Critical
+  for the first time; rounds 6-7 each found zero Critical again while closing
+  concurrency-fencing and DDL-precision gaps (full CAS/row-count contracts for
+  cutover and takeover, complete cross-workspace locking, a corrected
+  lease-expiry clock function, terminal outcomes and a second deferred trigger
+  for edge cases). **Round 8** closed the final 1 High + 1 Medium + 1 Low — a
+  schema-enforcement gap (transition control only restricted `UPDATE`, leaving
+  a direct `INSERT` able to fabricate an attempt at any starting outcome;
+  fixed by routing creation through a dedicated function that can only ever
+  insert `PENDING`), a column-semantics conflict (`raw_oauth_error_code`
+  required for an outcome that by definition has no Keycloak error code; split
+  into that column plus `safe_diagnostic_code`), and an alert-denominator
+  ambiguity (fixed to a window-start snapshot) — and the reviewer's closing
+  verdict confirmed **no remaining Critical/High/Medium/Low and no need for a
+  round 9**.
 - §5: multi-tenant granularity revised to per-user processes (supersedes the
   earlier per-team-container decision — flagged explicitly to Roy as a
   consequence of today's choice, not silently overridden). §5a (per-user
