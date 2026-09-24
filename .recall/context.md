@@ -1,40 +1,30 @@
 # Session Context: openhands-governance (central-governance-api)
 **Date**: 2026-09-24
-**Topic**: 設計 OHS Track 2 §4a（OAuth token-binding/unbind lifecycle）從零到 8 輪委派審查收斂為 IMPLEMENTATION-READY
+**Topic**: 設計 OHS Track 2 §4a 收斂為 IMPLEMENTATION-READY，commit+push，並新增桌面 app 打包待辦
 
 ## 目標 & 進度
-- ✓ 查 todo.md 待辦清單，標記 2026-09-09「企業前端整合」條目為 SUPERSEDED（被 Track 2 Slack 設計吸收）
-- ✓ §4a（Track 2 設計文件唯一遺留未設計的章節）從零開始設計
-- ✓ 委派小o（`codex exec --sandbox read-only`）做 8 輪獨立審查，逐輪修正，最終正式判定 **IMPLEMENTATION-READY**（2026-09-24）
-- ✓ `todo.md` 補上完整 8 輪里程碑記錄
-- ✓ wiki 三頁同步：`project_openhands_governance_platform.md`（詳細 8 輪歷程新章節）、`index.md`（專案摘要 append）、`log.md`（新 entry）
-- ✓ 向量索引已增量重建（`project_openhands_governance_platform.md` 重新 embed，index.md/log.md 屬 meta 頁不進索引）
-- ○ **尚未 commit**：`track2-slack-design-v1.md` 的今日全部變更（round 1-8）還在 working tree，Roy 尚未明確答覆要不要現在 commit——下次對話開始時應先問這個，不要假設答案
+- ✓ §4a（Track 2 設計文件唯一遺留未設計的章節）從零開始設計，委派小o 8 輪獨立審查，最終正式判定 **IMPLEMENTATION-READY**
+- ✓ `todo.md`／wiki 三頁（`project_openhands_governance_platform.md`／`index.md`／`log.md`）同步完成，向量索引已增量重建
+- ✓ **已 commit**（`662c180`，`central-governance-api` repo）**並已 push**（`chchiuleroy/software-agent-sdk` 的 `central-governance-api` 分支，`02ad0df..662c180`）——上一次存檔時還沒問到答案，這次已經問到且完成
+- ✓ Roy 追加新待辦，經兩輪澄清後寫入 `todo.md`：把 `central-governance-api`（及 `openhands-governance` 底下其他新功能）比照 `agent-canvas-source` 現有的 `electron-builder`+`extraResources` 機制，一起打包進同一個 Electron 桌面 app 安裝檔（現有版本 `OpenHands-Agent-Canvas-Setup-1.16.0.exe`，位於 `agent-canvas-source\dist-electron`）——**不是**獨立打包成 standalone exe 或 Windows Service，我第一次理解錯了，Roy 用 `dist-electron` 路徑舉例才點出正確方向
 
 ## 關鍵決策
-- §4a 核心設計（最終版，即 track2-slack-design-v1.md §4a.0-4a.9）：
-  - **身份模型**：central-governance-api 看到的是 per-binding **service principal**（不是人類本人），人類歸屬只在應用層 binding table 被稽核維護（跟既有 device registration「audit hint 非 security control」定位一致）——這是全程最重要的架構修正，round 1 的原始設計誤以為「每人一把 client-credentials 憑證」能讓 central 認得出人類本人，被小o 讀原始碼推翻（token 的 `(issuer, sub)` 是 client 自己的 service-account，不是 Device Flow 驗證過的人類）
-  - **Schema**：`slack_identity_binding`（純 pointer + routing status，無身份欄位）、`slack_binding_attempt`（generation 層級擁有身份欄位，不可變一旦寫入）、`active_human_binding`（human-uniqueness reverse index，PK 本身就是唯一性保證）
-  - **關鍵機制**：`DEFERRABLE INITIALLY DEFERRED` constraint trigger（commit 時才驗證 pointer-to-BOUND invariant）、CAS-guarded cutover with `LOST_RACE` 終態、takeover 單一 atomic transaction（human lock 先於雙 workspace lock）、`clock_timestamp()`（非 statement/transaction_timestamp）做 lease expiry fence、`fn_attempt_create` 是唯一允許 INSERT 的路徑且寫死 PENDING
-  - **v1 明確拍板、不留白**：rebind 不支援換人類身份（需明確 unbind-then-bind）；不做 `azp` 限制；一人最多一個 active binding；sweep tunables 給了精確起始值（jitter ±20%、concurrency cap 4、mass-suspension alert 5分鐘內>25%且≥2筆）
-  - **新增跨界範圍**：emergency deactivation 需要 central-governance-api 本身新增 `revoked_service_principal` денylist table（唯一一項不只是 Track 2 adapter/Keycloak 範圍的修法）
+- §4a 核心設計要點（完整記錄見 wiki `project_openhands_governance_platform.md`「§4a」章節，不重複）：central-governance-api 看到的是 per-binding **service principal** 非人類本人，人類歸屬只在應用層 binding table 稽核維護；schema 三表（`slack_identity_binding`/`slack_binding_attempt`/`active_human_binding`）；`DEFERRABLE INITIALLY DEFERRED` trigger、CAS-guarded cutover、`clock_timestamp()` lease fence、`fn_attempt_create` 唯一 INSERT 入口
+- 新打包待辦的範圍判斷：`central-governance-api` 是常駐 API 服務+PostgreSQL 依賴，跟現有 `extraResources` 只打包唯讀 SDK 程式碼的模式不同，實際方案需要另外設計（已記在 todo「下一步」）
 
 ## 重要程式碼 / 修改
-- `C:/Users/roy/todo.md`：新增 2026-09-24 §4a 完整 8 輪里程碑記錄（置頂）；2026-09-09 舊條目標記 SUPERSEDED
-- `openhands-governance/central-governance-api/docs/track2-slack-design-v1.md`：
-  - §4a 整段從 placeholder 改寫成完整規格（8 輪修訂，最終標題 "ROUND 8 CLOSURE — IMPLEMENTATION-READY"）
-  - 頂部「Current status」摘要段落同步更新反映 §4a 完工
-  - **working tree 有未 commit 的變更**（今天一整天的 round 1-8 全部內容）
-- `C:/Users/roy/roy_km/wiki/project_openhands_governance_platform.md`：新增「§4a：8 輪委派審查後判 IMPLEMENTATION-READY」章節，frontmatter `updated: 2026-09-24`
-- `C:/Users/roy/roy_km/wiki/index.md`：project_openhands_governance_platform 條目 append §4a 摘要
-- `C:/Users/roy/roy_km/wiki/log.md`：新增 2026-09-24 ingest entry
+- `C:/Users/roy/todo.md`：
+  - 新增置頂項目「把 `openhands-governance` 底下的新功能一起打包進 Agent Canvas 桌面 app 的 exe」（未完成，待評估打包方案）
+  - §4a 完整 8 輪里程碑記錄（已完成）
+  - 2026-09-09 舊條目標記 SUPERSEDED
+- `openhands-governance/central-governance-api/docs/track2-slack-design-v1.md`：§4a 完整規格（8 輪修訂，"ROUND 8 CLOSURE — IMPLEMENTATION-READY"）——**已 commit 且已 push**，working tree 乾淨
+- wiki 三頁已同步（見上次記錄，內容未變）
 
 ## 錯誤 & 修正
-- 無重大工具/流程錯誤本次 session；委派審查本身抓到大量設計錯誤（見上方關鍵決策），這是預期中的正常審查產出，不是工具問題
-- 8 輪審查中小o 多次指出小c 自己的措辭「講太滿」（如「unforgeable」「never before」「不可能碰撞」），每次都改成跟 §5a 既有措辭一致的誠實版本——提醒未來寫類似規格文件時，優先參考本文件 §5a 已經校準過的措辭風格，不要重新發明可能過度宣稱的說法
+- 這次 session 有一次理解錯誤：Roy 說「新的 OHS governance SDK 轉成 exe」時，我第一次猜成「把 central-governance-api 獨立打包成 standalone exe/Windows Service」，其實 Roy 要的是「比照 agent-canvas-source 現有機制、打包進同一個 Electron 安裝檔」——**教訓**：Roy 給模糊需求時主動猜測方向沒錯，但猜錯後他傾向直接指出具體參照路徑（這次是 `dist-electron`）而非重新描述需求，收到路徑/具體範例時要優先當作最精準的澄清訊號，不要停留在文字描述層面重新詮釋
+- 8 輪委派審查中小o 多次指出小c 自己的措辭「講太滿」（unforgeable/never before/不可能碰撞），每次都改成跟 §5a 既有措辭一致的誠實版本——未來寫類似規格文件優先參考 §5a 已校準的措辭風格
 
 ## 下次繼續
-1. **優先確認**：Roy 是否要 commit `track2-slack-design-v1.md` 今日的變更（尚未詢問到答案就存了這次 session）——下次對話開始應主動問，不要預設
-2. commit 後（若 Roy同意），比照過去節奏「先本機 commit，一段落再 push」，push 前需再次確認
-3. Track 2 §0-§8 全部設計完成，下一步理論上是實作（§5a、§4a 都已 implementation-ready）——但 Roy 尚未明確表態下一步要不要開始實作、還是先做其他事，不要自行假設開始寫 code
-4. 這是本專案繼 §5a（18輪）後第二個走完完整委派審查收斂流程的章節，8 輪明顯比 18 輪少——如果未來還有類似需要從零設計的章節，可以參考這次的效率（一開始就重用 §5a 已驗證的 lock/durable-intent 機制，不要重新從零摸索 fencing primitive）
+1. **打包待辦評估**（新增，優先度看 Roy 何時想推進）：盤點 `central-governance-api` 的執行方式（`uv run central-governance-api`，常駐服務+PostgreSQL）跟 `agent-canvas-source` 現有 `extraResources` 打包模式（唯讀 SDK 程式碼）的差異，設計實際打包方案（可能需要額外處理常駐服務啟動/資料庫依賴，不能原封不動套用現有機制）
+2. Track 2 §0-§8 全部設計完成、§5a／§4a 皆 implementation-ready，下一步理論上是實作——但 Roy 尚未明確表態何時開始，不要自行假設開始寫 code
+3. 本專案至今兩個走完完整委派審查收斂流程的章節：§5a（18輪）、§4a（8輪，這次）——§4a 較快是因為一開始就重用 §5a 已驗證的 lock/durable-intent 機制，未來類似情境可參考此效率模式

@@ -145,7 +145,23 @@ def main() -> None:
     placeholder), so importing this module for ``create_app`` alone (e.g.
     from tests, with their own explicit ``Settings``) must not require
     those env vars to be set.
+
+    Host/port default to the values every existing deployment already
+    assumes (127.0.0.1:8899); ``CGA_HOST``/``CGA_PORT`` let an embedding
+    process (e.g. the Agent Canvas desktop app, which already reserves
+    8899 for its local LLM toolcall proxy) run this on a different port
+    without a code change.
     """
+    import os
+
     import uvicorn
 
-    uvicorn.run(create_app(), host="127.0.0.1", port=8899)
+    host = os.environ.get("CGA_HOST", "127.0.0.1")
+    port_raw = os.environ.get("CGA_PORT", "8899")
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"CGA_PORT={port_raw!r} is not a valid integer port number."
+        ) from exc
+    uvicorn.run(create_app(), host=host, port=port)
