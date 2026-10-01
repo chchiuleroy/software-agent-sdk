@@ -575,9 +575,60 @@ def load_config(config_path: Path | None = None) -> Config:
     else:
         data = merge(file_data, env_data)
 
-    if not data:
-        return Config()
-    return Config.model_validate(data)
+    config = Config.model_validate(data) if data else Config()
+    validate_team_mode_config(config)
+    return config
+
+
+# Config fields team mode cannot work without (env var name = OH_ + upper-cased field).
+# ``governance_origin_device_id`` is deliberately not here: unset falls back to
+# a fixed placeholder id and still works (see conversation_service).
+_TEAM_MODE_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
+    "governance_bridge_token",
+    "governance_central_api_base_url",
+    "governance_central_api_token_url",
+    "governance_client_id",
+    "governance_client_secret",
+)
+
+
+def validate_team_mode_config(config: Config) -> None:
+    """Refuse to start a half-configured team-mode server.
+
+    With ``governance_deployment_mode == "team"`` and any connection field
+    unset, ``_governance_client_from_config`` returns ``None`` and
+    ``EventService._create_governance_approval`` only logs an error and returns:
+    no central approval is ever created, while accept is refused without the
+    bridge token, so the action hangs in WAITING_FOR_CONFIRMATION with no
+    explanation in the GUI. Failing at startup with the missing variable names
+    turns that silent hang into an obvious error.
+
+    Called from the two real startup paths — ``load_config`` and
+    ``init_router._build_initialized_config`` (deferred init merges via
+    ``model_copy``, which skips ``load_config``). ``Config(...)`` built
+    directly, as the fail-closed REST tests do, stays permissive.
+    """
+    if config.governance_deployment_mode != "team":
+        return
+    missing = [
+        f"{ENVIRONMENT_VARIABLE_PREFIX}_{name.upper()}"
+        for name in _TEAM_MODE_REQUIRED_FIELDS
+        if not getattr(config, name)
+    ]
+    if missing:
+        raise ValueError(
+            "governance_deployment_mode is 'team' but required setting(s) are "
+            f"missing: {', '.join(missing)}. Set them as environment variables "
+            "(or in the config file), or use governance_deployment_mode "
+            "'personal'."
+        )
+    if not config.governance_origin_device_id:
+        logging.getLogger(__name__).warning(
+            "governance_deployment_mode is 'team' but %s_GOVERNANCE_ORIGIN_"
+            "DEVICE_ID is unset; central approvals will report the "
+            "placeholder device id 'unset-device-id'.",
+            ENVIRONMENT_VARIABLE_PREFIX,
+        )
 
 
 def get_default_config() -> Config:

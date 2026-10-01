@@ -27,6 +27,7 @@ from openhands.agent_server.config import (
     TelemetrySpec,
     WebhookSpec,
     reject_blank_secret,
+    validate_team_mode_config,
 )
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.server_details_router import mark_initialization_complete
@@ -224,7 +225,12 @@ def _build_initialized_config(base: Config, req: InitRequest) -> Config:
         updates["governance_deployment_mode"] = req.governance_deployment_mode
     if req.governance_bridge_token is not None:
         updates["governance_bridge_token"] = req.governance_bridge_token
-    return base.model_copy(update=updates)
+    merged = base.model_copy(update=updates)
+    # model_copy skips load_config(), so a dormant 'personal' base plus an
+    # InitRequest that flips the mode to 'team' would otherwise start with no
+    # GovernanceClient (the silent hang validate_team_mode_config prevents).
+    validate_team_mode_config(merged)
+    return merged
 
 
 class InitService:

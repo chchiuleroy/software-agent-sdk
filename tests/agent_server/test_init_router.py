@@ -53,6 +53,19 @@ def _reset_bash_singleton():
     bash_mod._bash_event_service = None
 
 
+def _central_api_fields() -> dict:
+    """The central-API connection fields a warm-pool base config carries.
+
+    They are deliberately not part of InitRequest, so a 'team' init is only
+    valid when the dormant base already has them."""
+    return {
+        "governance_central_api_base_url": "https://central.example",
+        "governance_central_api_token_url": "https://idp.example/token",
+        "governance_client_id": "agent-server",
+        "governance_client_secret": SecretStr("s3cr3t"),
+    }
+
+
 class TestConfigDefaults:
     def test_deferred_init_defaults_false(self):
         assert Config().deferred_init is False
@@ -113,7 +126,7 @@ class TestBuildInitializedConfig:
         InitRequest.env cannot do this, because the dormant Config this
         merges against was already built from the process environment
         before this request ever arrives."""
-        base = Config(deferred_init=True)
+        base = Config(deferred_init=True, **_central_api_fields())
         assert base.governance_deployment_mode == "personal"
         assert base.governance_bridge_token is None
 
@@ -147,12 +160,55 @@ class TestBuildInitializedConfig:
             deferred_init=True,
             governance_deployment_mode="team",
             governance_bridge_token=SecretStr("booted-with-this"),
+            **_central_api_fields(),
         )
         merged = _build_initialized_config(base, InitRequest(session_api_keys=["k1"]))
 
         assert merged.governance_deployment_mode == "team"
         assert merged.governance_bridge_token is not None
         assert merged.governance_bridge_token.get_secret_value() == "booted-with-this"
+
+    def test_team_init_without_central_api_fields_is_refused(self):
+        """Why: model_copy skips load_config(), so without this check a
+        dormant 'personal' base (no central-API settings) plus an InitRequest
+        that flips the mode to 'team' with only a bridge token initializes
+        fine but gets governance_client=None — central approvals are never
+        created and actions hang in WAITING_FOR_CONFIRMATION."""
+        base = Config(deferred_init=True)
+
+        with pytest.raises(ValueError) as exc:
+            _build_initialized_config(
+                base,
+                InitRequest(
+                    governance_deployment_mode="team",
+                    governance_bridge_token=SecretStr("bridge-secret"),
+                ),
+            )
+
+        message = str(exc.value)
+        # Names exactly what the operator must set, and nothing already set.
+        assert "OH_GOVERNANCE_CENTRAL_API_BASE_URL" in message
+        assert "OH_GOVERNANCE_CLIENT_SECRET" in message
+        assert "OH_GOVERNANCE_BRIDGE_TOKEN" not in message
+        # Never leaks the token value.
+        assert "bridge-secret" not in message
+
+    def test_team_init_without_bridge_token_is_refused(self):
+        """The bridge token may arrive from the base config or the request,
+        but one of them must supply it: accept is refused without it."""
+        base = Config(deferred_init=True, **_central_api_fields())
+
+        with pytest.raises(ValueError, match="OH_GOVERNANCE_BRIDGE_TOKEN"):
+            _build_initialized_config(
+                base, InitRequest(governance_deployment_mode="team")
+            )
+
+    def test_personal_init_needs_no_governance_settings(self):
+        merged = _build_initialized_config(
+            Config(deferred_init=True), InitRequest(session_api_keys=["k1"])
+        )
+
+        assert merged.governance_deployment_mode == "personal"
 
 
 class TestRouterMounting:
@@ -436,6 +492,7 @@ class TestEndToEndOverLifespan:
             deferred_init=True,
             conversations_path=tmp_path / "convs",
             bash_events_dir=tmp_path / "bash",
+            **_central_api_fields(),
         )
         app = create_app(cfg)
         stub_event_service = AsyncMock()
@@ -469,6 +526,38 @@ class TestEndToEndOverLifespan:
                     headers={"X-Governance-Bridge-Token": "s3cr3t"},
                 )
                 assert resp.status_code == 200
+            finally:
+                _reset_conversation_singleton()
+
+    def test_init_team_mode_without_central_api_fields_stays_dormant(self, tmp_path):
+        """Real route: a 'team' init that the dormant base cannot support is
+        refused with the missing variable names, and the server rolls back to
+        dormant so the orchestrator can retry with a correct base/request."""
+        _reset_conversation_singleton()
+        cfg = Config(
+            deferred_init=True,
+            conversations_path=tmp_path / "convs",
+            bash_events_dir=tmp_path / "bash",
+        )
+        app = create_app(cfg)
+        with TestClient(app) as client:
+            try:
+                resp = client.post(
+                    "/api/init",
+                    json={
+                        "conversations_path": str(tmp_path / "u" / "convs"),
+                        "bash_events_dir": str(tmp_path / "u" / "bash"),
+                        "governance_deployment_mode": "team",
+                        "governance_bridge_token": "s3cr3t",
+                    },
+                )
+                assert resp.status_code == 500
+                # The app's global handler masks the 500 body; the operator
+                # reads the cause from the status endpoint instead.
+                status_body = client.get("/api/init").json()
+                assert status_body["state"] == "dormant"
+                assert "OH_GOVERNANCE_CENTRAL_API_BASE_URL" in status_body["error"]
+                assert "s3cr3t" not in status_body["error"]
             finally:
                 _reset_conversation_singleton()
 
@@ -673,6 +762,7 @@ async def test_governance_fields_consistent_across_app_service_and_eventservice(
         governance_central_api_token_url="https://idp.example/token",
         governance_client_id="agent-server",
         governance_client_secret=SecretStr("s3cr3t"),
+        governance_bridge_token=SecretStr("bridge-token"),
         governance_origin_device_id="device-1",
     )
     app = SimpleNamespace(state=SimpleNamespace(config=base))
