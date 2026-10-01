@@ -3222,6 +3222,16 @@ class EventService:
             # resolved by the loop-thread output masking at the end of that
             # step, where a LookupSecret pointing back at this server deadlocks
             # until its timeout. Resolve here, in the worker thread.
+            #
+            # Deliberately NOT under the state lock: arun() holds it across the
+            # LLM await, so taking it here would queue this request behind the
+            # whole step, and resolving while holding it would bring the
+            # self-deadlock back. The registry is re-read after the update, so
+            # this resolves the one output masking will read. A concurrent
+            # registry replacement (activate_credential_binding,
+            # apply_resume_secrets: copy + assign under the lock) can still drop
+            # an update that lands between its copy and its assignment; that
+            # race predates this change and is unchanged by it.
             conversation.state.secret_registry.resolve_pending_sources()
 
         loop = asyncio.get_running_loop()
