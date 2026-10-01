@@ -2211,9 +2211,14 @@ class EventService:
         # per-tool redaction/display projection is not built yet; until it
         # exists, send an explicit placeholder rather than either the raw payload
         # (a leak) or a silently-empty dict (which could be misread as
-        # "this action has no risk-relevant parameters"). `action_summary`
-        # (the LLM's own natural-language description) is still sent
-        # separately and is the current best available display content.
+        # "this action has no risk-relevant parameters").
+        #
+        # `action.summary` is deliberately NOT sent either: it is the LLM's
+        # own unverified claim, or — when the LLM left it empty — the SDK's
+        # auto-generated "{tool_name}: {every raw argument}" fallback, i.e.
+        # exactly the raw payload this comment forbids. Until a real
+        # per-tool projection exists, the tool name is the only display text.
+        action_summary = action.tool_name
         action_payload: dict[str, Any] = {
             "redaction_status": "not_yet_implemented",
             "tool_name": action.tool_name,
@@ -2222,7 +2227,7 @@ class EventService:
             action_type="tool_call",
             tool_name=action.tool_name,
             policy_revision="agent-server-mvp-v1",
-            action_summary=action.summary or action.tool_name,
+            action_summary=action_summary,
             action_payload=action_payload,
             digest_salt=digest_salt,
         )
@@ -2234,7 +2239,7 @@ class EventService:
             tool_name=action.tool_name,
             action_type="tool_call",
             policy_revision="agent-server-mvp-v1",
-            action_summary=action.summary or action.tool_name,
+            action_summary=action_summary,
             action_payload=action_payload,
             digest_salt=digest_salt,
             action_payload_digest=action_payload_digest,

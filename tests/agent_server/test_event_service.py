@@ -3763,20 +3763,23 @@ async def test_event_service_creates_lease_with_custom_ttl(tmp_path: Path) -> No
     assert (tmp_path / stored.id.hex / LEASE_FILE_NAME).exists()
 
 
-def _governance_pending_action(call_id: str = "call_1") -> ActionEvent:
+def _governance_pending_action(
+    call_id: str = "call_1", *, command: str = "ls", summary: str | None = None
+) -> ActionEvent:
     return ActionEvent(
         source="agent",
         thought=[TextContent(text="running a command")],
-        action=TerminalAction(command="ls"),
+        action=TerminalAction(command=command),
         tool_name="terminal",
         tool_call_id=call_id,
         tool_call=MessageToolCall(
             id=call_id,
             name="terminal",
-            arguments='{"command": "ls"}',
+            arguments=json.dumps({"command": command}),
             origin="completion",
         ),
         llm_response_id="response_1",
+        summary=summary,
     )
 
 
@@ -4166,6 +4169,42 @@ class TestEventServiceGovernanceOrchestration:
             "redaction_status": "not_yet_implemented",
             "tool_name": "terminal",
         }
+        await self._drain_wait_for_decision_task(governed_service)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "summary",
+        [
+            # What the SDK auto-generates when the LLM leaves `summary` empty:
+            # the tool name plus ALL raw arguments.
+            "terminal: {\"command\": \"curl -H 'Authorization: Bearer sk-FAKE-1' x\"}",
+            # What an LLM (or an injected prompt) may claim instead.
+            "running unit tests to verify the fix",
+            None,
+        ],
+        ids=["sdk-fallback-with-raw-args", "llm-claim", "no-summary"],
+    )
+    async def test_create_governance_approval_summary_never_carries_raw_args(
+        self, governed_service, summary
+    ):
+        """Why: ActionEvent.summary is either the SDK's auto-generated
+        "{tool}: {every raw argument}" or an unverified LLM claim. Sending
+        it leaked commands/file contents/tokens to central (and let a
+        prompt-injected LLM mislabel a dangerous command), contradicting the
+        "canonical payload never leaves this device" rule. Until a real
+        per-tool projection exists only the tool name is sent."""
+        action = _governance_pending_action(
+            command="curl -H 'Authorization: Bearer sk-FAKE-1' x", summary=summary
+        )
+        fake_client = MagicMock()
+        fake_client.create_approval = AsyncMock(return_value={"id": "approval-123"})
+        governed_service.governance_client = fake_client
+        await governed_service._create_governance_approval(action)
+
+        (body,), _ = fake_client.create_approval.call_args
+        assert body["action_summary"] == "terminal"
+        assert "sk-FAKE-1" not in json.dumps(body)
+        assert "curl" not in json.dumps(body)
         await self._drain_wait_for_decision_task(governed_service)
 
     @pytest.mark.asyncio
