@@ -506,6 +506,43 @@ create→wait（真的卡住，approver 身份 decide 後約 1.5 秒被 NOTIFY �
 **166 個測試全過**（165 + 新增的 packaging 進入點回歸測試），ruff/pyright 皆
 0 issue。commit `5b04b41`，本機未 push。
 
+## 網頁核准收件匣 `GET /inbox`（2026-10-01）
+
+核准者不一定是請求者、也不一定在跑桌面 app，所以做成本服務自己提供的靜態
+頁（同源，不需 CORS）：用 Keycloak 公開 client 以 Authorization Code +
+PKCE（S256）登入，列出 `GET /api/v1/approvals/pending`，按鈕呼叫既有的
+`POST /api/v1/approvals/{id}/decide`（帶 `Idempotency-Key`，同一個點擊的重試
+共用同一把 key）。授權完全在那兩個 API 的 Bearer token；頁面本身是公開靜態內容。
+
+**預設關閉**：設 `CGA_INBOX_OIDC_CLIENT_ID` 才啟用，未設時四條路徑
+（`/inbox`、`/inbox/inbox.js`、`/inbox/inbox.css`、`/inbox/config.json`）一律 404。
+
+Keycloak 側需要：
+- 一個 **public** client（不要 secret），開 Standard flow、PKCE method `S256`；
+- Valid redirect URIs 填 **本服務的 origin + `/inbox`**（例如 `http://localhost:18002/inbox`），
+  Web Origins 填同一個 origin（頁面直接對 token endpoint 發 POST，要 CORS）；
+- token 的 audience 與 roles claim 要和既有 API client 一致；若設了
+  `CGA_OIDC_AZP_ALLOWLIST`，這個 client id 必須在裡面，否則 API 會拒絕這個 token；
+- 核准者帳號要有 `agent.approver` 角色。
+
+安全設計（請求內容是不可信的——指令與摘要由 agent 自己決定）：
+- 內容一律用 `textContent` / `createTextNode` 渲染，不使用任何 HTML 注入 API；
+  `tests/test_inbox.py` 會在腳本出現 `innerHTML`、`eval`、`localStorage` 等字串時失敗；
+- CSP：`default-src 'none'`、script/style 只允許 `'self'`（無 inline）、`connect-src`
+  只允許本服務與 issuer 的 origin、`frame-ancestors 'none'`；另有 `nosniff`、
+  `X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Cache-Control: no-store`；
+- access token 只放在記憶體（不進 localStorage/sessionStorage），重新整理頁面需重新登入；
+  PKCE verifier 與 state 放 sessionStorage，回呼時 state 不符就不處理；
+- agent 自述（`agent_claim`）會標示「未驗證」，不與系統產生的欄位混在一起。
+
+限制：
+- **需要安全環境**（https，或 `http://localhost`）——`crypto.subtle` 在一般 HTTP 的
+  區網 IP 上不可用，頁面會直接說明而不是壞掉；
+- 沒有 refresh token 流程，token 過期要重新登入；
+- 一次最多顯示 `pending` 端點的上限筆數（超出時顯示「僅顯示最舊的」）；
+- 尚未在真實瀏覽器+真實 Keycloak 上跑過完整流程：目前驗證的是 Python 側的標頭/
+  開關測試、Node 單元測試（含 RFC 7636 向量）與突變檢查，**登入往返與決定按鈕沒有端到端驗證**。
+
 ## 開發
 
 ```bash

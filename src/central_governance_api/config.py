@@ -63,6 +63,18 @@ class Settings(BaseSettings):
         "for that known, accepted local-dev configuration, never for a "
         "real deployment.",
     )
+    inbox_oidc_client_id: str | None = Field(
+        default=None,
+        description="Keycloak PUBLIC client id the browser approvals inbox "
+        "(GET /inbox) logs in with (Authorization Code + PKCE). Unset = the "
+        "inbox is disabled and every /inbox route answers 404. The client "
+        "needs: Standard flow with PKCE S256, the exact redirect URI "
+        "<this server's origin>/inbox, and that origin under Web Origins "
+        "(the browser calls the token endpoint). Its tokens must also carry "
+        "this API's audience and the roles claim (the same mappers as the "
+        "service clients), and, if oidc_azp_allowlist is set, its client id "
+        "must be in it.",
+    )
     jwks_cache_ttl_seconds: int = Field(default=300)
     jwks_negative_cache_capacity: int = Field(
         default=256,

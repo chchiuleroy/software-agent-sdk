@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Approvals inbox</title>
+    <link rel="stylesheet" href="/inbox/inbox.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Approvals inbox</h1>
+      <span id="who"></span>
+      <button id="signout" type="button" hidden>Sign out</button>
+    </header>
+    <main>
+      <p id="status" role="status"></p>
+      <div id="login" hidden>
+        <button id="signin" type="button">Sign in</button>
+      </div>
+      <ul id="list" aria-live="polite"></ul>
+    </main>
+    <script type="module" src="/inbox/inbox.js"></script>
+  </body>
+</html>
