@@ -127,6 +127,16 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
 - `GET /api/v1/audit-events`：`governance.admin` 限定，支援
   `event_type`／`approval_request_id` 篩選 + offset/limit 分頁（多取 1
   筆判斷 `next_offset`，不用額外 `COUNT(*)`）
+- `GET /api/v1/approvals/pending`（核准者收件匣，2026-10-01）：限
+  `agent.approver`／`governance.admin`（與 `decide` 同角色，測試鎖定兩者
+  不會飄移）。只列「`pending`、未過 `expires_at`（sweep 尚未翻狀態也算過期）、
+  不是呼叫者自己的請求」的紀錄，最舊（最接近過期）優先，`limit` 1–100
+  （預設 50）加 `has_more`。刻意不做 offset/cursor：核准後該筆就會從清單
+  消失，offset 分頁會漏項，client 核准後重抓即可。回傳 display 半邊
+  （`action_summary`／`action_payload`）與 requester、device、tool 等決策
+  所需欄位，不含 `digest_salt` 與 requester 端記帳欄位。**注意**：目前
+  requester 送來的 display payload 是 placeholder（見 feature-gap #11），
+  收件匣的資訊量受此限制。
 - 兩個小重構（第二輪委派審查前先做，避免新舊兩份重複程式碼各自漂移）：
   `_commit_or_replay()` 從 `routers/approvals.py` 私有函式搬到
   `approvals/idempotency.py` 變成公開的 `commit_or_replay()`（`devices.py`

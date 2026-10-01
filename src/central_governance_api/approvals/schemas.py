@@ -52,6 +52,46 @@ class ApprovalSummary(BaseModel):
     action_payload_digest: str
 
 
+class PendingApprovalItem(BaseModel):
+    """What an approver needs to decide one request — and nothing more.
+
+    Deliberately omitted: ``digest_salt`` (an input to the integrity digest,
+    not something a decider needs), ``tool_call_id``/``action_event_id``/
+    ``policy_revision`` (requester-side bookkeeping), and every execution
+    field (a pending record has none yet).
+
+    ``action_summary``/``action_payload`` are the *display* half of the
+    envelope — the only view of the action this service ever stores (see
+    models.py). Today the requester sends a placeholder there (gap #11), so
+    this endpoint is only as informative as what was submitted.
+    """
+
+    id: uuid.UUID
+    request_id: str
+    requester_issuer: str
+    requester_sub: str
+    origin_device_id: str
+    conversation_id: str
+    action_type: str
+    tool_name: str
+    risk_level: str
+    action_summary: str
+    action_payload: dict[str, Any]
+    action_payload_digest: str
+    created_at: datetime
+    expires_at: datetime
+
+
+class PendingApprovalListResponse(BaseModel):
+    """Oldest first (closest to expiring first). No offset/cursor on purpose:
+    deciding a request removes it from this list, so offset paging would skip
+    items; the client simply re-fetches after acting. ``has_more`` says
+    whether the oldest ``limit`` items were all there was."""
+
+    items: list[PendingApprovalItem]
+    has_more: bool
+
+
 class DecideRequest(RequestModel):
     decision: Literal["accept", "reject"]
 

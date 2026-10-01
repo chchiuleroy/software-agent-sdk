@@ -617,3 +617,136 @@ async def test_cancel_and_pre_claim_abort_leave_distinguishable_audit_rows(
 
     assert [e.event_type for e in cancel_events] == ["approval_cancelled"]
     assert [e.event_type for e in abort_events] == ["approval_pre_claim_abort"]
+
+
+# --- LIST PENDING (approver inbox) ---------------------------------------
+
+
+def _approver(signing_key, sub: str = "carol", roles=("agent.approver",)) -> str:
+    return _sign(signing_key, sub=sub, roles=list(roles))
+
+
+async def _list_pending(client, token: str, **params):
+    return await client.get(
+        "/api/v1/approvals/pending", params=params, headers=_auth(token)
+    )
+
+
+async def test_list_pending_returns_others_requests_with_decision_fields(
+    client, signing_key
+):
+    created = await _create_approval(
+        client,
+        signing_key,
+        sub="alice",
+        action_summary="rm -rf build/",
+        action_payload={"command": "rm -rf build/"},
+        tool_name="bash",
+    )
+
+    resp = await _list_pending(client, _approver(signing_key))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["has_more"] is False
+    [item] = [i for i in body["items"] if i["id"] == created["id"]]
+    assert item["requester_sub"] == "alice"
+    assert item["requester_issuer"] == ISSUER
+    assert item["tool_name"] == "bash"
+    assert item["action_summary"] == "rm -rf build/"
+    assert item["action_payload"] == {"command": "rm -rf build/"}
+    assert item["action_payload_digest"] == created["action_payload_digest"]
+    # Requester-side bookkeeping and the digest salt are not decision input.
+    for hidden in ("digest_salt", "tool_call_id", "action_event_id", "status"):
+        assert hidden not in item
+
+
+async def test_list_pending_excludes_the_callers_own_requests(client, signing_key):
+    # Self-approval is denied for every role, so an inbox that listed the
+    # caller's own request would offer a button that can never work.
+    created = await _create_approval(client, signing_key, sub="alice")
+
+    own_view = await _list_pending(
+        client, _approver(signing_key, sub="alice", roles=("governance.admin",))
+    )
+    other_view = await _list_pending(client, _approver(signing_key, sub="carol"))
+
+    assert created["id"] not in [i["id"] for i in own_view.json()["items"]]
+    assert created["id"] in [i["id"] for i in other_view.json()["items"]]
+
+
+async def test_list_pending_requires_a_decide_role(client, signing_key):
+    await _create_approval(client, signing_key, sub="alice")
+    operator = _sign(signing_key, sub="bob", roles=["agent.operator"])
+
+    assert (await _list_pending(client, operator)).status_code == 403
+    assert (await client.get("/api/v1/approvals/pending")).status_code == 401
+
+
+async def test_list_pending_drops_requests_once_decided(client, signing_key):
+    created = await _create_approval(client, signing_key, sub="alice")
+    token = _approver(signing_key)
+    decide = await client.post(
+        f"/api/v1/approvals/{created['id']}/decide",
+        json={"decision": "accept"},
+        headers=_auth(token, "decide-for-list"),
+    )
+    assert decide.status_code == 200, decide.text
+
+    resp = await _list_pending(client, token)
+
+    assert created["id"] not in [i["id"] for i in resp.json()["items"]]
+
+
+async def test_list_pending_excludes_expired_even_before_the_sweep(
+    client, signing_key, db_session
+):
+    # status is still "pending" here (the expiry sweep has not run) but
+    # decide would already refuse it — see the decide-after-expiry test.
+    created = await _create_approval(client, signing_key, sub="alice")
+    await db_session.execute(
+        update(PendingApprovalRecord)
+        .where(PendingApprovalRecord.id == uuid.UUID(created["id"]))
+        .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    await db_session.flush()
+
+    resp = await _list_pending(client, _approver(signing_key))
+
+    assert created["id"] not in [i["id"] for i in resp.json()["items"]]
+
+
+async def test_list_pending_is_oldest_first_and_reports_has_more(
+    client, signing_key, db_session
+):
+    ids = [
+        (await _create_approval(client, signing_key, sub="alice"))["id"]
+        for _ in range(3)
+    ]
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    # Newest-created gets the oldest timestamp, so a list ordered by
+    # insertion (or by id) cannot pass by accident.
+    for age, approval_id in enumerate(ids):
+        await db_session.execute(
+            update(PendingApprovalRecord)
+            .where(PendingApprovalRecord.id == uuid.UUID(approval_id))
+            .values(created_at=base - timedelta(minutes=age))
+        )
+    await db_session.flush()
+    token = _approver(signing_key)
+
+    first_two = (await _list_pending(client, token, limit=2)).json()
+    all_three = (await _list_pending(client, token, limit=3)).json()
+
+    expected = list(reversed(ids))
+    assert [i["id"] for i in first_two["items"]] == expected[:2]
+    assert first_two["has_more"] is True
+    assert [i["id"] for i in all_three["items"]] == expected
+    assert all_three["has_more"] is False
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+async def test_list_pending_rejects_out_of_range_limit(client, signing_key, limit):
+    resp = await _list_pending(client, _approver(signing_key), limit=limit)
+
+    assert resp.status_code == 422

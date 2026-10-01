@@ -16,6 +16,7 @@ from central_governance_api.approvals.authorize import (
     ApprovalOwnership,
     AuthorizationDeniedError,
     authorize_create,
+    authorize_list_pending,
     authorize_on_record,
 )
 from central_governance_api.auth.oidc import Principal
@@ -384,3 +385,42 @@ def test_concatenated_subject_collision_does_not_confer_ownership():
     with pytest.raises(AuthorizationDeniedError) as exc_info:
         authorize_on_record(colliding, ApprovalAction.CLAIM, record)
     assert "owner" in exc_info.value.reason
+
+
+# --- LIST_PENDING (approver inbox) ----------------------------------------
+
+
+@pytest.mark.parametrize("principal", [APPROVER, ADMIN])
+def test_list_pending_allowed_for_exactly_the_decide_roles(principal):
+    authorize_list_pending(principal)
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [OTHER_OPERATOR, REQUESTER, NO_ROLES],
+    ids=["operator", "plain", "none"],
+)
+def test_list_pending_denied_without_a_decide_role(principal):
+    # Property protected: seeing other people's pending requests (with their
+    # display payload) must never be easier than being able to decide them.
+    with pytest.raises(AuthorizationDeniedError) as exc_info:
+        authorize_list_pending(principal)
+    assert exc_info.value.action is ApprovalAction.LIST_PENDING
+
+
+def test_list_pending_roles_match_decide_roles():
+    # If DECIDE's roles are ever widened or narrowed, this fails and forces a
+    # deliberate decision about the inbox instead of letting them drift.
+    someone_elses = ApprovalOwnership(requester_issuer=ISSUER, requester_sub="zed")
+    for principal in (APPROVER, ADMIN, OTHER_OPERATOR, NO_ROLES):
+        try:
+            authorize_on_record(principal, ApprovalAction.DECIDE, someone_elses)
+            may_decide = True
+        except AuthorizationDeniedError:
+            may_decide = False
+        try:
+            authorize_list_pending(principal)
+            may_list = True
+        except AuthorizationDeniedError:
+            may_list = False
+        assert may_list == may_decide, principal.sub

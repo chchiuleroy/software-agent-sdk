@@ -91,6 +91,7 @@ from central_governance_api.auth.oidc import Principal
 class ApprovalAction(StrEnum):
     CREATE = "create"
     DECIDE = "decide"
+    LIST_PENDING = "list_pending"
     CLAIM = "claim"
     REPORT_RESULT = "report_result"
     CANCEL = "cancel"
@@ -143,6 +144,24 @@ def authorize_create(principal: Principal) -> None:
     raise AuthorizationDeniedError(
         action=ApprovalAction.CREATE,
         reason="requires role governance.admin or agent.operator",
+    )
+
+
+def authorize_list_pending(principal: Principal) -> None:
+    """Listing the approver inbox (other people's pending requests, including
+    the display payload they would be deciding on) is limited to exactly the
+    roles that may DECIDE: the only legitimate reason to see someone else's
+    pending request is to act on it, so this must never be looser than
+    DECIDE. Ownership is not checked here because the list spans many
+    records; the router instead excludes the caller's own requests (which
+    the caller could not decide anyway — self-approval is denied for every
+    role).
+    """
+    if "governance.admin" in principal.roles or "agent.approver" in principal.roles:
+        return
+    raise AuthorizationDeniedError(
+        action=ApprovalAction.LIST_PENDING,
+        reason="requires role governance.admin or agent.approver",
     )
 
 

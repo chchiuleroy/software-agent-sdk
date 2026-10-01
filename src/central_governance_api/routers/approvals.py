@@ -61,13 +61,14 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from central_governance_api.approvals.authorize import (
     ApprovalAction,
     ApprovalOwnership,
     authorize_create,
+    authorize_list_pending,
     authorize_on_record,
 )
 from central_governance_api.approvals.digest import verify_display_digest
@@ -95,6 +96,8 @@ from central_governance_api.approvals.schemas import (
     CreateApprovalRequest,
     DecideRequest,
     DecideResponse,
+    PendingApprovalItem,
+    PendingApprovalListResponse,
     ReconciliationFindingRequest,
     ReconciliationFindingResponse,
     ReportResultRequest,
@@ -256,6 +259,66 @@ async def create_approval(
     if replayed is not None:
         return ApprovalSummary.model_validate(replayed)
     return response
+
+
+# --- LIST PENDING (approver inbox) ---------------------------------------
+
+_PENDING_DEFAULT_LIMIT = 50
+_PENDING_MAX_LIMIT = 100
+
+
+@router.get("/pending", response_model=PendingApprovalListResponse)
+async def list_pending_approvals(
+    limit: int = Query(default=_PENDING_DEFAULT_LIMIT, ge=1, le=_PENDING_MAX_LIMIT),
+    principal: Principal = Depends(get_current_principal),
+    session: AsyncSession = Depends(get_db_session),
+) -> PendingApprovalListResponse:
+    """Requests this principal could decide right now: still ``pending``,
+    not past ``expires_at`` (decide would refuse those even before the expiry
+    sweep flips their status), and not the caller's own (self-approval is
+    denied for every role, so listing them would only offer a button that
+    can never work). Read-only: no idempotency key, nothing written.
+    """
+    authorize_list_pending(principal)
+
+    stmt = (
+        select(PendingApprovalRecord)
+        .where(
+            PendingApprovalRecord.status == ApprovalStatus.PENDING.value,
+            PendingApprovalRecord.expires_at > now_utc(),
+            # (issuer, sub) is the identity key, not either column alone.
+            or_(
+                PendingApprovalRecord.requester_issuer != principal.issuer,
+                PendingApprovalRecord.requester_sub != principal.sub,
+            ),
+        )
+        .order_by(
+            PendingApprovalRecord.created_at.asc(), PendingApprovalRecord.id.asc()
+        )
+        .limit(limit + 1)
+    )
+    rows = list((await session.execute(stmt)).scalars())
+    has_more = len(rows) > limit
+    items = [
+        PendingApprovalItem(
+            id=row.id,
+            request_id=row.request_id,
+            requester_issuer=row.requester_issuer,
+            requester_sub=row.requester_sub,
+            origin_device_id=row.origin_device_id,
+            conversation_id=row.conversation_id,
+            action_type=row.action_type,
+            tool_name=row.tool_name,
+            risk_level=row.risk_level,
+            action_summary=row.action_summary,
+            action_payload=row.action_payload,
+            action_payload_digest=row.action_payload_digest,
+            created_at=row.created_at,
+            expires_at=row.expires_at,
+        )
+        for row in rows[:limit]
+    ]
+    return PendingApprovalListResponse(items=items, has_more=has_more)
 
 
 # --- DECIDE ----------------------------------------------------------------
