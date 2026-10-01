@@ -3213,8 +3213,19 @@ class EventService:
         if CODEX_AUTH_SECRET_NAME in self.credential_bindings:
             secrets = dict(secrets)
             secrets.pop(CODEX_AUTH_SECRET_NAME, None)
+        conversation = self._conversation
+
+        def _update_and_resolve() -> None:
+            conversation.update_secrets(secrets)
+            # arun() only resolves lookups at the start of each iteration, so a
+            # secret added while a step is already in flight would otherwise be
+            # resolved by the loop-thread output masking at the end of that
+            # step, where a LookupSecret pointing back at this server deadlocks
+            # until its timeout. Resolve here, in the worker thread.
+            conversation.state.secret_registry.resolve_pending_sources()
+
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._conversation.update_secrets, secrets)
+        await loop.run_in_executor(None, _update_and_resolve)
 
     async def set_confirmation_policy(self, policy: ConfirmationPolicyBase):
         """Set the confirmation policy for the conversation."""

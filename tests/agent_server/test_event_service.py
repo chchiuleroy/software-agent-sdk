@@ -47,6 +47,7 @@ from openhands.sdk.conversation.impl.local_conversation import (
     ACP_SUPERSEDE_INFLIGHT_PROMPT,
     LocalConversation,
 )
+from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
@@ -64,6 +65,7 @@ from openhands.sdk.io.local import LocalFileStore
 from openhands.sdk.io.memory import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.mcp.config import coerce_mcp_config
+from openhands.sdk.secret import SecretSource
 from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.security.roy_action_binding import (
     ActionBinding,
@@ -6068,3 +6070,47 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service.close()
 
         assert governed_service._wait_for_decision_task is None
+
+
+# Module-level on purpose: a function-local SecretSource subclass auto-registers
+# globally (see tests/sdk/conversation/test_secrets_manager.py).
+_UPDATE_SECRETS_LOOP: list[asyncio.AbstractEventLoop] = []
+_UPDATE_SECRETS_VALUE = "value-served-by-the-loop"
+
+
+class LoopAnsweredSource(SecretSource):
+    """Completes only if the event loop is free to answer, like a LookupSecret
+    whose URL points back at this very server."""
+
+    def get_value(self):
+        answered = threading.Event()
+        _UPDATE_SECRETS_LOOP[0].call_soon_threadsafe(answered.set)
+        if not answered.wait(3.0):
+            raise OSError("ReadTimeout: the loop was blocked while we waited")
+        return _UPDATE_SECRETS_VALUE
+
+
+@pytest.mark.asyncio
+async def test_update_secrets_resolves_new_sources_before_a_loop_thread_mask(
+    event_service,
+):
+    """A secret added while arun() is mid-step must not be first resolved by the
+    loop-thread masking at the end of that step: arun() only pre-resolves at the
+    start of each iteration, so the update itself has to do it, off the loop."""
+    registry = SecretRegistry()
+    conversation = MagicMock()
+    conversation.state.secret_registry = registry
+    conversation.update_secrets.side_effect = registry.update_secrets
+    event_service._conversation = conversation
+    _UPDATE_SECRETS_LOOP[:] = [asyncio.get_running_loop()]
+
+    await asyncio.wait_for(
+        event_service.update_secrets({"TOKEN": LoopAnsweredSource()}), timeout=10
+    )
+
+    assert not registry.has_unresolved_sources()
+    # What the end-of-step masking on the loop thread will now find: nothing to do.
+    assert registry.mask_secrets_in_output(f"leak: {_UPDATE_SECRETS_VALUE}") == (
+        "leak: <secret-hidden>"
+    )
+
