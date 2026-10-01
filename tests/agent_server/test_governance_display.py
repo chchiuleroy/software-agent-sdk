@@ -324,6 +324,69 @@ def test_browser_url_drops_credentials_query_values_and_fragment():
     assert payload["query_keys"] == ["x", "y"]
 
 
+@pytest.mark.parametrize(
+    ("raw", "shown", "keys", "secret"),
+    [
+        # Found by the independent review: without a scheme the raw URL used
+        # to be shown as-is, query values and userinfo included.
+        (
+            "/callback?sid=sessionvalue55&x=1",
+            "/callback",
+            ["sid", "x"],
+            "sessionvalue55",
+        ),
+        (
+            "//user:urlpass77@site.example/a?x=1",
+            "//site.example/a",
+            ["x"],
+            "urlpass77",
+        ),
+        (
+            "site.example/a?sid=sessionvalue55",
+            "site.example/a",
+            ["sid"],
+            "sessionvalue55",
+        ),
+        # Opaque schemes carry their content in the "path": show only its size.
+        ("data:text/plain;base64,c2Vjcg==", "data:[26 chars]", [], "c2Vjcg"),
+        ("javascript:alert('tok123')", "javascript:[15 chars]", [], "tok123"),
+        ("mailto:boss@example.com?subject=pw9", "mailto:[28 chars]", [], "pw9"),
+        ("https://[::1]:8443/a?x=1", "https://[::1]:8443/a", ["x"], None),
+    ],
+    ids=[
+        "relative",
+        "scheme-relative",
+        "bare-host",
+        "data",
+        "javascript",
+        "mailto",
+        "ipv6",
+    ],
+)
+def test_browser_url_never_shows_more_than_host_port_and_path(raw, shown, keys, secret):
+    projection = build_display(
+        _event("browser_navigate", BrowserNavigateAction(url=raw))
+    )
+
+    assert projection.payload["url"] == shown
+    assert projection.payload["query_keys"] == keys
+    if secret:
+        assert secret not in _shown(projection)
+
+
+def test_unparseable_url_shows_nothing_derived_from_it():
+    # An out-of-range port makes urlsplit(...).port raise ValueError.
+    projection = build_display(
+        _event(
+            "browser_navigate",
+            BrowserNavigateAction(url="https://site.example:99999999/a?tok=zz9"),
+        )
+    )
+
+    assert projection.payload["url"] == ""
+    assert "zz9" not in _shown(projection)
+
+
 # --- unknown tools ----------------------------------------------------------
 
 
@@ -357,6 +420,27 @@ def test_sdk_fallback_summary_is_not_shown_as_the_agents_claim():
 
     assert "agent_claim" not in projection.payload
     assert "id_rsa" not in projection.payload.get("agent_claim", {}).get("text", "")
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        'terminal: {"command": "cat ~/.ssh/id_rsa"}',
+        'terminal:{"command": "cat ~/.ssh/id_rsa"}',
+        'terminal: ["cat ~/.ssh/id_rsa"]',
+    ],
+    ids=["sdk-shape", "no-space", "list"],
+)
+def test_any_tool_name_prefixed_summary_is_treated_as_the_fallback(fallback):
+    # The SDK's real fallback is "{tool.name}: {json.dumps(dict)}", but a
+    # summary that merely starts with "<tool>:" is dropped too: it is
+    # untrusted anyway, so being conservative costs nothing.
+    projection = build_display(_terminal("cat ~/.ssh/id_rsa", summary=fallback))
+
+    assert "agent_claim" not in projection.payload
+    assert "id_rsa" not in projection.payload["command_preview"].replace(
+        "cat ~/.ssh/id_rsa", ""
+    )
 
 
 def test_missing_summary_means_no_claim():

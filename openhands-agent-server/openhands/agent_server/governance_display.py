@@ -205,9 +205,23 @@ def _project_browser_navigate(act: Any, red: _Redactions) -> tuple[str, dict[str
     try:
         parts = urlsplit(raw)
         host = parts.hostname or ""
+        if ":" in host:  # IPv6 literal: urlsplit strips the brackets
+            host = f"[{host}]"
         netloc = f"{host}:{parts.port}" if parts.port else host
-        base = f"{parts.scheme}://{netloc}{parts.path}" if parts.scheme else raw
         query_keys = sorted({p.split("=", 1)[0] for p in parts.query.split("&") if p})
+        # Never more than host, port and path — whatever the URL looks like.
+        if parts.netloc:
+            # http://h/p, or scheme-relative //h/p (userinfo dropped either way)
+            base = f"{parts.scheme + ':' if parts.scheme else ''}//{netloc}{parts.path}"
+        elif parts.scheme:
+            # data:, javascript:, mailto:, ...: the content lives in the
+            # "path", so show only how much there is.
+            base = f"{parts.scheme}:[{len(raw) - len(parts.scheme) - 1} chars]"
+            query_keys = []
+        else:
+            # Relative ("/cb?x=1") or a bare host ("site.example/a?x=1"):
+            # urlsplit already split the query off the path.
+            base = parts.path
     except ValueError:
         # Unparseable: show nothing derived from it rather than the raw text.
         base, query_keys = "", []
@@ -252,9 +266,12 @@ _PROJECTORS = {
 
 def _agent_claim(action: ActionEvent, red: _Redactions) -> dict[str, Any] | None:
     summary = action.summary
-    if not summary or summary.startswith(f"{action.tool_name}: {{"):
+    if not summary or summary.startswith(f"{action.tool_name}:"):
         # Absent, or the SDK's auto-generated "{tool}: {raw arguments}"
         # fallback — which is not the agent's claim, just the raw payload.
+        # Any "<tool>:" prefix is dropped (the SDK always emits
+        # "{tool.name}: {json}", but a claim is untrusted anyway, so being
+        # conservative costs nothing).
         return None
     text, _ = _clip(_one_line(red.text(summary)), MAX_CLAIM_CHARS)
     return {"text": text, "trusted": False}
