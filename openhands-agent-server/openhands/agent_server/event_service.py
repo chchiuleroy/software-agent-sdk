@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -23,6 +23,7 @@ from openhands.agent_server.governance_client import (
     GovernancePermanentError,
     compute_display_digest,
 )
+from openhands.agent_server.governance_display import POLICY_REVISION, build_display
 from openhands.agent_server.governance_outbox import (
     RETRIABLE_STATES,
     TERMINAL_STATES,
@@ -2203,30 +2204,21 @@ class EventService:
             return
         conversation_id = str(self.stored.id)
         digest_salt = uuid4().hex
-        # Deliberately NOT action.action.model_dump(...): that is the raw
-        # canonical tool call (may contain shell commands, file contents,
-        # URLs, tokens) and roy_action_binding.py's own ActionBinding
-        # docstring documents that canonical payloads never leave this
-        # device — central only ever sees redacted display fields. A real
-        # per-tool redaction/display projection is not built yet; until it
-        # exists, send an explicit placeholder rather than either the raw payload
-        # (a leak) or a silently-empty dict (which could be misread as
-        # "this action has no risk-relevant parameters").
-        #
-        # `action.summary` is deliberately NOT sent either: it is the LLM's
-        # own unverified claim, or — when the LLM left it empty — the SDK's
-        # auto-generated "{tool_name}: {every raw argument}" fallback, i.e.
-        # exactly the raw payload this comment forbids. Until a real
-        # per-tool projection exists, the tool name is the only display text.
-        action_summary = action.tool_name
-        action_payload: dict[str, Any] = {
-            "redaction_status": "not_yet_implemented",
-            "tool_name": action.tool_name,
-        }
+        # Deliberately NOT action.action.model_dump(...) and NOT
+        # action.summary: the first is the raw canonical tool call (may
+        # contain shell commands, file contents, URLs, tokens) and
+        # roy_action_binding.py's own ActionBinding docstring documents that
+        # canonical payloads never leave this device; the second is the LLM's
+        # unverified claim or, when empty, the SDK's auto-generated
+        # "{tool_name}: {every raw argument}". Central only ever sees this
+        # deterministic, bounded, redacted projection (governance_display.py).
+        display = build_display(action)
+        action_summary = display.summary
+        action_payload = display.payload
         action_payload_digest = compute_display_digest(
             action_type="tool_call",
             tool_name=action.tool_name,
-            policy_revision="agent-server-mvp-v1",
+            policy_revision=POLICY_REVISION,
             action_summary=action_summary,
             action_payload=action_payload,
             digest_salt=digest_salt,
@@ -2238,7 +2230,7 @@ class EventService:
             tool_call_id=action.tool_call_id,
             tool_name=action.tool_name,
             action_type="tool_call",
-            policy_revision="agent-server-mvp-v1",
+            policy_revision=POLICY_REVISION,
             action_summary=action_summary,
             action_payload=action_payload,
             digest_salt=digest_salt,

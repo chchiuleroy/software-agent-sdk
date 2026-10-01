@@ -24,7 +24,11 @@ from openhands.agent_server.event_service import (
     _GovernanceHandshake,
     _with_pending_report_outcome,
 )
-from openhands.agent_server.governance_client import GovernancePermanentError
+from openhands.agent_server.governance_client import (
+    GovernancePermanentError,
+    compute_display_digest,
+)
+from openhands.agent_server.governance_display import POLICY_REVISION, build_display
 from openhands.agent_server.governance_outbox import OutboxRecord, OutboxState
 from openhands.agent_server.models import (
     ConfirmationResponseRequest,
@@ -4151,24 +4155,35 @@ class TestEventServiceGovernanceOrchestration:
         self, governed_service
     ):
         """The canonical tool-call payload (may contain shell commands,
-        file contents, secrets) must never leave this device — only a
-        redaction placeholder + the LLM's own natural-language summary are
-        sent as action_payload/action_summary. execution_commitment is
+        file contents, secrets) must never leave this device — central
+        receives exactly the bounded, redacted projection from
+        governance_display, never the whole command. execution_commitment is
         exempt: it's a local-only SHA-256, never transmitted in cleartext
         form."""
-        action = _governance_pending_action()  # TerminalAction(command="ls")
+        command = "echo " + "A" * 1000
+        action = _governance_pending_action(command=command)
         fake_client = MagicMock()
         fake_client.create_approval = AsyncMock(return_value={"id": "approval-123"})
         governed_service.governance_client = fake_client
         await governed_service._create_governance_approval(action)
 
         (body,), kwargs = fake_client.create_approval.call_args
-        assert "ls" not in str(body["action_payload"])
-        assert "command" not in body["action_payload"]
-        assert body["action_payload"] == {
-            "redaction_status": "not_yet_implemented",
-            "tool_name": "terminal",
-        }
+        projection = build_display(action)
+        assert body["action_summary"] == projection.summary
+        assert body["action_payload"] == projection.payload
+        assert body["policy_revision"] == POLICY_REVISION
+        assert command not in json.dumps(body)
+        assert body["action_payload"]["truncated"] is True
+        # Central re-verifies this digest from the fields it receives; they
+        # must reproduce it exactly.
+        assert body["action_payload_digest"] == compute_display_digest(
+            action_type=body["action_type"],
+            tool_name=body["tool_name"],
+            policy_revision=body["policy_revision"],
+            action_summary=body["action_summary"],
+            action_payload=body["action_payload"],
+            digest_salt=body["digest_salt"],
+        )
         await self._drain_wait_for_decision_task(governed_service)
 
     @pytest.mark.asyncio
@@ -4189,10 +4204,11 @@ class TestEventServiceGovernanceOrchestration:
     ):
         """Why: ActionEvent.summary is either the SDK's auto-generated
         "{tool}: {every raw argument}" or an unverified LLM claim. Sending
-        it leaked commands/file contents/tokens to central (and let a
-        prompt-injected LLM mislabel a dangerous command), contradicting the
-        "canonical payload never leaves this device" rule. Until a real
-        per-tool projection exists only the tool name is sent."""
+        it as the summary leaked commands/file contents/tokens to central (and
+        let a prompt-injected LLM mislabel a dangerous command). The summary
+        central shows is now built from the action itself; the LLM's text only
+        survives as a redacted claim explicitly marked untrusted, and the SDK
+        fallback is dropped."""
         action = _governance_pending_action(
             command="curl -H 'Authorization: Bearer sk-FAKE-1' x", summary=summary
         )
@@ -4202,9 +4218,15 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service._create_governance_approval(action)
 
         (body,), _ = fake_client.create_approval.call_args
-        assert body["action_summary"] == "terminal"
         assert "sk-FAKE-1" not in json.dumps(body)
-        assert "curl" not in json.dumps(body)
+        # Derived from the real command, not from the LLM's words.
+        assert body["action_summary"].startswith("terminal: curl")
+        assert "unit tests" not in body["action_summary"]
+        claim = body["action_payload"].get("agent_claim")
+        if summary == "running unit tests to verify the fix":
+            assert claim == {"text": summary, "trusted": False}
+        else:
+            assert claim is None
         await self._drain_wait_for_decision_task(governed_service)
 
     @pytest.mark.asyncio
