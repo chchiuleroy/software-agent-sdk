@@ -331,3 +331,85 @@ def test_compute_display_digest_matches_known_vector():
         digest_salt=None,
     )
     assert digest == "829d1940a8b171535575c5a76aff4bbee75570948c6c4e7851844b50d97759bf"
+
+
+# --- check_health: backs GET /api/governance/status -------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_health_reachable_with_valid_credentials():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://central.example/healthz":
+            return httpx.Response(200, json={"status": "ok"})
+        return _token_response(request)
+
+    client = _make_client(handler)
+
+    assert await client.check_health() == {
+        "reachable": True,
+        "credentials_ok": True,
+        "error": None,
+    }
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_check_health_unreachable_central_api():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    client = _make_client(handler)
+    result = await client.check_health()
+
+    # Why this matters: this is the "central API died, GUI silently keeps
+    # working in a mode that can never get an approval" case.
+    assert result["reachable"] is False
+    assert result["credentials_ok"] is None
+    assert "ConnectError" in result["error"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_check_health_non_success_healthz_is_unreachable():
+    client = _make_client(lambda request: httpx.Response(503))
+    result = await client.check_health()
+
+    assert result["reachable"] is False
+    assert "503" in result["error"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_check_health_rejected_credentials_reports_status_not_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://central.example/healthz":
+            return httpx.Response(200)
+        return httpx.Response(401, text="invalid_client: secret 'secret' is wrong")
+
+    client = _make_client(handler)
+    result = await client.check_health()
+
+    assert result["reachable"] is True
+    assert result["credentials_ok"] is False
+    assert "401" in result["error"]
+    # The IdP's response body (which can echo credentials) must never reach
+    # the GUI-visible status.
+    assert "invalid_client" not in result["error"]
+    assert "secret" not in result["error"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_check_health_token_endpoint_unreachable():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://central.example/healthz":
+            return httpx.Response(200)
+        raise httpx.ConnectError("idp down")
+
+    client = _make_client(handler)
+    result = await client.check_health()
+
+    assert result["reachable"] is True
+    assert result["credentials_ok"] is False
+    assert "token endpoint unreachable" in result["error"]
+    await client.aclose()

@@ -592,6 +592,19 @@ _TEAM_MODE_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
 )
 
 
+def missing_team_mode_settings(config: Config) -> list[str]:
+    """Env var names of the team-mode required settings that are unset.
+
+    Independent of ``governance_deployment_mode`` (callers decide whether the
+    answer matters); shared by startup validation and the status endpoint so
+    there is one required-field list."""
+    return [
+        f"{ENVIRONMENT_VARIABLE_PREFIX}_{name.upper()}"
+        for name in _TEAM_MODE_REQUIRED_FIELDS
+        if not getattr(config, name)
+    ]
+
+
 def validate_team_mode_config(config: Config) -> None:
     """Refuse to start a half-configured team-mode server.
 
@@ -610,11 +623,7 @@ def validate_team_mode_config(config: Config) -> None:
     """
     if config.governance_deployment_mode != "team":
         return
-    missing = [
-        f"{ENVIRONMENT_VARIABLE_PREFIX}_{name.upper()}"
-        for name in _TEAM_MODE_REQUIRED_FIELDS
-        if not getattr(config, name)
-    ]
+    missing = missing_team_mode_settings(config)
     if missing:
         raise ValueError(
             "governance_deployment_mode is 'team' but required setting(s) are "

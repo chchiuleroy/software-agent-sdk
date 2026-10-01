@@ -47,6 +47,7 @@ from openhands.agent_server.event_service import (
 )
 from openhands.agent_server.file_router import file_router
 from openhands.agent_server.git_router import git_router
+from openhands.agent_server.governance_router import governance_router
 from openhands.agent_server.hooks_router import hooks_router
 from openhands.agent_server.init_router import (
     InitService,
@@ -435,6 +436,7 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(tool_router)
     api_router.include_router(bash_router)
     api_router.include_router(git_router)
+    api_router.include_router(governance_router)
     api_router.include_router(file_router)
     api_router.include_router(vscode_router)
     api_router.include_router(desktop_router)

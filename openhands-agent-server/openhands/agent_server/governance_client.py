@@ -198,6 +198,44 @@ class GovernanceClient:
         if self._owns_http_client:
             await self._http.aclose()
 
+    async def check_health(self) -> dict[str, Any]:
+        """Probe central-governance-api for the status endpoint; never raises.
+
+        Two independent facts: is the API reachable (unauthenticated
+        ``/healthz``), and do the configured client credentials still get a
+        token from the IdP. ``error`` carries only an exception class name or
+        an HTTP status code — never a response body or a credential, since
+        the result is shown in the GUI.
+        """
+        try:
+            response = await self._http.get(f"{self._base_url}/healthz")
+        except httpx.HTTPError as exc:
+            return {
+                "reachable": False,
+                "credentials_ok": None,
+                "error": f"central API unreachable ({type(exc).__name__})",
+            }
+        if not response.is_success:
+            return {
+                "reachable": False,
+                "credentials_ok": None,
+                "error": f"central API /healthz returned HTTP {response.status_code}",
+            }
+        try:
+            await self._access_token()
+        except GovernanceApiError as exc:
+            reason = (
+                f"HTTP {exc.status_code}"
+                if exc.status_code is not None
+                else "token endpoint unreachable"
+            )
+            return {
+                "reachable": True,
+                "credentials_ok": False,
+                "error": f"token request failed ({reason})",
+            }
+        return {"reachable": True, "credentials_ok": True, "error": None}
+
     async def _access_token(self) -> str:
         # 30s safety margin so a token doesn't expire mid-request.
         if (
