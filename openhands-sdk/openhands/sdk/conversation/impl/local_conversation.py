@@ -2334,6 +2334,15 @@ class LocalConversation(BaseConversation):
                 logger.debug(f"Conversation arun iteration {iteration}")
                 acp_step_user_message_id: str | None = None
                 acp_step_user_message: MessageEvent | None = None
+                # Resolve secret lookups in a worker thread, before taking the
+                # state lock and before astep() masks output on this thread:
+                # a LookupSecret is answered by this same server, so resolving
+                # it on the event loop deadlocks until its 30s timeout (see
+                # SecretRegistry.mask_secrets_in_output). No thread hop once
+                # every source is resolved or backing off.
+                secret_registry = self._state.secret_registry
+                if secret_registry.has_unresolved_sources():
+                    await asyncio.to_thread(secret_registry.resolve_pending_sources)
                 with self._state:
                     if self._state.execution_status in [
                         ConversationExecutionStatus.PAUSED,

@@ -140,6 +140,39 @@ class SecretRegistry(OpenHandsModel):
                 env_vars[name] = value
         return env_vars
 
+    def _is_pending(self, key: str, now: float) -> bool:
+        """Whether ``key`` still has to be resolved (not cached, not backing off)."""
+        if key in self._exported_values:
+            return False
+        failed_at = self._failed_lookups.get(key)
+        return failed_at is None or now - failed_at >= FAILED_LOOKUP_RETRY_SECONDS
+
+    def has_unresolved_sources(self) -> bool:
+        """Cheap check: would :meth:`resolve_pending_sources` do any lookup?
+
+        A source in its failure back-off window does not count, so callers can
+        use this to decide whether a worker-thread hop is worthwhile.
+        """
+        now = time.monotonic()
+        return any(self._is_pending(key, now) for key in list(self.secret_sources))
+
+    def resolve_pending_sources(self) -> None:
+        """Resolve every source that has no cached value, backing off on failure.
+
+        ``get_value()`` may do blocking network I/O, and a ``LookupSecret`` is
+        answered by the agent-server this code runs inside, so on the event-loop
+        thread it deadlocks until its timeout. Call this from a worker thread
+        there (``arun()`` does, via ``asyncio.to_thread``). Resolved values are
+        tracked for output masking; a source that fails is not retried until
+        ``FAILED_LOOKUP_RETRY_SECONDS`` have passed.
+        """
+        now = time.monotonic()
+        for key in list(self.secret_sources):
+            if not self._is_pending(key, now):
+                continue
+            if not self.get_secret_value(key):
+                self._failed_lookups[key] = now
+
     def mask_secrets_in_output(self, text: str) -> str:
         """Mask secret values in the given text.
 
@@ -159,15 +192,9 @@ class SecretRegistry(OpenHandsModel):
 
         # Resolve uncached sources, backing off on failure: get_value() may do
         # blocking network I/O and masking runs per output and per ACP chunk.
-        now = time.monotonic()
-        for key in list(self.secret_sources):
-            if key in self._exported_values:
-                continue
-            failed_at = self._failed_lookups.get(key)
-            if failed_at is not None and now - failed_at < FAILED_LOOKUP_RETRY_SECONDS:
-                continue
-            if not self.get_secret_value(key):
-                self._failed_lookups[key] = now
+        # ``arun()`` resolves them in a worker thread before each step, so
+        # on the event loop this finds nothing left to do (see there).
+        self.resolve_pending_sources()
 
         masked_text = text
         with self._exported_values_lock:
