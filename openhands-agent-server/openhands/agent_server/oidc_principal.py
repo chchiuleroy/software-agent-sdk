@@ -10,6 +10,17 @@ running application requires mode-specific composition (separate router/
 dependency assembly for ``personal`` vs ``team``), not a drop-in
 replacement of a single dependency. That wiring is scoped to later phases.
 
+Status note (2026-10-02, identity model B): the agent-server deliberately
+does NOT authenticate humans itself. Under ``team`` mode this process
+acts as one *device* identity (its own ``governance_client_id`` /
+``client_credentials`` token, see ``governance_client.py``) when it talks to
+central-governance-api, and the human approver is verified there, at
+decision time, from their OIDC token (recorded as the decision actor).
+So nothing in the request path calls this resolver, by design. It is kept
+as the building block for the alternative "per-user token reaches the
+agent-server" model (GUI login), which would wire it at the single
+``check_session_api_key`` dependency; that model is not implemented.
+
 Verification follows the same JWKS + joserfc pattern already used by
 ``openhands.sdk.llm.auth.openai`` for OpenAI's subscription OAuth flow
 (JWKS caching, ``jwt.decode`` + ``JWTClaimsRegistry``), generalized to an

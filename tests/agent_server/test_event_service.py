@@ -1561,6 +1561,39 @@ class TestEventServiceRespondToConfirmation:
         event_service.run.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_respond_to_confirmation_team_mode_ignores_client_approver_identity(
+        self, event_service
+    ):
+        """Identity model B (2026-10-02): under team mode the *only* approver
+        identity that counts is the one central-governance-api verified from
+        the approver's OIDC token when they decided the request (recorded as
+        its ``decision_actor``). A caller-supplied ``approver_identity`` is
+        self-reported and must never reach the local self-approval path, so a
+        client cannot use it to claim (or to dodge) a self-approval check.
+        Pinning this keeps ``approver_identity`` from being mistaken for an
+        authorization boundary by a future change."""
+        event_service.governance_deployment_mode = "team"
+        event_service._conversation = MagicMock()
+        event_service.run = AsyncMock()
+        event_service.run_and_wait_for_start = AsyncMock(
+            return_value=GovernanceStartOutcome.STARTED
+        )
+
+        request = ConfirmationResponseRequest(
+            accept=True,
+            central_approval_id="approval-1",
+            approver_identity="someone-claimed-by-the-client",
+        )
+        await event_service.respond_to_confirmation(request)
+
+        event_service.run_and_wait_for_start.assert_awaited_once_with(
+            central_approval_id="approval-1"
+        )
+        # The plain path is the only one that forwards approver_identity; it
+        # must not run at all in team mode.
+        event_service.run.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_respond_to_confirmation_raises_on_pending_unknown_outcome(
         self, event_service
     ):
