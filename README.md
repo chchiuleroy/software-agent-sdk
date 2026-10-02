@@ -543,6 +543,37 @@ Keycloak 側需要：
 - 尚未在真實瀏覽器+真實 Keycloak 上跑過完整流程：目前驗證的是 Python 側的標頭/
   開關測試、Node 單元測試（含 RFC 7636 向量）與突變檢查，**登入往返與決定按鈕沒有端到端驗證**。
 
+## 裝置綁定 `CGA_DEVICE_BINDING_ENFORCED`（2026-10-02，gap #6）
+
+身份模型 B（2026-10-02 定案）下，每台桌面的 agent-server 是一個**裝置身份**
+（自己的 Keycloak service account、client_credentials），人的身份只在核准時由
+本服務從 OIDC token 驗證。裝置綁定讓這個「裝置身份」有意義：
+
+**預設關閉**（`false`，行為與以前完全相同，`origin_device_id` 是未驗證字串）。
+設 `CGA_DEVICE_BINDING_ENFORCED=true` 後：
+- `POST /api/v1/approvals`（建立）與 `POST /api/v1/approvals/{id}/claim`（認領）
+  要求 `origin_device_id` 是**呼叫者本人**註冊、且**未撤銷**的裝置，否則 403
+  `device_not_bound`（「從沒註冊」「別人註冊的」「已撤銷」三種情況回應相同，
+  不洩漏別的主體有哪些 device id）；
+- claim 也檢查（不只建立時）：裝置可能在請求等待決定的期間被撤銷，而 claim 才是
+  讓動作真正執行的那一步；被拒絕時紀錄維持 `accepted`、不改狀態；
+- 因此撤銷裝置真的會生效，裝置清冊不再只是紀錄。
+
+**這仍然不是密碼學的裝置證明**：持有某個主體憑證的人可以使用該主體註冊過的任何
+device id。它防的是「亂填 device id」與「已撤銷的裝置繼續用」。
+
+開啟前要做（否則 agent-server 的每個請求都會 403）：
+1. 用該 agent-server 的 service account token 呼叫
+   `POST /api/v1/devices/register`，`device_id` 填它的
+   `governance_origin_device_id`（需 `Idempotency-Key` 標頭）；
+2. 確認 agent-server 的 `governance_origin_device_id` 不是預設的佔位值
+   `unset-device-id`。
+
+測試：`tests/test_device_binding.py` 6 個（預設關閉、未註冊 403 且不寫列、本人註冊
+成功、別人的註冊不算、撤銷後不能建立、撤銷後 claim 被拒且維持 accepted），已用突變
+檢查（拿掉擁有者條件／未撤銷條件／claim 檢查／create 檢查／預設值改 true）逐一驗證
+會失敗。**尚未在真實 Keycloak＋真實 agent-server 上端到端驗證。**
+
 ## 開發
 
 ```bash

@@ -90,6 +90,20 @@ class Settings(BaseSettings):
 
     # --- Device inventory (v10/v11: explicitly NOT a security control) ---
     device_denylist_enabled: bool = Field(default=True)
+    device_binding_enforced: bool = Field(
+        default=False,
+        description="When True, CREATE and CLAIM on an approval require "
+        "origin_device_id to be an ACTIVE (not revoked) device registered by "
+        "the calling principal itself (POST /api/v1/devices/register with "
+        "the same token); otherwise 403 device_not_bound. This is what makes "
+        "revoking a device actually stop it: a revoked device can no longer "
+        "create or claim approvals. It is still NOT a cryptographic device "
+        "proof — whoever holds the principal's credentials can use any of "
+        "that principal's registered device ids. Default False keeps today's "
+        "behavior (origin_device_id is an unverified string), so turning it "
+        "on requires each agent-server's service account to register its "
+        "governance_origin_device_id first.",
+    )
     device_registration_quota: int = Field(
         default=20,
         gt=0,

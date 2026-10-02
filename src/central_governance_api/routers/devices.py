@@ -5,7 +5,11 @@ security control (see `models.py`'s docstrings on both tables) — this
 inventory doesn't itself make claim/report-result "device-bound"; it's a
 registration hint an admin can audit, and a place to remember that a
 given (owner, device_id) pair was deliberately revoked so it can't
-silently come back.
+silently come back. By default nothing consults it when an approval is
+created or claimed; ``config.device_binding_enforced`` (2026-10-02, off by
+default) makes :func:`ensure_device_bound` do exactly that, so a revoked or
+never-registered device id is refused — still a registration check, not a
+cryptographic device proof.
 
 Schemas and error types live directly in this file rather than in a
 `devices/` subpackage mirroring `approvals/` — two endpoints and six
@@ -165,6 +169,25 @@ class DeviceQuotaExceededError(Exception):
         super().__init__(f"device registration quota ({quota}) exceeded")
 
 
+class DeviceNotBoundError(Exception):
+    """CREATE/CLAIM of an *approval* only (raised by
+    :func:`ensure_device_bound`, not by any ``/devices`` endpoint): with
+    ``config.device_binding_enforced`` on, the approval's
+    ``origin_device_id`` is not an active registration owned by the
+    calling principal. Covers "never registered", "registered by a
+    different principal", and "registered but revoked" identically on
+    purpose, so the response doesn't tell a caller which of another
+    principal's device ids exist. Maps to HTTP 403.
+    """
+
+    def __init__(self, *, device_id: str) -> None:
+        self.device_id = device_id
+        super().__init__(
+            f"device_id {device_id!r} is not an active registered device of "
+            "the calling principal"
+        )
+
+
 class DeviceAlreadyRevokedError(Exception):
     """REVOKE only: the conditional UPDATE's ``WHERE revoked_at IS NULL``
     affected zero rows — same "request doesn't match current resource
@@ -197,6 +220,47 @@ class DeviceRevokeResponse(BaseModel):
     device_id: str
     revoked_at: datetime
     revoked_by_subject: str
+
+
+# --- Device binding (used by the approvals router) ---------------------------
+
+
+async def ensure_device_bound(
+    session: AsyncSession,
+    principal: Principal,
+    device_id: str,
+    *,
+    enforced: bool,
+) -> None:
+    """Refuse an approval CREATE/CLAIM whose ``origin_device_id`` is not an
+    active registration of *this* principal — when ``enforced``.
+
+    ``enforced=False`` (``config.device_binding_enforced``'s default) is a
+    pure no-op, so today's behavior is unchanged until an operator opts in.
+    "Active" means ``revoked_at IS NULL``; ownership is the
+    ``(owner_issuer, owner_sub)`` pair, never either column alone (the same
+    identity rule as everywhere else in this service). This makes revocation
+    actually bite — a revoked device can no longer create or claim approvals —
+    but it is still a registration check, not a cryptographic device proof
+    (see ``DeviceRegistration``'s docstring).
+
+    Raises:
+        DeviceNotBoundError: 403, for every not-active-and-owned case alike.
+    """
+    if not enforced:
+        return
+    stmt = (
+        select(DeviceRegistration.id)
+        .where(
+            DeviceRegistration.owner_issuer == principal.issuer,
+            DeviceRegistration.owner_sub == principal.sub,
+            DeviceRegistration.device_id == device_id,
+            DeviceRegistration.revoked_at.is_(None),
+        )
+        .limit(1)
+    )
+    if (await session.execute(stmt)).first() is None:
+        raise DeviceNotBoundError(device_id=device_id)
 
 
 # --- REGISTER --------------------------------------------------------------

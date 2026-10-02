@@ -231,6 +231,9 @@ class DeviceRegistration(Base):
     """v11 §2/§4. `origin_device_id` inventory — a registration hint, not a
     cryptographic device proof (see v11 §2's honesty note; this table's
     existence does not itself make claim/decide endpoints "device-bound").
+    Since 2026-10-02 an operator can opt in (``config.device_binding_enforced``)
+    to having approval CREATE/CLAIM require an active registration owned by
+    the calling principal — still a registration check, not a device proof.
 
     ``device_id`` uniqueness is scoped per-owner (code-review finding,
     fixed 2026-09-15), not global: the original global-unique constraint
