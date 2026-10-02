@@ -17,14 +17,20 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import DBAPIError
 
 from central_governance_api.auth.dependencies import get_oidc_resolver
-from central_governance_api.auth.oidc import OIDCPrincipalResolver
+from central_governance_api.auth.oidc import OIDCPrincipalResolver, Principal
 from central_governance_api.config import Settings
-from central_governance_api.db import get_db_session
+from central_governance_api.db import (
+    create_engine,
+    create_session_factory,
+    get_db_session,
+)
 from central_governance_api.main import create_app
-from central_governance_api.models import PendingApprovalRecord
+from central_governance_api.models import DeviceRegistration, PendingApprovalRecord
+from central_governance_api.routers.devices import ensure_device_bound
 
 from .conftest import _TEST_DATABASE_URL, AUDIENCE, ISSUER, JWKS_URL
 from .test_app_auth import _sign
@@ -189,3 +195,75 @@ async def test_claim_after_revocation_is_refused_and_leaves_record_accepted(
     row = await db_session.get(PendingApprovalRecord, uuid.UUID(created["id"]))
     await db_session.refresh(row)
     assert row.status == "accepted"
+
+
+async def test_binding_check_holds_a_row_lock_so_a_concurrent_revoke_must_wait(
+    settings,
+):
+    """Race (found by review): without a lock, a revoke could commit between
+    ``ensure_device_bound``'s SELECT and the claim's status UPDATE, and the
+    claim would still proceed on a device that was just revoked. The check
+    takes FOR SHARE on the registration row, so a concurrent revoke's UPDATE
+    cannot get the row until the claim's transaction ends.
+
+    Proved with two genuinely separate connections (the shared SAVEPOINT
+    ``db_session`` can't produce a real conflict): session A runs the check
+    and keeps its transaction open; session B tries to revoke the same row
+    with a short ``lock_timeout`` and must be refused the lock; once A
+    finishes, B's revoke succeeds.
+    """
+    engine = create_engine(settings)
+    try:
+        async with engine.connect():
+            pass
+    except Exception as exc:
+        await engine.dispose()
+        pytest.skip(f"no reachable test Postgres at {_TEST_DATABASE_URL!r}: {exc}")
+
+    sub = f"lock-test-{uuid.uuid4()}"
+    device_id = f"device-{uuid.uuid4()}"
+    principal = Principal(
+        issuer=ISSUER, sub=sub, display_name=sub, roles=frozenset(), azp=None
+    )
+    session_factory = create_session_factory(engine)
+    try:
+        async with session_factory() as setup:
+            reg = DeviceRegistration(
+                owner_issuer=ISSUER, owner_sub=sub, device_id=device_id
+            )
+            setup.add(reg)
+            await setup.commit()
+            reg_id = reg.id
+
+        async with session_factory() as claimer, session_factory() as revoker:
+            # A: the binding check (as claim_approval does), transaction left open.
+            await ensure_device_bound(claimer, principal, device_id, enforced=True)
+
+            # B: revoke the same row; the lock must NOT be available.
+            await revoker.execute(text("SET LOCAL lock_timeout = '300ms'"))
+            with pytest.raises(DBAPIError):
+                await revoker.execute(
+                    update(DeviceRegistration)
+                    .where(DeviceRegistration.id == reg_id)
+                    .values(revoked_at=func.now())
+                )
+            await revoker.rollback()
+
+            # A finishes (as the claim's commit would) -> the lock is released.
+            await claimer.commit()
+
+            await revoker.execute(
+                update(DeviceRegistration)
+                .where(DeviceRegistration.id == reg_id)
+                .values(revoked_at=func.now())
+            )
+            await revoker.commit()
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(
+                delete(DeviceRegistration).where(
+                    DeviceRegistration.owner_issuer == ISSUER,
+                    DeviceRegistration.owner_sub == sub,
+                )
+            )
+        await engine.dispose()

@@ -258,6 +258,13 @@ async def ensure_device_bound(
             DeviceRegistration.revoked_at.is_(None),
         )
         .limit(1)
+        # FOR SHARE: keep the registration row locked until the caller's
+        # transaction ends. Without it, a revoke could commit between this
+        # check and the claim's status UPDATE, and the claim would still go
+        # through (check-then-act race; small-model review 2026-10-02). With
+        # it, a concurrent revoke's UPDATE of this row waits for the claim's
+        # transaction, so revoke and claim are ordered, never interleaved.
+        .with_for_update(read=True)
     )
     if (await session.execute(stmt)).first() is None:
         raise DeviceNotBoundError(device_id=device_id)
