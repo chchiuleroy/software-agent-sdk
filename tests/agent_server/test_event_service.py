@@ -6088,6 +6088,181 @@ class TestEventServiceGovernanceOrchestration:
         client.create_approval.assert_not_awaited()
         assert governed_service.governance_outbox.load() is None
 
+    async def _start_restored(self, governed_service, pending, status, client):
+        """start() on a service whose persisted conversation is in ``status``
+        with ``pending`` actions, as after a process restart. Only the two
+        reads that describe the persisted conversation are stubbed; start()'s
+        own wiring and the real register hook run."""
+        governed_service._external_lease_renewal = True
+        governed_service.governance_client = client
+        with (
+            patch.object(
+                governed_service,
+                "_get_execution_status",
+                AsyncMock(return_value=status),
+            ),
+            patch.object(
+                governed_service,
+                "_snapshot_pending_actions_sync",
+                return_value=list(pending),
+            ),
+        ):
+            await governed_service.start()
+            # let the fire-and-forget create task run to completion
+            for task in list(governed_service._pending_governance_create_tasks):
+                await task
+
+    async def _stop_restored(self, governed_service) -> None:
+        await self._drain_wait_for_decision_task(governed_service)
+        await governed_service.close()
+
+    @pytest.mark.asyncio
+    async def test_start_registers_approval_for_conversation_restored_while_waiting(
+        self, governed_service
+    ):
+        """After a restart a conversation persisted as WAITING_FOR_CONFIRMATION
+        with one pending action and no outbox record had nothing that would
+        ever register it: the register hook only runs from the end of a run,
+        and no run can start (run() refuses a bindingless call, and nothing
+        holds a binding for an approval that does not exist). It could only be
+        rejected. start() must run the same hook once, as it already does for
+        the report hook, so the pending action gets a central approval."""
+        action = _governance_pending_action()
+        client = MagicMock()
+        client.create_approval = AsyncMock(return_value={"id": "approval-restart"})
+        try:
+            await self._start_restored(
+                governed_service,
+                [action],
+                ConversationExecutionStatus.WAITING_FOR_CONFIRMATION,
+                client,
+            )
+
+            client.create_approval.assert_awaited_once()
+            payload = client.create_approval.call_args.args[0]
+            assert payload["action_event_id"] == action.id
+            record = governed_service.governance_outbox.load()
+            assert record is not None
+            assert record.action_event_id == action.id
+            assert record.state == OutboxState.CREATED
+            assert record.central_approval_id == "approval-restart"
+        finally:
+            await self._stop_restored(governed_service)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "n_pending"),
+        [
+            (ConversationExecutionStatus.IDLE, 1),
+            (ConversationExecutionStatus.WAITING_FOR_CONFIRMATION, 0),
+            (ConversationExecutionStatus.WAITING_FOR_CONFIRMATION, 2),
+        ],
+        ids=["not-waiting", "waiting-no-action", "waiting-several-actions"],
+    )
+    async def test_start_does_not_register_unless_exactly_one_action_is_waiting(
+        self, governed_service, status, n_pending
+    ):
+        """The restart path must keep the hook's own preconditions: nothing is
+        created for a conversation that is not waiting, or whose pending
+        actions are not exactly one (batch confirmations are out of scope)."""
+        pending = [_governance_pending_action(f"call_{i}") for i in range(n_pending)]
+        client = MagicMock()
+        client.create_approval = AsyncMock(return_value={"id": "unexpected"})
+        try:
+            await self._start_restored(governed_service, pending, status, client)
+
+            client.create_approval.assert_not_awaited()
+            assert governed_service.governance_outbox.load() is None
+        finally:
+            await self._stop_restored(governed_service)
+
+    @pytest.mark.asyncio
+    async def test_real_restart_of_waiting_conversation_registers_its_approval(
+        self, governed_service, tmp_path
+    ):
+        """No stubs on the persisted conversation: a service is started, left
+        waiting for confirmation with one unmatched action and closed; a new
+        service on the same directory then restarts it and must register the
+        approval from what was actually persisted."""
+        action = _governance_pending_action()
+        governed_service._external_lease_renewal = True
+        await governed_service.start()
+        conversation = governed_service.get_conversation()
+        with conversation._state as state:
+            conversation._on_event(action)
+            state.execution_status = (
+                ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            )
+        await governed_service.close()
+
+        restarted = EventService(
+            stored=governed_service.stored,
+            agent=governed_service.agent,
+            conversations_dir=governed_service.conversations_dir,
+        )
+        restarted.governance_deployment_mode = "team"
+        restarted.governance_origin_device_id = "device-1"
+        restarted._external_lease_renewal = True
+        client = MagicMock()
+        client.create_approval = AsyncMock(return_value={"id": "approval-real"})
+        restarted.governance_client = client
+        try:
+            await restarted.start()
+            for task in list(restarted._pending_governance_create_tasks):
+                await task
+
+            client.create_approval.assert_awaited_once()
+            record = restarted.governance_outbox.load()
+            assert record is not None
+            assert record.action_event_id == action.id
+            assert record.state == OutboxState.CREATED
+        finally:
+            await self._drain_wait_for_decision_task(restarted)
+            await restarted.close()
+
+    @pytest.mark.asyncio
+    async def test_real_restart_with_a_truncated_action_is_refused_not_registered(
+        self, governed_service
+    ):
+        """Restart-time registration and the refusal of truncated actions meet
+        here: a conversation persisted as waiting on an action whose preview
+        would be cut must not get a central approval when it is restored, and
+        the action must be rejected so the conversation is not left waiting."""
+        action = _governance_pending_action(command="x" * 500)
+        governed_service._external_lease_renewal = True
+        await governed_service.start()
+        conversation = governed_service.get_conversation()
+        with conversation._state as state:
+            conversation._on_event(action)
+            state.execution_status = (
+                ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            )
+        await governed_service.close()
+
+        restarted = EventService(
+            stored=governed_service.stored,
+            agent=governed_service.agent,
+            conversations_dir=governed_service.conversations_dir,
+        )
+        restarted.governance_deployment_mode = "team"
+        restarted.governance_origin_device_id = "device-1"
+        restarted._external_lease_renewal = True
+        client = MagicMock()
+        client.create_approval = AsyncMock()
+        restarted.governance_client = client
+        try:
+            await restarted.start()
+            for task in list(restarted._pending_governance_create_tasks):
+                await task
+
+            client.create_approval.assert_not_awaited()
+            assert restarted.governance_outbox.load() is None
+            assert restarted._snapshot_pending_actions_sync() == []
+            status = restarted.get_conversation().state.execution_status
+            assert status != ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        finally:
+            await restarted.close()
+
     @pytest.mark.asyncio
     async def test_relay_retries_result_pending_success(self, governed_service):
         await self._create_outbox_record(

@@ -19,6 +19,10 @@ from openhands.sdk.agent import Agent
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.llm import LLM, Message, TextContent
+from openhands.sdk.security.roy_action_binding import (
+    ActionBindingMismatchError,
+    ExecutionLeaseExpiredError,
+)
 from openhands.sdk.testing import TestLLM
 from openhands.sdk.workspace import LocalWorkspace
 
@@ -386,6 +390,58 @@ async def test_goal_loop_halts_on_run_error_as_interrupted(event_service, tmp_pa
         assert updates[-1]["status"] == "interrupted"
         assert updates[-1]["active"] is False
         assert event_service._goal_loop_outcome is None
+    finally:
+        await event_service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ActionBindingMismatchError(
+            "conversation is waiting for confirmation but no governed approval "
+            "is registered for its pending actions"
+        ),
+        ActionBindingMismatchError(
+            "conversation is waiting for confirmation but the governed approval "
+            "on record is already finished (EXECUTED)"
+        ),
+        ExecutionLeaseExpiredError("the central execution lease has expired"),
+    ],
+    ids=["no-record", "terminal-record", "lease-expired"],
+)
+async def test_goal_loop_governance_halt_log_names_the_actual_gate(
+    event_service, tmp_path, caplog, error
+):
+    # Team mode refuses the goal loop's bindingless run() for several distinct
+    # reasons. The halt must still be recorded as interrupted (resumable), and
+    # the log line must carry the gate's own message: a fixed "awaiting central
+    # governance approval" is wrong when no approval is registered at all or the
+    # one on record is already finished -- nothing is being awaited then.
+    await _start(event_service, tmp_path, "did the work")
+    judge = _scripted(_NOT_DONE, usage_id="judge")
+    try:
+        with (
+            patch.object(event_service, "run", side_effect=error),
+            caplog.at_level("INFO", logger="openhands.agent_server.event_service"),
+        ):
+            await event_service.start_goal_loop(
+                "build x", judge_llm=judge, max_iterations=5
+            )
+            await asyncio.wait_for(event_service._goal_loop_task, timeout=15)
+
+        updates = _goal_status_updates(event_service)
+        assert updates[-1]["status"] == "interrupted"
+        assert updates[-1]["active"] is False
+        halt = [
+            r.getMessage()
+            for r in caplog.records
+            if "Goal loop halted" in r.getMessage()
+        ]
+        assert len(halt) == 1
+        assert type(error).__name__ in halt[0]
+        assert str(error) in halt[0]
+        assert "awaiting central governance approval" not in halt[0]
     finally:
         await event_service.close()
 
