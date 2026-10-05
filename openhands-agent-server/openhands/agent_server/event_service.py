@@ -1812,6 +1812,18 @@ class EventService:
         # run happened to trigger the finally hook again.
         await self.maybe_report_governance_result()
 
+        # Restart counterpart to the same hook in _run_and_publish()'s
+        # finally: a conversation persisted as WAITING_FOR_CONFIRMATION whose
+        # approval was never registered (several pending actions at the time,
+        # the create task never persisted its record, or the process stopped
+        # before registering) would otherwise stay unregistered for good. No
+        # run() can end to trigger the hook — run() refuses a bindingless call
+        # and nothing holds a binding for an approval that does not exist — so
+        # it could only be rejected. The hook keeps its own preconditions
+        # (team mode, WAITING_FOR_CONFIRMATION, exactly one pending action) and
+        # fire-and-forgets the create call, so this does not block start().
+        await self.maybe_register_governance_approval()
+
         # Publish initial state update
         await self._publish_state_update()
 
