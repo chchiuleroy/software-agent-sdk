@@ -17,6 +17,7 @@ from openhands.agent_server.governance_display import (
     MAX_COMMAND_PREVIEW_CHARS,
     MAX_PREVIEW_LINE_CHARS,
     MAX_PREVIEW_LINES,
+    MAX_QUERY_KEYS,
     MAX_URL_CHARS,
     POLICY_REVISION,
     PROJECTION_VERSION,
@@ -614,3 +615,58 @@ def test_truncation_reason_never_repeats_the_action_content():
     reason = truncation_reason(build_display(_terminal(f"echo {secret} " + "e" * 500)))
 
     assert secret not in reason
+
+
+# --- limits that cut the INPUT before the preview limits apply ----------------
+
+
+def _replace(old: str, new: str) -> ActionEvent:
+    return _event(
+        "file_editor",
+        FileEditorAction(
+            command="str_replace", path="/w/f.txt", old_str=old, new_str=new
+        ),
+    )
+
+
+def test_str_replace_differing_only_past_the_input_line_cap_is_truncated():
+    # The diff is computed on the first _MAX_INPUT_LINES lines of each side.
+    # Identical heads give an empty diff, so a change after that point would
+    # look like "nothing to show" while the flag stayed False.
+    shared = [f"line {i}" for i in range(600)]
+    old = "\n".join(shared)
+    new = "\n".join(shared[:550] + ["CHANGED"] + shared[551:])
+
+    projection = build_display(_replace(old, new))
+
+    assert projection.payload["diff_preview"] == []
+    assert projection.payload["diff_truncated"] is True
+    assert projection.is_truncated
+
+
+def test_str_replace_differing_only_past_the_char_cap_is_truncated():
+    old = "a" * 150_000
+    new = "a" * 149_999 + "b"
+
+    projection = build_display(_replace(old, new))
+
+    assert projection.is_truncated
+
+
+def test_str_replace_within_both_caps_is_not_truncated():
+    projection = build_display(_replace("old line", "new line"))
+
+    assert not projection.is_truncated
+
+
+@pytest.mark.parametrize(
+    ("n_keys", "expected"),
+    [(MAX_QUERY_KEYS, False), (MAX_QUERY_KEYS + 1, True)],
+    ids=["keys-at-limit", "keys-over-limit"],
+)
+def test_browser_url_with_more_query_keys_than_shown_is_truncated(n_keys, expected):
+    query = "&".join(f"k{i}=v" for i in range(n_keys))
+    projection = build_display(_navigate(f"https://example.com/p?{query}"))
+
+    assert len(projection.payload["query_keys"]) == min(n_keys, MAX_QUERY_KEYS)
+    assert projection.is_truncated is expected

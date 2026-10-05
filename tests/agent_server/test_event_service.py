@@ -5959,22 +5959,22 @@ class TestEventServiceGovernanceOrchestration:
 
     # ---------------- refusing actions an approver cannot see in full ----------------
 
-    async def _register_pending(self, governed_service, action):
+    async def _register_pending(self, governed_service, action, *, conversation=None):
         """Run the real register hook for one pending ``action`` with a fake
-        central client; returns that client. ``reject_pending_actions`` is
-        stubbed so what is asserted is whether the hook asks for a rejection."""
+        central client; returns (client, conversation). The conversation is a
+        mock, so what is asserted is whether the hook asks it to reject."""
         client = MagicMock()
         client.create_approval = AsyncMock(return_value={"id": "approval-1"})
         governed_service.governance_client = client
-        governed_service._conversation = self._mock_conversation([action])
+        conversation = conversation or self._mock_conversation([action])
+        governed_service._conversation = conversation
         governed_service._get_execution_status = AsyncMock(
             return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
         )
-        governed_service.reject_pending_actions = AsyncMock()
         await governed_service.maybe_register_governance_approval()
         for task in list(governed_service._pending_governance_create_tasks):
             await task
-        return client
+        return client, conversation
 
     @pytest.mark.asyncio
     async def test_truncated_action_is_refused_instead_of_sent_for_approval(
@@ -5987,12 +5987,12 @@ class TestEventServiceGovernanceOrchestration:
         secret = "ZZ-not-a-real-secret-ZZ"
         action = _governance_pending_action(command=f"echo {secret} " + "x" * 500)
 
-        client = await self._register_pending(governed_service, action)
+        client, conversation = await self._register_pending(governed_service, action)
 
         client.create_approval.assert_not_awaited()
         assert governed_service.governance_outbox.load() is None
-        governed_service.reject_pending_actions.assert_awaited_once()
-        (reason,) = governed_service.reject_pending_actions.call_args.args
+        conversation.reject_pending_actions.assert_called_once()
+        (reason,) = conversation.reject_pending_actions.call_args.args
         assert "cannot be reviewed in full" in reason
         assert "smaller steps" in reason
         assert secret not in reason
@@ -6004,20 +6004,20 @@ class TestEventServiceGovernanceOrchestration:
         governed_service.governance_refuse_truncated_actions = False
         action = _governance_pending_action(command="x" * 500)
 
-        client = await self._register_pending(governed_service, action)
+        client, conversation = await self._register_pending(governed_service, action)
 
         client.create_approval.assert_awaited_once()
-        governed_service.reject_pending_actions.assert_not_awaited()
+        conversation.reject_pending_actions.assert_not_called()
         await self._drain_wait_for_decision_task(governed_service)
 
     @pytest.mark.asyncio
     async def test_action_shown_in_full_still_goes_to_central(self, governed_service):
         action = _governance_pending_action(command="ls")
 
-        client = await self._register_pending(governed_service, action)
+        client, conversation = await self._register_pending(governed_service, action)
 
         client.create_approval.assert_awaited_once()
-        governed_service.reject_pending_actions.assert_not_awaited()
+        conversation.reject_pending_actions.assert_not_called()
         await self._drain_wait_for_decision_task(governed_service)
 
     @pytest.mark.asyncio
@@ -6025,19 +6025,48 @@ class TestEventServiceGovernanceOrchestration:
         self, governed_service
     ):
         """Between the hook's check and the refusal a human may already have
-        rejected the action. reject_pending_actions() rejects whatever is
-        pending, so the refusal re-reads the pending action and does nothing
-        unless it is still the one it refused."""
+        rejected the action, and a newer one may be pending.
+        reject_pending_actions() rejects whatever is pending, so the refusal
+        re-reads the pending action and does nothing unless it is still the one
+        it refused."""
         action = _governance_pending_action(command="x" * 500)
-        with patch.object(
-            governed_service,
-            "_snapshot_pending_actions_sync",
-            side_effect=[[action], []],
-        ):
-            client = await self._register_pending(governed_service, action)
+        conversation = self._mock_conversation([action])
+        conversation._state.active_branch = MagicMock(side_effect=[[action], []])
+
+        client, _ = await self._register_pending(
+            governed_service, action, conversation=conversation
+        )
 
         client.create_approval.assert_not_awaited()
-        governed_service.reject_pending_actions.assert_not_awaited()
+        conversation.reject_pending_actions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refusal_checks_and_rejects_under_one_hold_of_the_state_lock(
+        self, governed_service
+    ):
+        """The re-read and the rejection must happen while the conversation
+        state lock is held, or a newer pending action could appear between
+        them and be rejected with the wrong reason. The lock is reentrant, so
+        reject_pending_actions() can take it again inside the same hold."""
+        action = _governance_pending_action(command="x" * 500)
+        conversation = self._mock_conversation([action])
+        calls: list[str] = []
+        state = conversation._state
+        state.__enter__ = MagicMock(side_effect=lambda: calls.append("lock") or state)
+        state.__exit__ = MagicMock(side_effect=lambda *a: calls.append("unlock"))
+        state.active_branch = MagicMock(
+            side_effect=lambda: calls.append("read") or [action]
+        )
+        conversation.reject_pending_actions = MagicMock(
+            side_effect=lambda reason: calls.append("reject")
+        )
+
+        await self._register_pending(
+            governed_service, action, conversation=conversation
+        )
+
+        # first hold: the register hook's own read; second hold: the refusal
+        assert calls == ["lock", "read", "unlock", "lock", "read", "reject", "unlock"]
 
     @pytest.mark.asyncio
     async def test_refusal_that_cannot_reject_leaves_the_conversation_unapproved(
@@ -6047,20 +6076,14 @@ class TestEventServiceGovernanceOrchestration:
         run() still refuses it, so the safe outcome holds and the hook does not
         raise out of its fire-and-forget task."""
         action = _governance_pending_action(command="x" * 500)
-        client = MagicMock()
-        client.create_approval = AsyncMock()
-        governed_service.governance_client = client
-        governed_service._conversation = self._mock_conversation([action])
-        governed_service._get_execution_status = AsyncMock(
-            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
-        )
-        governed_service.reject_pending_actions = AsyncMock(
+        conversation = self._mock_conversation([action])
+        conversation.reject_pending_actions = MagicMock(
             side_effect=RuntimeError("inactive_service")
         )
 
-        await governed_service.maybe_register_governance_approval()
-        for task in list(governed_service._pending_governance_create_tasks):
-            await task  # must not raise
+        client, _ = await self._register_pending(
+            governed_service, action, conversation=conversation
+        )  # must not raise
 
         client.create_approval.assert_not_awaited()
         assert governed_service.governance_outbox.load() is None

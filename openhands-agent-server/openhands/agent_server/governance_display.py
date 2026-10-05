@@ -166,9 +166,11 @@ def _project_file_editor(act: Any, red: _Redactions) -> tuple[str, dict[str, Any
         new = _text(getattr(act, "new_str", None))
         payload["old_str_bytes"] = _byte_len(old)
         payload["new_str_bytes"] = _byte_len(new)
+        old_lines = red.text(old).splitlines()
+        new_lines = red.text(new).splitlines()
         diff = difflib.unified_diff(
-            red.text(old).splitlines()[:_MAX_INPUT_LINES],
-            red.text(new).splitlines()[:_MAX_INPUT_LINES],
+            old_lines[:_MAX_INPUT_LINES],
+            new_lines[:_MAX_INPUT_LINES],
             fromfile="old",
             tofile="new",
             lineterm="",
@@ -176,7 +178,16 @@ def _project_file_editor(act: Any, red: _Redactions) -> tuple[str, dict[str, Any
         )
         preview, truncated = _lines_preview("\n".join(diff))
         payload["diff_preview"] = preview
-        payload["diff_truncated"] = truncated
+        # The diff is computed on a capped head of each side, so a change past
+        # that head is not in it at all: that is a cut even when the preview is
+        # short (or empty).
+        input_cut = (
+            len(old) > _MAX_INPUT_CHARS
+            or len(new) > _MAX_INPUT_CHARS
+            or len(old_lines) > _MAX_INPUT_LINES
+            or len(new_lines) > _MAX_INPUT_LINES
+        )
+        payload["diff_truncated"] = truncated or input_cut
     elif command == "insert":
         new = _text(getattr(act, "new_str", None))
         insert_line = getattr(act, "insert_line", None)
@@ -243,7 +254,8 @@ def _project_browser_navigate(act: Any, red: _Redactions) -> tuple[str, dict[str
     payload = {
         "kind": "browser_navigate",
         "url": url,
-        "url_truncated": truncated,
+        # Query keys beyond MAX_QUERY_KEYS are dropped too: also a cut.
+        "url_truncated": truncated or len(query_keys) > MAX_QUERY_KEYS,
         # Names only: query values are where session ids and tokens live.
         "query_keys": [red.text(k) for k in query_keys[:MAX_QUERY_KEYS]],
         "new_tab": bool(getattr(act, "new_tab", False)),
