@@ -15,10 +15,13 @@ import pytest
 
 from openhands.agent_server.governance_display import (
     MAX_COMMAND_PREVIEW_CHARS,
+    MAX_PREVIEW_LINE_CHARS,
     MAX_PREVIEW_LINES,
+    MAX_URL_CHARS,
     POLICY_REVISION,
     PROJECTION_VERSION,
     build_display,
+    truncation_reason,
 )
 from openhands.agent_server.governance_redaction import REDACTION_VERSION
 from openhands.sdk.event import ActionEvent
@@ -517,3 +520,97 @@ def test_output_size_is_bounded_whatever_the_input_size(action):
     projection = build_display(action)
 
     assert len(_shown(projection)) < 12_000
+
+
+# --- truncation: does the approver see the whole action? ----------------------
+
+
+def _create_file(content: str) -> ActionEvent:
+    return _event(
+        "file_editor",
+        FileEditorAction(command="create", path="/w/f.txt", file_text=content),
+    )
+
+
+def _navigate(url: str) -> ActionEvent:
+    return _event("browser_navigate", BrowserNavigateAction(url=url))
+
+
+def _patch_adding(n_lines: int) -> ActionEvent:
+    body = "\n".join(f"+{i}" for i in range(n_lines))
+    return _event(
+        "apply_patch",
+        ApplyPatchAction(
+            patch=f"*** Begin Patch\n*** Add File: a.py\n{body}\n*** End Patch"
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        (_terminal("e" * MAX_COMMAND_PREVIEW_CHARS), False),
+        (_terminal("e" * (MAX_COMMAND_PREVIEW_CHARS + 1)), True),
+        (_create_file("\n".join("r" for _ in range(MAX_PREVIEW_LINES))), False),
+        (_create_file("\n".join("r" for _ in range(MAX_PREVIEW_LINES + 1))), True),
+        (_create_file("c" * (MAX_PREVIEW_LINE_CHARS + 1)), True),
+        (_event("apply_patch", ApplyPatchAction(patch=PATCH)), False),
+        (_patch_adding(MAX_PREVIEW_LINES + 5), True),
+        (_navigate("https://example.com/a"), False),
+        (_navigate("https://example.com/" + "p" * MAX_URL_CHARS), True),
+        (_event("some_mcp_tool", _McpLikeAction(query="q", api_token="t")), False),
+        (_event("file_editor", FileEditorAction(command="view", path="/w/f")), False),
+    ],
+    ids=[
+        "terminal-at-limit",
+        "terminal-over-limit",
+        "file-at-line-limit",
+        "file-over-line-limit",
+        "file-over-line-width",
+        "patch-small",
+        "patch-over-line-limit",
+        "url-short",
+        "url-over-limit",
+        "unknown-tool",
+        "file-view",
+    ],
+)
+def test_projection_reports_whether_the_approver_sees_less_than_the_action(
+    action, expected
+):
+    assert build_display(action).is_truncated is expected
+
+
+def test_truncation_flag_is_not_part_of_the_digested_payload():
+    # The payload is what central digests and shows: adding anything to it
+    # would change the wire contract. The flag is derived from it instead.
+    payload = build_display(_terminal("e" * 5000)).payload
+
+    assert "is_truncated" not in payload
+    assert payload["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("action", "limit_text"),
+    [
+        (_terminal("e" * 5000), str(MAX_COMMAND_PREVIEW_CHARS)),
+        (_create_file("r\n" * 500), str(MAX_PREVIEW_LINES)),
+        (_patch_adding(100), str(MAX_PREVIEW_LINES)),
+        (_navigate("https://example.com/" + "p" * 1000), str(MAX_URL_CHARS)),
+    ],
+    ids=["terminal", "file", "patch", "url"],
+)
+def test_truncation_reason_names_the_limit_and_tells_the_agent_what_to_do(
+    action, limit_text
+):
+    reason = truncation_reason(build_display(action))
+
+    assert limit_text in reason
+    assert "smaller steps" in reason
+
+
+def test_truncation_reason_never_repeats_the_action_content():
+    secret = "ZZ-not-a-real-secret-ZZ"
+    reason = truncation_reason(build_display(_terminal(f"echo {secret} " + "e" * 500)))
+
+    assert secret not in reason

@@ -4201,6 +4201,7 @@ class TestGetInstanceGovernanceSnapshot:
         assert service.governance_deployment_mode == "personal"
         assert service.governance_client is None
         assert service.governance_origin_device_id == "unset-device-id"
+        assert service.governance_refuse_truncated_actions is True
 
     def test_team_mode_without_client_credentials_still_has_no_client(self, tmp_path):
         """governance_deployment_mode='team' alone does not fabricate a
@@ -4231,6 +4232,7 @@ class TestGetInstanceGovernanceSnapshot:
             governance_client_id="agent-server",
             governance_client_secret=SecretStr("s3cr3t"),
             governance_origin_device_id="device-1",
+            governance_refuse_truncated_actions=False,
         )
         service = ConversationService.get_instance(config)
 
@@ -4249,6 +4251,8 @@ class TestGetInstanceGovernanceSnapshot:
             assert event_service.governance_deployment_mode == "team"
             assert event_service.governance_client is service.governance_client
             assert event_service.governance_origin_device_id == "device-1"
+            # the non-default value, so a default-only plumbing bug is caught
+            assert event_service.governance_refuse_truncated_actions is False
 
     @pytest.mark.asyncio
     async def test_aexit_closes_the_owned_governance_client(self, tmp_path):

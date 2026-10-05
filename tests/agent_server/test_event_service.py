@@ -4167,6 +4167,10 @@ class TestEventServiceGovernanceOrchestration:
         fake_client = MagicMock()
         fake_client.create_approval = AsyncMock(return_value={"id": "approval-123"})
         governed_service.governance_client = fake_client
+        # This command is long on purpose, to see what central receives when a
+        # truncated action *is* sent. By default such an action is refused and
+        # never sent (see test_truncated_action_is_refused_instead_of_...).
+        governed_service.governance_refuse_truncated_actions = False
         await governed_service._create_governance_approval(action)
 
         (body,), kwargs = fake_client.create_approval.call_args
@@ -5952,6 +5956,114 @@ class TestEventServiceGovernanceOrchestration:
                 governed_service._outbox_relay_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await governed_service._outbox_relay_task
+
+    # ---------------- refusing actions an approver cannot see in full ----------------
+
+    async def _register_pending(self, governed_service, action):
+        """Run the real register hook for one pending ``action`` with a fake
+        central client; returns that client. ``reject_pending_actions`` is
+        stubbed so what is asserted is whether the hook asks for a rejection."""
+        client = MagicMock()
+        client.create_approval = AsyncMock(return_value={"id": "approval-1"})
+        governed_service.governance_client = client
+        governed_service._conversation = self._mock_conversation([action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service.reject_pending_actions = AsyncMock()
+        await governed_service.maybe_register_governance_approval()
+        for task in list(governed_service._pending_governance_create_tasks):
+            await task
+        return client
+
+    @pytest.mark.asyncio
+    async def test_truncated_action_is_refused_instead_of_sent_for_approval(
+        self, governed_service
+    ):
+        """An approver sees a clipped preview of a long command, so nothing
+        stops them approving a tail they never saw. The device refuses such an
+        action itself: no central approval is created and the pending action is
+        rejected with a reason the agent can act on."""
+        secret = "ZZ-not-a-real-secret-ZZ"
+        action = _governance_pending_action(command=f"echo {secret} " + "x" * 500)
+
+        client = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_not_awaited()
+        assert governed_service.governance_outbox.load() is None
+        governed_service.reject_pending_actions.assert_awaited_once()
+        (reason,) = governed_service.reject_pending_actions.call_args.args
+        assert "cannot be reviewed in full" in reason
+        assert "smaller steps" in reason
+        assert secret not in reason
+
+    @pytest.mark.asyncio
+    async def test_truncated_action_goes_to_central_when_the_refusal_is_turned_off(
+        self, governed_service
+    ):
+        governed_service.governance_refuse_truncated_actions = False
+        action = _governance_pending_action(command="x" * 500)
+
+        client = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_awaited_once()
+        governed_service.reject_pending_actions.assert_not_awaited()
+        await self._drain_wait_for_decision_task(governed_service)
+
+    @pytest.mark.asyncio
+    async def test_action_shown_in_full_still_goes_to_central(self, governed_service):
+        action = _governance_pending_action(command="ls")
+
+        client = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_awaited_once()
+        governed_service.reject_pending_actions.assert_not_awaited()
+        await self._drain_wait_for_decision_task(governed_service)
+
+    @pytest.mark.asyncio
+    async def test_refusal_does_not_reject_when_the_pending_action_has_changed(
+        self, governed_service
+    ):
+        """Between the hook's check and the refusal a human may already have
+        rejected the action. reject_pending_actions() rejects whatever is
+        pending, so the refusal re-reads the pending action and does nothing
+        unless it is still the one it refused."""
+        action = _governance_pending_action(command="x" * 500)
+        with patch.object(
+            governed_service,
+            "_snapshot_pending_actions_sync",
+            side_effect=[[action], []],
+        ):
+            client = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_not_awaited()
+        governed_service.reject_pending_actions.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refusal_that_cannot_reject_leaves_the_conversation_unapproved(
+        self, governed_service
+    ):
+        """If rejecting fails the conversation stays waiting with no approval:
+        run() still refuses it, so the safe outcome holds and the hook does not
+        raise out of its fire-and-forget task."""
+        action = _governance_pending_action(command="x" * 500)
+        client = MagicMock()
+        client.create_approval = AsyncMock()
+        governed_service.governance_client = client
+        governed_service._conversation = self._mock_conversation([action])
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        governed_service.reject_pending_actions = AsyncMock(
+            side_effect=RuntimeError("inactive_service")
+        )
+
+        await governed_service.maybe_register_governance_approval()
+        for task in list(governed_service._pending_governance_create_tasks):
+            await task  # must not raise
+
+        client.create_approval.assert_not_awaited()
+        assert governed_service.governance_outbox.load() is None
 
     @pytest.mark.asyncio
     async def test_relay_retries_result_pending_success(self, governed_service):

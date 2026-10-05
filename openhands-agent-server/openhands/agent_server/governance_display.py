@@ -54,10 +54,24 @@ _PATCH_FILE_HEADER = re.compile(
 _FRAMEWORK_ARG_KEYS = frozenset({"kind", "summary", "security_risk"})
 
 
+# Payload flags each projector sets when it showed less than the action holds.
+# Read-only here: the payload is digested and sent to central, so the flags are
+# derived from it rather than added to it.
+_TRUNCATION_FLAGS = ("truncated", "diff_truncated", "patch_truncated", "url_truncated")
+
+
 @dataclass(frozen=True)
 class DisplayProjection:
     summary: str
     payload: dict[str, Any]
+
+    @property
+    def is_truncated(self) -> bool:
+        """True when what an approver sees is shorter than the action itself
+        (a clipped command, diff, patch or URL). Not true for fields that are
+        withheld by design — URL credentials and query values, an unknown
+        tool's argument values — only for text that was cut to fit a limit."""
+        return any(self.payload.get(flag) is True for flag in _TRUNCATION_FLAGS)
 
 
 class _Redactions:
@@ -298,3 +312,34 @@ def build_display(action: ActionEvent) -> DisplayProjection:
     # Collected last so it covers every field above, including the claim.
     payload["redactions"] = red.names
     return DisplayProjection(summary=summary, payload=payload)
+
+
+def truncation_reason(display: DisplayProjection) -> str:
+    """Why an action whose projection is truncated cannot be approved, worded
+    for the agent that proposed it. Built from the limits and sizes only —
+    never from the action's text."""
+    payload = display.payload
+    kind = payload.get("kind")
+    if kind == "terminal":
+        what = (
+            f"the command is {payload.get('command_length')} characters but an "
+            f"approver can be shown only the first {MAX_COMMAND_PREVIEW_CHARS}"
+        )
+    elif kind in ("file_edit", "patch"):
+        what = (
+            f"the change is longer than the {MAX_PREVIEW_LINES}-line preview "
+            f"(at most {MAX_PREVIEW_LINE_CHARS} characters per line) an approver "
+            "can be shown"
+        )
+    elif kind == "browser_navigate":
+        what = (
+            f"the URL is longer than the {MAX_URL_CHARS} characters an approver "
+            "can be shown"
+        )
+    else:
+        what = "an approver cannot be shown all of it"
+    return (
+        "Refused by governance policy: this action cannot be reviewed in full "
+        f"because {what}. Split it into smaller steps and propose them one at "
+        "a time."
+    )
