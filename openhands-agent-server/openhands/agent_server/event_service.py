@@ -2953,20 +2953,25 @@ class EventService:
                     ActionBindingMismatchError,
                     ActionCountMismatchError,
                     ExecutionLeaseExpiredError,
-                ):
-                    # Team mode blocked this run() because a governed
-                    # action requires central approval that has not been
-                    # granted — an expected governance gate (see
-                    # check_governed_binding_required(), which this
-                    # method's own bindingless self.run() call is exactly
-                    # the kind of caller that check exists to stop), not a
-                    # goal-loop bug. Halt the same way the PAUSED/ERROR
-                    # branch below does, rather than falling through to
-                    # this method's outer `except Exception` handler,
-                    # which would misleadingly log an expected governance
-                    # gate as "Goal loop failed".
+                ) as gate:
+                    # Team mode blocked this run() because no live central
+                    # approval covers the pending actions — an expected
+                    # governance gate (see check_governed_binding_required(),
+                    # which this method's own bindingless self.run() call is
+                    # exactly the kind of caller that check exists to stop),
+                    # not a goal-loop bug. Halt the same way the PAUSED/ERROR
+                    # branch below does, rather than falling through to this
+                    # method's outer `except Exception` handler, which would
+                    # misleadingly log an expected governance gate as "Goal
+                    # loop failed". Log the gate's own message: the reasons
+                    # differ (no approval registered, the one on record is
+                    # already finished, a binding or lease mismatch), and
+                    # "awaiting approval" is wrong for the first two, where
+                    # nothing is being awaited.
                     logger.info(
-                        "Goal loop halted: awaiting central governance approval"
+                        "Goal loop halted by the governance gate: %s: %s",
+                        type(gate).__name__,
+                        gate,
                     )
                     await _emit_status(active=False, status="interrupted")
                     return
