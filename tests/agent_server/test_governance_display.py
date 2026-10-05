@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from openhands.agent_server import governance_display as gd
 from openhands.agent_server.governance_display import (
     MAX_COMMAND_PREVIEW_CHARS,
     MAX_PREVIEW_LINE_CHARS,
@@ -670,3 +671,66 @@ def test_browser_url_with_more_query_keys_than_shown_is_truncated(n_keys, expect
 
     assert len(projection.payload["query_keys"]) == min(n_keys, MAX_QUERY_KEYS)
     assert projection.is_truncated is expected
+
+
+# --- cuts the preview limits never see (found in a second review) --------------
+
+_INPUT_CAP = gd._MAX_INPUT_CHARS
+
+
+def test_query_keys_past_the_input_cap_are_truncated():
+    # The URL is cut to the input cap before it is parsed, so a parameter name
+    # after a long value is not in query_keys at all.
+    url = "https://example.test/cb?k=" + "p" * (_INPUT_CAP + 10) + "&dangerous=v"
+    projection = build_display(_navigate(url))
+
+    assert "dangerous" not in projection.payload["query_keys"]
+    assert projection.is_truncated
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(document.cookie)",
+        "data:text/html,<script>x</script>",
+        "file:///etc/passwd",
+        "mailto:someone@example.test",
+    ],
+)
+def test_url_whose_content_is_shown_only_as_a_length_is_truncated(url):
+    # For schemes without a host the content lives in the "path", and the
+    # projection shows only how long it is. That is the whole action, not a
+    # credential or a query value, so the approver is not seeing it.
+    projection = build_display(_navigate(url))
+
+    assert projection.payload["url"].endswith("chars]")
+    assert projection.is_truncated
+
+
+@pytest.mark.parametrize("url", ["/cb?x=1", "site.example/a?x=1", "https://h.test/p"])
+def test_url_shown_as_host_and_path_is_not_truncated(url):
+    assert not build_display(_navigate(url)).is_truncated
+
+
+def test_file_path_past_the_input_cap_is_truncated():
+    action = _event(
+        "file_editor",
+        FileEditorAction(command="create", path="/w/" + "d" * _INPUT_CAP, file_text=""),
+    )
+
+    assert build_display(action).is_truncated
+
+
+def test_input_cut_is_recorded_in_the_payload_only_when_it_happens():
+    normal = build_display(_terminal("ls")).payload
+    cut = build_display(_terminal("e" * (_INPUT_CAP + 1))).payload
+
+    assert "input_truncated" not in normal
+    assert cut["input_truncated"] is True
+
+
+def test_an_overlong_agent_claim_is_not_an_action_truncation():
+    # The claim is the agent's own untrusted text, not the action.
+    projection = build_display(_terminal("ls", summary="x" * (_INPUT_CAP + 1)))
+
+    assert not projection.is_truncated

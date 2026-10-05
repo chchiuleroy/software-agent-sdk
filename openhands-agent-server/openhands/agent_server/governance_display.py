@@ -57,7 +57,13 @@ _FRAMEWORK_ARG_KEYS = frozenset({"kind", "summary", "security_risk"})
 # Payload flags each projector sets when it showed less than the action holds.
 # Read-only here: the payload is digested and sent to central, so the flags are
 # derived from it rather than added to it.
-_TRUNCATION_FLAGS = ("truncated", "diff_truncated", "patch_truncated", "url_truncated")
+_TRUNCATION_FLAGS = (
+    "truncated",
+    "diff_truncated",
+    "patch_truncated",
+    "url_truncated",
+    "input_truncated",
+)
 
 
 @dataclass(frozen=True)
@@ -79,8 +85,14 @@ class _Redactions:
 
     def __init__(self) -> None:
         self._names: set[str] = set()
+        # Set when any action text was cut to _MAX_INPUT_CHARS before it was
+        # redacted or projected: whatever followed the cut is in no field, so no
+        # per-field preview flag can notice it.
+        self.input_cut = False
 
-    def text(self, value: str) -> str:
+    def text(self, value: str, *, count_cut: bool = True) -> str:
+        if count_cut and len(value) > _MAX_INPUT_CHARS:
+            self.input_cut = True
         result = redact(value[:_MAX_INPUT_CHARS])
         self._names.update(result.applied)
         return result.text
@@ -203,7 +215,10 @@ def _project_file_editor(act: Any, red: _Redactions) -> tuple[str, dict[str, Any
 
 
 def _project_apply_patch(act: Any, red: _Redactions) -> tuple[str, dict[str, Any]]:
-    patch = _text(getattr(act, "patch", None))[:_MAX_INPUT_CHARS]
+    full_patch = _text(getattr(act, "patch", None))
+    if len(full_patch) > _MAX_INPUT_CHARS:
+        red.input_cut = True
+    patch = full_patch[:_MAX_INPUT_CHARS]
     files = [
         {"op": op.lower(), "path": red.text(path.strip())}
         for op, path in _PATCH_FILE_HEADER.findall(patch)
@@ -226,7 +241,11 @@ def _project_apply_patch(act: Any, red: _Redactions) -> tuple[str, dict[str, Any
 
 
 def _project_browser_navigate(act: Any, red: _Redactions) -> tuple[str, dict[str, Any]]:
-    raw = _text(getattr(act, "url", None))[:_MAX_INPUT_CHARS]
+    full_url = _text(getattr(act, "url", None))
+    if len(full_url) > _MAX_INPUT_CHARS:
+        red.input_cut = True
+    raw = full_url[:_MAX_INPUT_CHARS]
+    opaque = False
     try:
         parts = urlsplit(raw)
         host = parts.hostname or ""
@@ -243,6 +262,7 @@ def _project_browser_navigate(act: Any, red: _Redactions) -> tuple[str, dict[str
             # "path", so show only how much there is.
             base = f"{parts.scheme}:[{len(raw) - len(parts.scheme) - 1} chars]"
             query_keys = []
+            opaque = True
         else:
             # Relative ("/cb?x=1") or a bare host ("site.example/a?x=1"):
             # urlsplit already split the query off the path.
@@ -255,7 +275,10 @@ def _project_browser_navigate(act: Any, red: _Redactions) -> tuple[str, dict[str
         "kind": "browser_navigate",
         "url": url,
         # Query keys beyond MAX_QUERY_KEYS are dropped too: also a cut.
-        "url_truncated": truncated or len(query_keys) > MAX_QUERY_KEYS,
+        # An opaque URL (javascript:, data:, file:, mailto:) is shown only as a
+        # length, and its content is the whole action: that is a cut, not a
+        # withheld credential.
+        "url_truncated": truncated or opaque or len(query_keys) > MAX_QUERY_KEYS,
         # Names only: query values are where session ids and tokens live.
         "query_keys": [red.text(k) for k in query_keys[:MAX_QUERY_KEYS]],
         "new_tab": bool(getattr(act, "new_tab", False)),
@@ -299,7 +322,8 @@ def _agent_claim(action: ActionEvent, red: _Redactions) -> dict[str, Any] | None
         # "{tool.name}: {json}", but a claim is untrusted anyway, so being
         # conservative costs nothing).
         return None
-    text, _ = _clip(_one_line(red.text(summary)), MAX_CLAIM_CHARS)
+    # Not action content: the claim is the agent's own untrusted text.
+    text, _ = _clip(_one_line(red.text(summary, count_cut=False)), MAX_CLAIM_CHARS)
     return {"text": text, "trusted": False}
 
 
@@ -321,6 +345,8 @@ def build_display(action: ActionEvent) -> DisplayProjection:
     claim = _agent_claim(action, red)
     if claim is not None:
         payload["agent_claim"] = claim
+    if red.input_cut:
+        payload["input_truncated"] = True
     # Collected last so it covers every field above, including the claim.
     payload["redactions"] = red.names
     return DisplayProjection(summary=summary, payload=payload)
