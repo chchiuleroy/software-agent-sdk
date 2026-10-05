@@ -221,50 +221,66 @@ def record_attempt(
 def check_governed_binding_required(
     record: OutboxRecord | None, expected: ActionBinding | None
 ) -> None:
-    """Closes the SDK-layer gap ``roy_action_binding.py``'s own module
-    docstring states plainly rather than solves: ``EventService.run()``'s
-    ``expected_binding=None`` is a no-op by design (personal mode/today's
-    behavior, unaffected), so any agent-server entry point that calls
-    ``run()`` without threading through a real binding — ``send_message
+    """Refuse a ``run()`` that is not tied to the governed approval covering
+    the conversation's pending actions.
+
+    ``EventService.run()`` treats ``expected_binding=None`` as a no-op by
+    design (personal mode behaves as before), so any agent-server entry
+    point that calls ``run()`` without a real binding — ``send_message
     (run=True)``, the goal loop, the ACP-rerun path in ``run()``'s own
-    ``finally`` — bypasses central governance entirely for a conversation
-    that already has one pending. ``run_and_wait_for_start()`` (the
-    intended, correctly-bound caller) is unaffected: it always builds and
-    passes a real ``ActionBinding`` for the exact outbox record this
-    checks against.
+    ``finally`` — would otherwise start a conversation that is waiting for
+    confirmation without central approval. ``run_and_wait_for_start()``, the
+    intended caller, always passes a real ``ActionBinding`` for the exact
+    outbox record checked here.
 
-    A no-op only when there is no outbox record, or its state is
-    terminal (nothing left to protect). Deliberately fails *closed* while
-    ``PENDING_CREATE`` (no ``central_approval_id`` minted yet — the
-    create call to central hasn't succeeded, is still in flight, or is
-    being retried) rather than treating "nothing to compare against yet"
-    as "nothing to protect": no caller can hold a genuine binding for an
-    approval that doesn't exist yet, so every call — bindingless or not —
-    is rejected until create succeeds and a real ``central_approval_id``
-    exists to bind against. (An earlier version of this function treated
-    ``PENDING_CREATE`` as a no-op on the theory that ``check_action_
-    binding()``'s SDK-layer check remained the only defense in that
-    window — but that check is itself a no-op for exactly the bindingless
-    callers this function exists to catch, so the two "defenses" were the
-    same no-op wearing two names.)
+    This check is only reached in team mode while the conversation is
+    ``WAITING_FOR_CONFIRMATION``, i.e. while actions are pending. A call is
+    let through only when a non-terminal record exists and ``expected``
+    names that record's workflow. Everything else is refused:
 
-    Deliberately compares only ``central_approval_id`` and
-    ``action_event_id`` — the two fields that identify *which* governed
-    workflow is in flight — rather than recomputing the full
-    ``ActionBinding.fingerprint()`` (which also folds in
-    ``execution_attempt_id``/``executing_lease_expires_at``, populated
-    only after claim). Detecting a stale/replayed claim-level fingerprint
-    is ``run_and_wait_for_start()``'s own job; this check's only job is
-    "does the caller know this conversation is currently gated on a
+    * No record: the pending actions are governed by no approval.
+      ``maybe_register_governance_approval()`` registers only when exactly
+      one action is pending, its create call may not have persisted the
+      record yet, and the service may have restarted before registering.
+    * Terminal record: the governed action it tracked is finished,
+      cancelled or reconciled, so it covers none of the actions pending
+      now. A later confirmation round that the hook does not register
+      (several pending actions) leaves the old record in place.
+    * ``PENDING_CREATE`` (no ``central_approval_id`` minted yet): no caller
+      can hold a genuine binding for an approval that does not exist.
+
+    Rejecting the pending actions (``reject_pending_actions()``) does not go
+    through ``run()`` and still unblocks the conversation.
+
+    Compares only ``central_approval_id`` and ``action_event_id`` — the two
+    fields that identify *which* governed workflow is in flight — rather
+    than recomputing the full ``ActionBinding.fingerprint()`` (which also
+    folds in ``execution_attempt_id``/``executing_lease_expires_at``,
+    populated only after claim). Detecting a stale/replayed claim-level
+    fingerprint is ``run_and_wait_for_start()``'s own job; this check's only
+    job is "does the caller know this conversation is currently gated on a
     specific central approval at all".
 
     Raises:
-        ActionBindingMismatchError: a non-terminal governed action is
-            pending and ``expected`` is missing or names a different
+        ActionBindingMismatchError: there is no outbox record, the record is
+            terminal, or ``expected`` is missing or names a different
             workflow.
     """
-    if record is None or record.state in TERMINAL_STATES:
-        return
+    if record is None:
+        raise ActionBindingMismatchError(
+            "conversation is waiting for confirmation but no governed "
+            "approval is registered for its pending actions; run() cannot "
+            "start it directly (reject the pending actions, or wait for an "
+            "approval to be created and use run_and_wait_for_start())"
+        )
+    if record.state in TERMINAL_STATES:
+        raise ActionBindingMismatchError(
+            "conversation is waiting for confirmation but the governed "
+            f"approval on record is already finished ({record.state.name}) "
+            "and does not cover its pending actions; run() cannot start it "
+            "directly (reject the pending actions, or wait for a new "
+            "approval to be created and use run_and_wait_for_start())"
+        )
     if (
         expected is None
         or expected.central_approval_id != record.central_approval_id

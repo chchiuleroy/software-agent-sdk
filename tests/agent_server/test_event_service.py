@@ -4294,6 +4294,40 @@ class TestEventServiceGovernanceOrchestration:
         assert governed_service._active_governance_handshake is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "terminal_state",
+        [
+            OutboxState.RESULT_REPORTED,
+            OutboxState.RECONCILIATION_REPORTED,
+            OutboxState.CANCELLED,
+        ],
+    )
+    async def test_run_and_wait_for_start_refuses_to_restart_a_finished_approval(
+        self, governed_service, terminal_state
+    ):
+        """No handshake is in memory (fresh process, or a different one is
+        active), so only the outbox says anything about this approval. A
+        finished approval must not enter the claim flow again: doing so would
+        overwrite the terminal audit state and let a consumed approval drive
+        a new execution."""
+        await self._create_outbox_record(governed_service, state=terminal_state)
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock()
+        governed_service.governance_client = fake_client
+        governed_service.run = AsyncMock()
+
+        with pytest.raises(ActionBindingMismatchError, match="already finished"):
+            await governed_service.run_and_wait_for_start(
+                central_approval_id="approval-1", timeout_seconds=5.0
+            )
+
+        fake_client.claim.assert_not_awaited()
+        governed_service.run.assert_not_awaited()
+        assert governed_service._active_governance_handshake is None
+        record = governed_service.governance_outbox.load()
+        assert record is not None and record.state == terminal_state
+
+    @pytest.mark.asyncio
     async def test_run_and_wait_for_start_returns_started_on_success(
         self, governed_service
     ):
@@ -5263,6 +5297,149 @@ class TestEventServiceGovernanceOrchestration:
 
         assert governed_service._run_task is None
 
+    # ---------------- no-outbox boundary ----------------
+    # check_governed_binding_required() refuses a run() when there is no
+    # outbox record at all. These tests cover how a team-mode conversation
+    # can wait for confirmation with no outbox record, and that a
+    # bindingless run() is refused then.
+    # Invariant: in team mode a bindingless run() of a conversation that is
+    # waiting for confirmation is refused whether or not an outbox record
+    # exists yet.
+
+    def _waiting_conversation_with_pending(self, *pending_actions):
+        conversation = self._governed_conversation()
+        conversation._state.active_branch = MagicMock(
+            return_value=list(pending_actions)
+        )
+        conversation.send_message = MagicMock()
+        return conversation
+
+    @pytest.mark.asyncio
+    async def test_hook_declines_two_pending_actions_so_no_outbox_record_exists(
+        self, governed_service
+    ):
+        """Reachability, not the invariant: with other than one pending
+        action maybe_register_governance_approval() never engages (batch
+        confirmations are unsupported), so a team-mode conversation stays
+        WAITING_FOR_CONFIRMATION with no outbox record and no create task."""
+        governed_service._conversation = self._waiting_conversation_with_pending(
+            _governance_pending_action("call_1"),
+            _governance_pending_action("call_2", command="pwd"),
+        )
+
+        await governed_service.maybe_register_governance_approval()
+
+        assert governed_service.governance_outbox.load() is None
+        assert governed_service._pending_governance_create_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_bindingless_call_with_no_outbox_record(
+        self, governed_service
+    ):
+        assert governed_service.governance_outbox.load() is None
+        governed_service._conversation = self._governed_conversation()
+
+        with pytest.raises(ActionBindingMismatchError, match="no governed approval"):
+            await governed_service.run()
+
+        assert governed_service._run_task is None
+        governed_service._conversation.run.assert_not_called()
+        governed_service._conversation.arun.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_message_run_blocked_with_no_outbox_record(
+        self, governed_service, caplog
+    ):
+        """Same invariant through send_message(run=True), which reaches
+        run() without an expected binding. send_message() swallows the
+        ValueError run() raises, so the observable contract is that no run
+        was started, and the refusal is logged so the caller's silent
+        success is diagnosable."""
+        governed_service._conversation = self._governed_conversation()
+        governed_service._conversation.send_message = MagicMock()
+        caplog.set_level("WARNING")
+
+        await governed_service.send_message(
+            Message(role="user", content=[TextContent(text="go on")]), run=True
+        )
+
+        assert governed_service._run_task is None
+        governed_service._conversation.run.assert_not_called()
+        governed_service._conversation.arun.assert_not_awaited()
+        assert "refused by the governance gate" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_bindingless_call_in_window_before_create_persists(
+        self, governed_service
+    ):
+        """One pending action: the hook schedules the create task and
+        returns, but the PENDING_CREATE record is written only once that
+        task runs. Hold the task back to model that window; a bindingless
+        run() inside it must still be refused."""
+        governed_service._conversation = self._waiting_conversation_with_pending(
+            _governance_pending_action()
+        )
+        scheduled = []
+        governed_service._schedule_governance_create_task = MagicMock(
+            side_effect=lambda coro: (scheduled.append(coro), coro.close())
+        )
+
+        await governed_service.maybe_register_governance_approval()
+        assert len(scheduled) == 1  # hook engaged, record not written yet
+        assert governed_service.governance_outbox.load() is None
+
+        with pytest.raises(ActionBindingMismatchError):
+            await governed_service.run()
+
+        governed_service._conversation.run.assert_not_called()
+        governed_service._conversation.arun.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_bindingless_call_after_hook_declines_two_pending(
+        self, governed_service
+    ):
+        """End to end for the batch case: the hook declines, no record ever
+        exists, and a bindingless run() must still be refused rather than
+        executing the pending actions."""
+        governed_service._conversation = self._waiting_conversation_with_pending(
+            _governance_pending_action("call_1"),
+            _governance_pending_action("call_2", command="pwd"),
+        )
+        await governed_service.maybe_register_governance_approval()
+        assert governed_service.governance_outbox.load() is None
+
+        with pytest.raises(ActionBindingMismatchError):
+            await governed_service.run()
+
+        governed_service._conversation.run.assert_not_called()
+        governed_service._conversation.arun.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_bindingless_call_for_batch_round_after_terminal_record(
+        self, governed_service
+    ):
+        """A terminal record only means the governed action it tracked is
+        finished. A later confirmation round with several pending actions is
+        never registered (the hook needs exactly one), so the old terminal
+        record stays on disk and covers none of them; a bindingless run()
+        must still be refused."""
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.RESULT_REPORTED
+        )
+        governed_service._conversation = self._waiting_conversation_with_pending(
+            _governance_pending_action("call_2"),
+            _governance_pending_action("call_3", command="pwd"),
+        )
+        await governed_service.maybe_register_governance_approval()
+        record = governed_service.governance_outbox.load()
+        assert record is not None and record.state == OutboxState.RESULT_REPORTED
+
+        with pytest.raises(ActionBindingMismatchError, match="already finished"):
+            await governed_service.run()
+
+        governed_service._conversation.run.assert_not_called()
+        governed_service._conversation.arun.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_run_allows_matching_expected_binding(self, governed_service):
         record = await self._create_outbox_record(
@@ -5303,37 +5480,55 @@ class TestEventServiceGovernanceOrchestration:
         assert governed_service._run_task is None
 
     @pytest.mark.asyncio
-    async def test_run_allows_bindingless_call_when_no_outbox_record(
-        self, governed_service
+    @pytest.mark.parametrize(
+        "terminal_state",
+        [
+            OutboxState.RESULT_REPORTED,
+            OutboxState.RECONCILIATION_REPORTED,
+            OutboxState.CANCELLED,
+        ],
+    )
+    async def test_run_blocks_bindingless_call_when_outbox_terminal(
+        self, governed_service, terminal_state
     ):
-        """No governed action in flight at all (outbox never created, or
-        already cleared) — team mode itself must not block an ordinary
-        confirmation accept that isn't under central governance."""
+        """A terminal record only describes a governed action that is
+        finished, cancelled or reconciled. The conversation is waiting for
+        confirmation of other pending actions that the record does not
+        cover, so a bindingless run() is refused until a new approval
+        exists."""
+        await self._create_outbox_record(governed_service, state=terminal_state)
         governed_service._conversation = self._governed_conversation()
-        governed_service._publish_state_update = AsyncMock()
 
-        await governed_service.run()
+        with pytest.raises(ActionBindingMismatchError, match="already finished"):
+            await governed_service.run()
 
-        assert governed_service._run_task is not None
+        assert governed_service._run_task is None
+        governed_service._conversation.run.assert_not_called()
+        governed_service._conversation.arun.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_run_allows_bindingless_call_when_outbox_terminal(
+    async def test_run_blocks_matching_binding_when_outbox_terminal(
         self, governed_service
     ):
-        """A resolved (terminal) prior governed action must not block this
-        conversation's next, ungoverned confirmation round — mirrors
-        maybe_register_governance_approval()'s own archive-and-clear
-        handling of a terminal record for a *different* action; this is
-        the same terminal-state leniency applied to run()'s own guard."""
-        await self._create_outbox_record(
+        """A settled approval cannot start a run again, even when the caller
+        presents the binding of that very record."""
+        record = await self._create_outbox_record(
             governed_service, state=OutboxState.RESULT_REPORTED
         )
         governed_service._conversation = self._governed_conversation()
-        governed_service._publish_state_update = AsyncMock()
+        assert record.central_approval_id is not None
+        binding = ActionBinding(
+            central_approval_id=record.central_approval_id,
+            action_event_id=record.action_event_id,
+            execution_commitment=record.execution_commitment,
+        )
 
-        await governed_service.run()
+        with pytest.raises(ActionBindingMismatchError, match="already finished"):
+            await governed_service.run(expected_binding=binding)
 
-        assert governed_service._run_task is not None
+        assert governed_service._run_task is None
+        governed_service._conversation.run.assert_not_called()
+        governed_service._conversation.arun.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_run_allows_bindingless_call_in_personal_mode(self, event_service):
