@@ -1329,6 +1329,14 @@ class EventService:
                 )
                 self._acp_internal_rerun_requested = False
             except ValueError as e:
+                if isinstance(e, ActionBindingMismatchError):
+                    logger.warning(
+                        "send_message(run=True) appended the message but run() "
+                        "was refused by the governance gate for conversation "
+                        "%s: %s",
+                        self.stored.id,
+                        e,
+                    )
                 # run() refused. If a run is still wrapping up (its
                 # wait_for_pending tail), the message we just appended won't be
                 # picked up by it, so record explicit run intent for
@@ -1902,13 +1910,12 @@ class EventService:
                 # this check, any of those call sites would silently
                 # bypass central governance for a conversation that
                 # already has a non-terminal governed action pending. Only
-                # engages in team mode (governance_outbox.load() is always
-                # None in personal mode, so check_governed_binding_
-                # required() is a no-op there regardless of this guard —
-                # explicit gate here anyway to avoid an unnecessary sync
-                # file read on every personal-mode confirmation). See
-                # that function's own docstring for what it does and does
-                # not check.
+                # engages in team mode: check_governed_binding_required()
+                # rejects a missing outbox record, and personal mode never
+                # has one, so this gate is what keeps personal-mode
+                # confirmations unaffected (and avoids a sync file read on
+                # every one of them). See that function's own docstring for
+                # what it does and does not check.
                 if self.governance_deployment_mode == "team":
                     check_governed_binding_required(
                         self.governance_outbox.load(), expected_binding
@@ -2514,6 +2521,20 @@ class EventService:
                     "flight for this conversation"
                 )
             else:
+                if outbox_record.state in TERMINAL_STATES:
+                    # Only a *new* handshake is refused here; a retry that
+                    # matches the active handshake reuses it above and
+                    # replays its settled outcome. With no matching
+                    # handshake in memory (fresh process, or a different
+                    # approval ran since) the outbox is the only record of
+                    # this approval, and a finished one must not enter the
+                    # claim flow again: that would overwrite its terminal
+                    # state and let a consumed approval drive a new run.
+                    raise ActionBindingMismatchError(
+                        f"governance approval {central_approval_id} is "
+                        f"already finished ({outbox_record.state.name}) and "
+                        "cannot start a new execution"
+                    )
                 future = asyncio.get_running_loop().create_future()
                 task = asyncio.create_task(
                     self._claim_and_run_governed(
