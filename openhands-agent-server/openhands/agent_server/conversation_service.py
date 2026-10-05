@@ -725,6 +725,7 @@ class ConversationService:
     governance_deployment_mode: Literal["personal", "team"] = "personal"
     governance_client: GovernanceClient | None = None
     governance_origin_device_id: str = "unset-device-id"
+    governance_refuse_truncated_actions: bool = True
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
     _conversation_records: dict[UUID, _ConversationRecord] = field(
         default_factory=dict, init=False
@@ -2345,6 +2346,9 @@ class ConversationService:
             governance_origin_device_id=(
                 config.governance_origin_device_id or "unset-device-id"
             ),
+            governance_refuse_truncated_actions=(
+                config.governance_refuse_truncated_actions
+            ),
         )
 
     async def _start_event_service(
@@ -2376,6 +2380,9 @@ class ConversationService:
             governance_deployment_mode=self.governance_deployment_mode,
             governance_client=self.governance_client,
             governance_origin_device_id=self.governance_origin_device_id,
+            governance_refuse_truncated_actions=(
+                self.governance_refuse_truncated_actions
+            ),
         )
         # Lease renewal is handled by the centralized
         # _renew_all_leases_loop task on ConversationService.

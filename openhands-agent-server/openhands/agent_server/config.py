@@ -447,6 +447,21 @@ class Config(BaseModel):
             "operator-chosen identifier for this agent-server installation."
         ),
     )
+    governance_refuse_truncated_actions: bool = Field(
+        default=True,
+        description=(
+            "Only used when governance_deployment_mode is 'team'. The approval "
+            "screen shows a bounded preview of the action (a command's first "
+            "160 characters, a diff's first 30 lines, a URL's first 300 "
+            "characters), so an approver could approve a tail they never saw. "
+            "When true (default), an action whose preview was cut is not sent "
+            "for approval at all: this agent-server rejects it with a reason "
+            "that tells the agent to split it into smaller steps. Set false to "
+            "send such actions for approval anyway, with the cut recorded in "
+            "the projection's 'truncated' flags. Unknown tools are not "
+            "affected either way: their argument values are never shown."
+        ),
+    )
 
     @field_validator("governance_client_secret")
     @classmethod

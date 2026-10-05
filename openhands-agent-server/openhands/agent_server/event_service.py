@@ -23,7 +23,12 @@ from openhands.agent_server.governance_client import (
     GovernancePermanentError,
     compute_display_digest,
 )
-from openhands.agent_server.governance_display import POLICY_REVISION, build_display
+from openhands.agent_server.governance_display import (
+    POLICY_REVISION,
+    DisplayProjection,
+    build_display,
+    truncation_reason,
+)
 from openhands.agent_server.governance_outbox import (
     RETRIABLE_STATES,
     TERMINAL_STATES,
@@ -330,6 +335,7 @@ class EventService:
     governance_deployment_mode: Literal["personal", "team"] = "personal"
     governance_client: GovernanceClient | None = None
     governance_origin_device_id: str = "unset-device-id"
+    governance_refuse_truncated_actions: bool = True
     _conversation: LocalConversation | None = field(default=None, init=False)
     _pub_sub: PubSub[Event] = field(
         default_factory=lambda: PubSub[Event](max_subscribers=50), init=False
@@ -2232,6 +2238,9 @@ class EventService:
         # "{tool_name}: {every raw argument}". Central only ever sees this
         # deterministic, bounded, redacted projection (governance_display.py).
         display = build_display(action)
+        if self.governance_refuse_truncated_actions and display.is_truncated:
+            await self._refuse_truncated_action(action, display)
+            return
         action_summary = display.summary
         action_payload = display.payload
         action_payload_digest = compute_display_digest(
@@ -2264,6 +2273,60 @@ class EventService:
             # existing record is authoritative, nothing more to do.
             return
         await self._send_create_approval(record)
+
+    async def _refuse_truncated_action(
+        self, action: ActionEvent, display: DisplayProjection
+    ) -> None:
+        """Reject a pending action that no approver could be shown in full.
+
+        An approver sees the bounded projection, so approving an action whose
+        projection was cut would approve text nobody read. No outbox record
+        exists for it, so run() already refuses it (see
+        check_governed_binding_required()); rejecting turns that dead end into
+        feedback the agent can act on. reject_pending_actions() rejects
+        whatever is pending, and a human may have rejected this action
+        meanwhile, so the re-check and the rejection happen under one hold of
+        the state lock (see _reject_if_still_pending_sync()).
+
+        If rejecting fails the conversation stays waiting with no approval,
+        which run() still refuses: the safe outcome holds, so this only logs.
+        """
+        logger.warning(
+            "team mode: refusing action %s (tool %s) for conversation %s: its "
+            "approval preview is truncated",
+            action.id,
+            action.tool_name,
+            self.stored.id,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                self._reject_if_still_pending_sync,
+                action.id,
+                truncation_reason(display),
+            )
+        except Exception:
+            logger.exception(
+                "team mode: could not reject the truncated action %s for "
+                "conversation %s; it stays unapproved",
+                action.id,
+                self.stored.id,
+            )
+
+    def _reject_if_still_pending_sync(self, action_id: str, reason: str) -> bool:
+        """Off-loop (see _snapshot_pending_actions_sync() for why): reject the
+        pending actions only if the one pending action is still ``action_id``.
+        The read and the rejection share one hold of the state lock — it is
+        reentrant, so reject_pending_actions() takes it again inside — so no
+        other thread can change what is pending between them."""
+        assert self._conversation is not None
+        with self._conversation._state as state:
+            pending = ConversationState.get_unmatched_actions(state.active_branch())
+            if [a.id for a in pending] != [action_id]:
+                return False
+            self._conversation.reject_pending_actions(reason)
+            return True
 
     async def _send_create_approval(self, record: OutboxRecord) -> None:
         """POSTs ``record``'s own already-persisted fields to central via

@@ -13,12 +13,17 @@ import json
 
 import pytest
 
+from openhands.agent_server import governance_display as gd
 from openhands.agent_server.governance_display import (
     MAX_COMMAND_PREVIEW_CHARS,
+    MAX_PREVIEW_LINE_CHARS,
     MAX_PREVIEW_LINES,
+    MAX_QUERY_KEYS,
+    MAX_URL_CHARS,
     POLICY_REVISION,
     PROJECTION_VERSION,
     build_display,
+    truncation_reason,
 )
 from openhands.agent_server.governance_redaction import REDACTION_VERSION
 from openhands.sdk.event import ActionEvent
@@ -517,3 +522,215 @@ def test_output_size_is_bounded_whatever_the_input_size(action):
     projection = build_display(action)
 
     assert len(_shown(projection)) < 12_000
+
+
+# --- truncation: does the approver see the whole action? ----------------------
+
+
+def _create_file(content: str) -> ActionEvent:
+    return _event(
+        "file_editor",
+        FileEditorAction(command="create", path="/w/f.txt", file_text=content),
+    )
+
+
+def _navigate(url: str) -> ActionEvent:
+    return _event("browser_navigate", BrowserNavigateAction(url=url))
+
+
+def _patch_adding(n_lines: int) -> ActionEvent:
+    body = "\n".join(f"+{i}" for i in range(n_lines))
+    return _event(
+        "apply_patch",
+        ApplyPatchAction(
+            patch=f"*** Begin Patch\n*** Add File: a.py\n{body}\n*** End Patch"
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        (_terminal("e" * MAX_COMMAND_PREVIEW_CHARS), False),
+        (_terminal("e" * (MAX_COMMAND_PREVIEW_CHARS + 1)), True),
+        (_create_file("\n".join("r" for _ in range(MAX_PREVIEW_LINES))), False),
+        (_create_file("\n".join("r" for _ in range(MAX_PREVIEW_LINES + 1))), True),
+        (_create_file("c" * (MAX_PREVIEW_LINE_CHARS + 1)), True),
+        (_event("apply_patch", ApplyPatchAction(patch=PATCH)), False),
+        (_patch_adding(MAX_PREVIEW_LINES + 5), True),
+        (_navigate("https://example.com/a"), False),
+        (_navigate("https://example.com/" + "p" * MAX_URL_CHARS), True),
+        (_event("some_mcp_tool", _McpLikeAction(query="q", api_token="t")), False),
+        (_event("file_editor", FileEditorAction(command="view", path="/w/f")), False),
+    ],
+    ids=[
+        "terminal-at-limit",
+        "terminal-over-limit",
+        "file-at-line-limit",
+        "file-over-line-limit",
+        "file-over-line-width",
+        "patch-small",
+        "patch-over-line-limit",
+        "url-short",
+        "url-over-limit",
+        "unknown-tool",
+        "file-view",
+    ],
+)
+def test_projection_reports_whether_the_approver_sees_less_than_the_action(
+    action, expected
+):
+    assert build_display(action).is_truncated is expected
+
+
+def test_truncation_flag_is_not_part_of_the_digested_payload():
+    # The payload is what central digests and shows: adding anything to it
+    # would change the wire contract. The flag is derived from it instead.
+    payload = build_display(_terminal("e" * 5000)).payload
+
+    assert "is_truncated" not in payload
+    assert payload["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("action", "limit_text"),
+    [
+        (_terminal("e" * 5000), str(MAX_COMMAND_PREVIEW_CHARS)),
+        (_create_file("r\n" * 500), str(MAX_PREVIEW_LINES)),
+        (_patch_adding(100), str(MAX_PREVIEW_LINES)),
+        (_navigate("https://example.com/" + "p" * 1000), str(MAX_URL_CHARS)),
+    ],
+    ids=["terminal", "file", "patch", "url"],
+)
+def test_truncation_reason_names_the_limit_and_tells_the_agent_what_to_do(
+    action, limit_text
+):
+    reason = truncation_reason(build_display(action))
+
+    assert limit_text in reason
+    assert "smaller steps" in reason
+
+
+def test_truncation_reason_never_repeats_the_action_content():
+    secret = "ZZ-not-a-real-secret-ZZ"
+    reason = truncation_reason(build_display(_terminal(f"echo {secret} " + "e" * 500)))
+
+    assert secret not in reason
+
+
+# --- limits that cut the INPUT before the preview limits apply ----------------
+
+
+def _replace(old: str, new: str) -> ActionEvent:
+    return _event(
+        "file_editor",
+        FileEditorAction(
+            command="str_replace", path="/w/f.txt", old_str=old, new_str=new
+        ),
+    )
+
+
+def test_str_replace_differing_only_past_the_input_line_cap_is_truncated():
+    # The diff is computed on the first _MAX_INPUT_LINES lines of each side.
+    # Identical heads give an empty diff, so a change after that point would
+    # look like "nothing to show" while the flag stayed False.
+    shared = [f"line {i}" for i in range(600)]
+    old = "\n".join(shared)
+    new = "\n".join(shared[:550] + ["CHANGED"] + shared[551:])
+
+    projection = build_display(_replace(old, new))
+
+    assert projection.payload["diff_preview"] == []
+    assert projection.payload["diff_truncated"] is True
+    assert projection.is_truncated
+
+
+def test_str_replace_differing_only_past_the_char_cap_is_truncated():
+    old = "a" * 150_000
+    new = "a" * 149_999 + "b"
+
+    projection = build_display(_replace(old, new))
+
+    assert projection.is_truncated
+
+
+def test_str_replace_within_both_caps_is_not_truncated():
+    projection = build_display(_replace("old line", "new line"))
+
+    assert not projection.is_truncated
+
+
+@pytest.mark.parametrize(
+    ("n_keys", "expected"),
+    [(MAX_QUERY_KEYS, False), (MAX_QUERY_KEYS + 1, True)],
+    ids=["keys-at-limit", "keys-over-limit"],
+)
+def test_browser_url_with_more_query_keys_than_shown_is_truncated(n_keys, expected):
+    query = "&".join(f"k{i}=v" for i in range(n_keys))
+    projection = build_display(_navigate(f"https://example.com/p?{query}"))
+
+    assert len(projection.payload["query_keys"]) == min(n_keys, MAX_QUERY_KEYS)
+    assert projection.is_truncated is expected
+
+
+# --- cuts the preview limits never see (found in a second review) --------------
+
+_INPUT_CAP = gd._MAX_INPUT_CHARS
+
+
+def test_query_keys_past_the_input_cap_are_truncated():
+    # The URL is cut to the input cap before it is parsed, so a parameter name
+    # after a long value is not in query_keys at all.
+    url = "https://example.test/cb?k=" + "p" * (_INPUT_CAP + 10) + "&dangerous=v"
+    projection = build_display(_navigate(url))
+
+    assert "dangerous" not in projection.payload["query_keys"]
+    assert projection.is_truncated
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(document.cookie)",
+        "data:text/html,<script>x</script>",
+        "file:///etc/passwd",
+        "mailto:someone@example.test",
+    ],
+)
+def test_url_whose_content_is_shown_only_as_a_length_is_truncated(url):
+    # For schemes without a host the content lives in the "path", and the
+    # projection shows only how long it is. That is the whole action, not a
+    # credential or a query value, so the approver is not seeing it.
+    projection = build_display(_navigate(url))
+
+    assert projection.payload["url"].endswith("chars]")
+    assert projection.is_truncated
+
+
+@pytest.mark.parametrize("url", ["/cb?x=1", "site.example/a?x=1", "https://h.test/p"])
+def test_url_shown_as_host_and_path_is_not_truncated(url):
+    assert not build_display(_navigate(url)).is_truncated
+
+
+def test_file_path_past_the_input_cap_is_truncated():
+    action = _event(
+        "file_editor",
+        FileEditorAction(command="create", path="/w/" + "d" * _INPUT_CAP, file_text=""),
+    )
+
+    assert build_display(action).is_truncated
+
+
+def test_input_cut_is_recorded_in_the_payload_only_when_it_happens():
+    normal = build_display(_terminal("ls")).payload
+    cut = build_display(_terminal("e" * (_INPUT_CAP + 1))).payload
+
+    assert "input_truncated" not in normal
+    assert cut["input_truncated"] is True
+
+
+def test_an_overlong_agent_claim_is_not_an_action_truncation():
+    # The claim is the agent's own untrusted text, not the action.
+    projection = build_display(_terminal("ls", summary="x" * (_INPUT_CAP + 1)))
+
+    assert not projection.is_truncated

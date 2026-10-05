@@ -81,7 +81,10 @@ TEAM_MODE_ENV = {
 
 def _clear_governance_env(monkeypatch, tmp_path):
     monkeypatch.setenv(CONFIG_PATH_ENV, str(tmp_path / "missing.json"))
-    for name in list(TEAM_MODE_ENV) + ["OH_GOVERNANCE_ORIGIN_DEVICE_ID"]:
+    for name in list(TEAM_MODE_ENV) + [
+        "OH_GOVERNANCE_ORIGIN_DEVICE_ID",
+        "OH_GOVERNANCE_REFUSE_TRUNCATED_ACTIONS",
+    ]:
         monkeypatch.delenv(name, raising=False)
 
 
@@ -144,6 +147,16 @@ def test_load_config_personal_mode_needs_no_governance_settings(monkeypatch, tmp
     _clear_governance_env(monkeypatch, tmp_path)
 
     assert load_config().governance_deployment_mode == "personal"
+
+
+def test_refusing_truncated_actions_is_on_by_default_and_env_turns_it_off(
+    monkeypatch, tmp_path
+):
+    _clear_governance_env(monkeypatch, tmp_path)
+    assert load_config().governance_refuse_truncated_actions is True
+
+    monkeypatch.setenv("OH_GOVERNANCE_REFUSE_TRUNCATED_ACTIONS", "false")
+    assert load_config().governance_refuse_truncated_actions is False
 
 
 def test_directly_built_team_config_stays_permissive():
