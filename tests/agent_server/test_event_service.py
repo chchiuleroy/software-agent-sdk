@@ -6042,6 +6042,50 @@ class TestEventServiceGovernanceOrchestration:
             await self._stop_restored(governed_service)
 
     @pytest.mark.asyncio
+    async def test_real_restart_of_waiting_conversation_registers_its_approval(
+        self, governed_service, tmp_path
+    ):
+        """No stubs on the persisted conversation: a service is started, left
+        waiting for confirmation with one unmatched action and closed; a new
+        service on the same directory then restarts it and must register the
+        approval from what was actually persisted."""
+        action = _governance_pending_action()
+        governed_service._external_lease_renewal = True
+        await governed_service.start()
+        conversation = governed_service.get_conversation()
+        with conversation._state as state:
+            conversation._on_event(action)
+            state.execution_status = (
+                ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            )
+        await governed_service.close()
+
+        restarted = EventService(
+            stored=governed_service.stored,
+            agent=governed_service.agent,
+            conversations_dir=governed_service.conversations_dir,
+        )
+        restarted.governance_deployment_mode = "team"
+        restarted.governance_origin_device_id = "device-1"
+        restarted._external_lease_renewal = True
+        client = MagicMock()
+        client.create_approval = AsyncMock(return_value={"id": "approval-real"})
+        restarted.governance_client = client
+        try:
+            await restarted.start()
+            for task in list(restarted._pending_governance_create_tasks):
+                await task
+
+            client.create_approval.assert_awaited_once()
+            record = restarted.governance_outbox.load()
+            assert record is not None
+            assert record.action_event_id == action.id
+            assert record.state == OutboxState.CREATED
+        finally:
+            await self._drain_wait_for_decision_task(restarted)
+            await restarted.close()
+
+    @pytest.mark.asyncio
     async def test_relay_retries_result_pending_success(self, governed_service):
         await self._create_outbox_record(
             governed_service, state=OutboxState.RESULT_PENDING
