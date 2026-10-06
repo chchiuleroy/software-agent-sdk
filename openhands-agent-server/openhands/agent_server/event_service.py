@@ -2465,7 +2465,10 @@ class EventService:
         # retry could re-classify a different outcome from a since-changed
         # event log — this way, _outbox_relay_loop()'s retry always
         # replays the exact same outcome via the same idempotency key.
-        await self.governance_outbox.mutate(
+        # Read the attestation from the record this mutate just wrote, not
+        # from the snapshot loaded above: the EXECUTION_STARTED marker is
+        # scheduled separately and may land in between.
+        pending = await self.governance_outbox.mutate(
             lambda r: record_attempt(
                 _with_pending_report_outcome(r, outcome),
                 new_state=OutboxState.RESULT_PENDING,
@@ -2477,7 +2480,7 @@ class EventService:
                 idempotency_key=f"report-{record.execution_attempt_id}",
                 execution_attempt_id=record.execution_attempt_id,
                 outcome=outcome,
-                executed_commitment=record.attested_commitment(),
+                executed_commitment=pending.attested_commitment(),
             )
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
@@ -2536,7 +2539,7 @@ class EventService:
         # deliberate: the outbox relay loop was already stopped just above
         # in close(), so nothing would ever retry a RESULT_PENDING left
         # behind by a process that is tearing down right now.
-        await self.governance_outbox.mutate(
+        pending = await self.governance_outbox.mutate(
             lambda r: record_attempt(
                 _with_pending_report_outcome(r, "failure_unknown"),
                 new_state=OutboxState.RESULT_PENDING,
@@ -2548,7 +2551,7 @@ class EventService:
                 idempotency_key=f"report-{record.execution_attempt_id}",
                 execution_attempt_id=record.execution_attempt_id,
                 outcome="failure_unknown",
-                executed_commitment=record.attested_commitment(),
+                executed_commitment=pending.attested_commitment(),
             )
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)

@@ -22,6 +22,7 @@ from openhands.agent_server.event_service import (
     GovernanceStartOutcome,
     GovernanceStartRejectedError,
     _GovernanceHandshake,
+    _with_execution_attested,
     _with_pending_report_outcome,
 )
 from openhands.agent_server.governance_client import (
@@ -4863,6 +4864,51 @@ class TestEventServiceGovernanceOrchestration:
         _, kwargs = fake_client.report_result.call_args
         expected = record.execution_commitment if expect_attestation else None
         assert kwargs["executed_commitment"] == expected
+
+    @pytest.mark.asyncio
+    async def test_report_uses_the_marker_that_landed_after_the_snapshot_was_read(
+        self, governed_service
+    ):
+        """The EXECUTION_STARTED marker is written by a separately scheduled
+        task, so it can land after the report path has loaded the record but
+        before it sends. Reading the attestation from that stale snapshot
+        would tell central "not attested" for an execution whose check had
+        passed (found by review)."""
+        action = _governance_pending_action()
+        record = self._keyed(
+            governed_service, action, self._claimed_record(governed_service, action)
+        )
+        assert record.execution_attested is False
+        await governed_service.governance_outbox.create_record(record)
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=False),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+
+        real_mutate = governed_service.governance_outbox.mutate
+        marker_pending = True
+
+        async def _mutate_after_marker_lands(fn):
+            # The marker lands first, then the report path's own mutate runs.
+            nonlocal marker_pending
+            if marker_pending:
+                marker_pending = False
+                await real_mutate(_with_execution_attested)
+            return await real_mutate(fn)
+
+        governed_service.governance_outbox.mutate = _mutate_after_marker_lands
+
+        await governed_service.maybe_report_governance_result()
+
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["executed_commitment"] == record.execution_commitment
 
     @pytest.mark.asyncio
     async def test_close_reconcile_does_not_attest_an_execution_that_never_started(
