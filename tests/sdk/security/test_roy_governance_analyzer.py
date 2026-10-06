@@ -178,6 +178,26 @@ def test_grep_and_glob_without_a_path_stay_gated(analyzer):
     )
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    ["../outside/*", "sub/../../outside/*", "/etc/**", "~/x/*", "C:/x/*", r"..\x"],
+)
+def test_glob_pattern_that_can_leave_the_path_is_gated(analyzer, workspace, pattern):
+    # glob evaluates ``pattern`` as written (the Python fallback backend), so a
+    # path inside the workspace says nothing about where an absolute or ``..``
+    # pattern reaches. (Found by review; the old field-name routing had it too.)
+    action = GlobAction(pattern=pattern, path=str(workspace))
+    risk = _risk(analyzer, "glob", action)
+    assert risk != SecurityRisk.LOW
+    assert ConfirmRisky().should_confirm(risk) is True
+
+
+@pytest.mark.parametrize("pattern", ["**/*.py", "src/*.py", "*.md", "a..b/*"])
+def test_glob_pattern_below_the_path_stays_free(analyzer, workspace, pattern):
+    action = GlobAction(pattern=pattern, path=str(workspace))
+    assert _risk(analyzer, "glob", action) == SecurityRisk.LOW
+
+
 def test_terminal_is_high(analyzer):
     action = TerminalAction(command="ls")
     assert _risk(analyzer, "terminal", action) == SecurityRisk.HIGH

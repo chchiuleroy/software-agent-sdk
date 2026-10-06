@@ -8,6 +8,7 @@ POST /{conversation_id}/security_analyzer REST endpoint 選用
 from __future__ import annotations
 
 import os
+import re
 
 from openhands.sdk.event.llm_convertible import ActionEvent
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
@@ -41,6 +42,28 @@ _PATH_TOOLS: dict[str, tuple[str, bool]] = {
     "list_directory": ("dir_path", True),
 }
 
+# glob takes a second argument that can name a directory by itself: the Python
+# fallback backend evaluates ``pattern`` as written, so ``../outside/*`` or an
+# absolute pattern reaches files outside ``path``. A ``path`` inside the
+# workspace therefore proves nothing unless the pattern stays inside it too.
+_PATTERN_FIELD_BY_TOOL = {"glob": "pattern"}
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+def _pattern_may_leave_path(pattern: object) -> bool:
+    """True when ``pattern`` is absolute, home-relative, drive-qualified or
+    contains a ``..`` component — anything that is not strictly below the
+    directory it is searched in."""
+    if not isinstance(pattern, str):
+        return True
+    normalized = pattern.replace("\\", "/")
+    return (
+        normalized.startswith(("/", "~"))
+        or bool(_DRIVE_PREFIX.match(normalized))
+        or ".." in normalized.split("/")
+    )
+
+
 # A tool is "built-in" only if its Action class comes from this package. The
 # tool name alone is not enough: a third-party tool (an MCP server's, a plugin's)
 # can be called ``file_editor`` or have a field named ``path``, and treating it
@@ -57,6 +80,7 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
     - 內建檔案/搜尋工具(``_PATH_TOOLS``)的路徑在工作區內 -> LOW(免核准)
     - 同上,路徑在工作區外 -> HIGH(需核准)
     - 同上,但沒給路徑(grep/glob 不帶 path)-> UNKNOWN(需核准)
+    - glob 的 pattern 可跳出 path(絕對路徑、``~``、磁碟機代號、``..``)-> UNKNOWN
     - 任何有 ``command`` 欄位的動作(TerminalAction 等)-> HIGH
       (比照 dsh bash/pwsh 一律問;只會更嚴格,所以不限工具身分)
     - 其餘一律 UNKNOWN(需核准),**包含第三方/MCP 工具**,不論它有沒有叫
@@ -85,6 +109,11 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
         ):
             field, relative_to_workspace = spec
             path = getattr(act, field, None)
+            pattern_field = _PATTERN_FIELD_BY_TOOL.get(action.tool_name)
+            if pattern_field and _pattern_may_leave_path(
+                getattr(act, pattern_field, None)
+            ):
+                return SecurityRisk.UNKNOWN
             if isinstance(path, str) and path:
                 in_workspace = self._is_in_workspace(
                     path, relative_to_workspace=relative_to_workspace
