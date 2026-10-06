@@ -444,7 +444,12 @@ class Config(BaseModel):
             "Value sent as CreateApprovalRequest.origin_device_id. This MVP "
             "slice does not auto-register a device via central-governance-"
             "api's POST /devices/register — set this to a stable, "
-            "operator-chosen identifier for this agent-server installation."
+            "operator-chosen identifier for this agent-server installation. "
+            "If central-governance-api runs with CGA_DEVICE_BINDING_ENFORCED, "
+            "this value must first be registered by THIS process's own "
+            "governance_client_id service account (POST /api/v1/devices/"
+            "register) and not revoked, or every create/claim answers 403 "
+            "device_not_bound."
         ),
     )
     governance_refuse_truncated_actions: bool = Field(

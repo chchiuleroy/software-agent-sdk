@@ -408,6 +408,12 @@ class ConfirmationResponseRequest(BaseModel):
     ``openhands.sdk.security.roy_self_approval``); a match responds with a
     ``403`` (``SelfApprovalDeniedError``, mapped in ``api.py``) instead of
     executing the pending action.
+
+    Self-reported and therefore NOT an authorization boundary. Under
+    ``governance_deployment_mode == "team"`` an ``accept=True`` ignores it
+    entirely (identity model B): the approver that counts is the one
+    central-governance-api verified from their OIDC token when deciding
+    ``central_approval_id``.
     """
     central_approval_id: str | None = None
     """The central-governance-api approval id this ``accept=True`` is
