@@ -127,6 +127,29 @@ class OutboxRecord:
     # durably persisting intent" invariant. Only meaningful while
     # state == RESULT_PENDING; stale otherwise.
     pending_report_outcome: str | None = None
+    # Per-record secret behind ``execution_commitment`` (an HMAC under it, see
+    # roy_action_binding.compute_execution_commitment). Local only: it is never
+    # sent to central, and it is what lets an audit recompute the commitment
+    # from this device's copy of the action. None for a record created before
+    # commitments were registered (then ``execution_commitment`` is the older
+    # unkeyed hash and central holds nothing to compare it with).
+    commitment_key: str | None = None
+    # True once the binding check passed immediately before execution started
+    # (set with EXECUTION_STARTED). Only then may the device attest it to
+    # central at report-result; a lost marker means "not attested", which
+    # central records as unknown rather than as a pass.
+    execution_attested: bool = False
+
+    def registered_commitment(self) -> str | None:
+        """The commitment central holds for this record, or None if this
+        record never registered one."""
+        return self.execution_commitment if self.commitment_key else None
+
+    def attested_commitment(self) -> str | None:
+        """What to put in ``executed_commitment`` at report-result."""
+        if self.commitment_key and self.execution_attested:
+            return self.execution_commitment
+        return None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True, default=str)

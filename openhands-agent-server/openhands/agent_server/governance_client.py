@@ -56,6 +56,7 @@ def compute_display_digest(
     action_summary: str,
     action_payload: dict[str, Any],
     digest_salt: str | None,
+    execution_commitment: str | None = None,
 ) -> str:
     canonical = {
         "action_type": action_type,
@@ -65,6 +66,10 @@ def compute_display_digest(
         "action_payload": action_payload,
         "digest_salt": digest_salt,
     }
+    if execution_commitment is not None:
+        # Added only when present, exactly as central does, so a record with
+        # no commitment hashes as it always did.
+        canonical["execution_commitment"] = execution_commitment
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -348,10 +353,23 @@ class GovernanceClient:
         )
         return response.json()
 
-    async def claim(self, approval_id: str, *, idempotency_key: str) -> dict[str, Any]:
+    async def claim(
+        self,
+        approval_id: str,
+        *,
+        idempotency_key: str,
+        execution_commitment: str | None = None,
+    ) -> dict[str, Any]:
+        # No body at all for a record that has no commitment, so a claim for
+        # one is byte-for-byte what it always was.
         response = await self._request(
             "POST",
             f"/api/v1/approvals/{approval_id}/claim",
+            json_body=(
+                {"execution_commitment": execution_commitment}
+                if execution_commitment is not None
+                else None
+            ),
             idempotency_key=idempotency_key,
         )
         return response.json()
@@ -363,11 +381,14 @@ class GovernanceClient:
         idempotency_key: str,
         execution_attempt_id: str | None = None,
         outcome: str | None = None,
+        executed_commitment: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {}
         if execution_attempt_id is not None:
             body["execution_attempt_id"] = execution_attempt_id
             body["outcome"] = outcome
+            if executed_commitment is not None:
+                body["executed_commitment"] = executed_commitment
         response = await self._request(
             "POST",
             f"/api/v1/approvals/{approval_id}/report-result",

@@ -41,8 +41,9 @@ Design mirrors ``roy_self_approval.py`` deliberately:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -98,13 +99,14 @@ class ActionBinding:
     the approval record is created and carried through claim/execute.
 
     ``execution_commitment`` is computed locally (see
-    ``compute_execution_commitment`` below) and never sent to
-    central-governance-api — only the redacted display fields go there
-    (see that service's ``approvals/digest.py`` module docstring for why:
-    "this service never receives the canonical (unredacted) action
-    payload"). Re-verifying this commitment against the *current* pending
-    action, right before executing, is this process's own responsibility
-    precisely because central can't do it.
+    ``compute_execution_commitment`` below). When ``commitment_key`` is set
+    it is an HMAC under that per-record key, and only that opaque value goes
+    to central-governance-api (which stores it, covers it with the create-time
+    digest and compares it at claim and report-result); the key and the
+    canonical action never leave this device. Without a key it is the older
+    unkeyed SHA-256 and stays local. Either way, re-verifying it against the
+    *current* pending action, right before executing, is this process's own
+    responsibility: central cannot recompute it.
     """
 
     central_approval_id: str
@@ -112,6 +114,9 @@ class ActionBinding:
     execution_commitment: str
     execution_attempt_id: str | None = None
     executing_lease_expires_at: datetime | None = None
+    # Not part of fingerprint(): the key is a secret and the commitment it
+    # produced already identifies the execution.
+    commitment_key: str | None = field(default=None, repr=False)
 
     def fingerprint(self) -> str:
         """Stable identity for "is this the same in-flight governed
@@ -131,17 +136,23 @@ class ActionBinding:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def compute_execution_commitment(action: ActionEvent, conversation_id: str) -> str:
-    """SHA-256 hex digest over a canonical JSON encoding of the exact
-    action content this process is about to execute.
+def compute_execution_commitment(
+    action: ActionEvent, conversation_id: str, key: str | None = None
+) -> str:
+    """Hex digest over a canonical JSON encoding of the exact action content
+    this process is about to execute.
 
-    Deliberately plain SHA-256, not HMAC: an earlier design iteration used
-    an HMAC with a per-record local key, but since this value never leaves
+    Without ``key`` this is plain SHA-256 — fine while the value never leaves
     local memory/disk and is never displayed back to any caller (see
     ``api.py``'s exception handlers for this module — they must never echo
-    binding details), a keyed hash adds secret-management surface for no
-    real benefit. This is a versioned canonical-content equality check,
-    not a tamper-evidence mechanism.
+    binding details): a versioned canonical-content equality check, not a
+    tamper-evidence mechanism.
+
+    With ``key`` it is HMAC-SHA256 under that per-record secret, which is
+    what makes it safe to register with central-governance-api: an unkeyed
+    hash of a short command could be recovered by guessing candidates, and
+    central stores it. An auditor holding the key and this device's copy of
+    the action can recompute and compare it; nobody without the key can.
     """
     canonical: dict[str, Any] = {
         "schema_version": _COMMITMENT_SCHEMA_VERSION,
@@ -158,6 +169,10 @@ def compute_execution_commitment(action: ActionEvent, conversation_id: str) -> s
         ),
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    if key is not None:
+        return hmac.new(
+            key.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -199,8 +214,10 @@ def check_action_binding(
         raise ExecutionLeaseExpiredError(
             "central execution lease expired before this action could start"
         )
-    recomputed = compute_execution_commitment(action, conversation_id)
-    if recomputed != expected.execution_commitment:
+    recomputed = compute_execution_commitment(
+        action, conversation_id, expected.commitment_key
+    )
+    if not hmac.compare_digest(recomputed, expected.execution_commitment):
         raise ActionBindingMismatchError(
             "pending action's content changed since central approval was granted"
         )

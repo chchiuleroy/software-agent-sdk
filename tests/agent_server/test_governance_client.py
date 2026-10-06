@@ -8,6 +8,7 @@ central-governance-api's ops/ directory (not part of the pytest suite).
 
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -331,6 +332,94 @@ def test_compute_display_digest_matches_known_vector():
         digest_salt=None,
     )
     assert digest == "829d1940a8b171535575c5a76aff4bbee75570948c6c4e7851844b50d97759bf"
+
+
+# The same literals are asserted in central-governance-api's
+# tests/test_execution_commitment.py, each computed by that side's own
+# function: a drift in either copy breaks one of the two files.
+_GOLDEN_ARGS = dict(
+    action_type="tool_call",
+    tool_name="terminal",
+    policy_revision="agent-server-display-v2",
+    action_summary="terminal: ls",
+    action_payload={"kind": "terminal", "command_preview": "ls"},
+    digest_salt="salt-1",
+)
+_GOLDEN_COMMITMENT = "ab" * 32
+_GOLDEN_PLAIN = "e0a423a81c6c2f5b5d9e03201eaec983829b01d009e11449a40713dd08eef158"
+_GOLDEN_WITH_COMMITMENT = (
+    "d87cae0970a399e31e6afa849490f60f57799de5be140c109ca435a083c1733f"
+)
+
+
+def test_digest_without_a_commitment_matches_central_and_is_unchanged():
+    # A record that registered no commitment must hash exactly as before.
+    assert compute_display_digest(**_GOLDEN_ARGS) == _GOLDEN_PLAIN
+    assert (
+        compute_display_digest(**_GOLDEN_ARGS, execution_commitment=None)
+        == _GOLDEN_PLAIN
+    )
+
+
+def test_digest_covering_a_commitment_matches_central():
+    digest = compute_display_digest(
+        **_GOLDEN_ARGS, execution_commitment=_GOLDEN_COMMITMENT
+    )
+    assert digest == _GOLDEN_WITH_COMMITMENT
+
+
+def _recording_client(captured: list):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        captured.append(request)
+        return httpx.Response(200, json={"id": "a", "status": "ok"})
+
+    return _make_client(handler)
+
+
+@pytest.mark.asyncio
+async def test_claim_sends_the_commitment_only_when_there_is_one():
+    # A record that registered none must be claimed with no body at all,
+    # exactly as before; one that did must present it or central refuses.
+    captured: list = []
+    client = _recording_client(captured)
+
+    await client.claim("a1", idempotency_key="k1")
+    await client.claim("a1", idempotency_key="k2", execution_commitment="cd" * 32)
+
+    assert captured[0].content == b""
+    assert json.loads(captured[1].content) == {"execution_commitment": "cd" * 32}
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_report_result_attaches_the_attestation_to_execution_results_only():
+    captured: list = []
+    client = _recording_client(captured)
+
+    await client.report_result(
+        "a1",
+        idempotency_key="k1",
+        execution_attempt_id="att-1",
+        outcome="success",
+        executed_commitment="cd" * 32,
+    )
+    await client.report_result(
+        "a1",
+        idempotency_key="k2",
+        execution_attempt_id="att-1",
+        outcome="success",
+    )
+    # A pre-claim abort has no execution to attest, and central rejects one.
+    await client.report_result(
+        "a1", idempotency_key="k3", executed_commitment="cd" * 32
+    )
+
+    assert json.loads(captured[0].content)["executed_commitment"] == "cd" * 32
+    assert "executed_commitment" not in json.loads(captured[1].content)
+    assert json.loads(captured[2].content) == {}
+    await client.aclose()
 
 
 # --- check_health: backs GET /api/governance/status -------------------------
