@@ -677,7 +677,8 @@ def test_task_tracker_shows_how_many_tasks_not_their_text():
         _event(
             "task_tracker",
             TaskTrackerAction(
-                command="plan", task_list=[TaskItem(title="private plan", notes="n")]
+                command="plan",
+                task_list=[TaskItem(title="private plan", notes="n", status="todo")],
             ),
         )
     )

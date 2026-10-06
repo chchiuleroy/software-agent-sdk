@@ -22,6 +22,8 @@ from openhands.agent_server.event_service import (
     GovernanceStartOutcome,
     GovernanceStartRejectedError,
     _GovernanceHandshake,
+    _with_execution_attested,
+    _with_execution_started,
     _with_pending_report_outcome,
 )
 from openhands.agent_server.governance_client import (
@@ -4239,7 +4241,8 @@ class TestEventServiceGovernanceOrchestration:
         assert command not in json.dumps(body)
         assert body["action_payload"]["truncated"] is True
         # Central re-verifies this digest from the fields it receives; they
-        # must reproduce it exactly.
+        # must reproduce it exactly — including the execution commitment,
+        # which the digest now covers.
         assert body["action_payload_digest"] == compute_display_digest(
             action_type=body["action_type"],
             tool_name=body["tool_name"],
@@ -4247,7 +4250,14 @@ class TestEventServiceGovernanceOrchestration:
             action_summary=body["action_summary"],
             action_payload=body["action_payload"],
             digest_salt=body["digest_salt"],
+            execution_commitment=body["execution_commitment"],
         )
+        # The commitment is an HMAC under a per-record key that stays here:
+        # central must be able to hold the value but never the key.
+        record = governed_service.governance_outbox.load()
+        assert record.commitment_key
+        assert record.commitment_key not in json.dumps(body)
+        assert body["execution_commitment"] == record.execution_commitment
         await self._drain_wait_for_decision_task(governed_service)
 
     @pytest.mark.asyncio
@@ -4736,6 +4746,192 @@ class TestEventServiceGovernanceOrchestration:
             central_approval_id="approval-1",
             execution_attempt_id="attempt-1",
         )
+
+    # ---------- execution commitment: registered, presented, attested ----------
+
+    def _keyed(self, governed_service, action, record: OutboxRecord) -> OutboxRecord:
+        """``record`` as a device creates it now: its commitment is an HMAC
+        under a per-record key that is stored with it."""
+        record.commitment_key = "k" * 64
+        record.execution_commitment = compute_execution_commitment(
+            action, str(governed_service.stored.id), record.commitment_key
+        )
+        return record
+
+    async def _claim_with_fake_central(self, governed_service, record):
+        await governed_service.governance_outbox.create_record(record)
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-1",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+
+        seen_bindings: list = []
+
+        async def _fake_run(*, expected_binding, on_governed_start, **_kwargs):
+            seen_bindings.append(expected_binding)
+            asyncio.get_running_loop().call_soon(on_governed_start)
+
+        governed_service.run = AsyncMock(side_effect=_fake_run)
+        governed_service.governance_client = fake_client
+        outcome = await governed_service.run_and_wait_for_start(
+            central_approval_id="approval-1", timeout_seconds=5.0
+        )
+        assert outcome == GovernanceStartOutcome.STARTED
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        if governed_service._pending_governance_report_tasks:
+            await asyncio.gather(*governed_service._pending_governance_report_tasks)
+        return fake_client, seen_bindings
+
+    @pytest.mark.asyncio
+    async def test_claim_presents_the_registered_commitment_and_marks_attested(
+        self, governed_service
+    ):
+        """Central only hands out the lease if the commitment presented at
+        claim equals the one registered before the human decided, and the
+        local binding check must use the same key to recompute it. Once that
+        check has passed and execution has started, the record is marked so a
+        later report may attest it."""
+        action = _governance_pending_action()
+        record = self._keyed(
+            governed_service,
+            action,
+            self._claimed_record(governed_service, action),
+        )
+        record.state = OutboxState.CREATED
+        record.execution_attempt_id = None
+
+        client, seen = await self._claim_with_fake_central(governed_service, record)
+
+        _, kwargs = client.claim.call_args
+        assert kwargs["execution_commitment"] == record.execution_commitment
+        assert seen[0].commitment_key == record.commitment_key
+        updated = governed_service.governance_outbox.load()
+        assert updated.execution_attested is True
+
+    @pytest.mark.asyncio
+    async def test_claim_of_a_record_with_no_key_presents_nothing(
+        self, governed_service
+    ):
+        """A record created before commitments were registered has nothing at
+        central to compare with; sending one would be a mismatch."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        record.state = OutboxState.CREATED
+        record.execution_attempt_id = None
+
+        client, _ = await self._claim_with_fake_central(governed_service, record)
+
+        _, kwargs = client.claim.call_args
+        assert kwargs["execution_commitment"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("keyed", "attested", "expect_attestation"),
+        [
+            (True, True, True),
+            # The marker is lost if the process dies before it is written;
+            # that must read as "not attested", never as a pass.
+            (True, False, False),
+            # No key means central holds no commitment for this record.
+            (False, True, False),
+        ],
+        ids=["attested", "marker-lost", "legacy-record"],
+    )
+    async def test_report_attests_only_what_was_verified_before_execution(
+        self, governed_service, keyed, attested, expect_attestation
+    ):
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        if keyed:
+            self._keyed(governed_service, action, record)
+        record.execution_attested = attested
+        await governed_service.governance_outbox.create_record(record)
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=False),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+
+        await governed_service.maybe_report_governance_result()
+
+        _, kwargs = fake_client.report_result.call_args
+        expected = record.execution_commitment if expect_attestation else None
+        assert kwargs["executed_commitment"] == expected
+
+    @pytest.mark.asyncio
+    async def test_report_uses_the_marker_that_landed_after_the_snapshot_was_read(
+        self, governed_service
+    ):
+        """The EXECUTION_STARTED marker is written by a separately scheduled
+        task, so it can land after the report path has loaded the record but
+        before it sends. Reading the attestation from that stale snapshot
+        would tell central "not attested" for an execution whose check had
+        passed (found by review)."""
+        action = _governance_pending_action()
+        record = self._keyed(
+            governed_service, action, self._claimed_record(governed_service, action)
+        )
+        assert record.execution_attested is False
+        await governed_service.governance_outbox.create_record(record)
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=False),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+
+        real_mutate = governed_service.governance_outbox.mutate
+        marker_pending = True
+
+        async def _mutate_after_marker_lands(fn):
+            # The marker lands first, then the report path's own mutate runs.
+            nonlocal marker_pending
+            if marker_pending:
+                marker_pending = False
+                await real_mutate(_with_execution_attested)
+            return await real_mutate(fn)
+
+        governed_service.governance_outbox.mutate = _mutate_after_marker_lands
+
+        await governed_service.maybe_report_governance_result()
+
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["executed_commitment"] == record.execution_commitment
+
+    @pytest.mark.asyncio
+    async def test_close_reconcile_does_not_attest_an_execution_that_never_started(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        record = self._keyed(
+            governed_service, action, self._claimed_record(governed_service, action)
+        )
+        await governed_service.governance_outbox.create_record(record)
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+        governed_service._conversation = None
+
+        await governed_service.close()
+
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["outcome"] == "failure_unknown"
+        assert kwargs["executed_commitment"] is None
 
     @pytest.mark.asyncio
     async def test_maybe_report_result_reports_success(self, governed_service):
@@ -6402,6 +6598,70 @@ class TestEventServiceGovernanceOrchestration:
         assert kwargs["idempotency_key"] == "report-attempt-1"
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.RESULT_REPORTED
+
+    @pytest.mark.asyncio
+    async def test_relay_resend_attests_a_marker_that_landed_after_the_load(
+        self, governed_service
+    ):
+        """The relay loads the record once, but the start marker is its own
+        task and can land before the resend goes out; the attestation must
+        come from the current record (found by review)."""
+        action = _governance_pending_action()
+        record = self._keyed(
+            governed_service, action, self._claimed_record(governed_service, action)
+        )
+        record.state = OutboxState.RESULT_PENDING
+        record.pending_report_outcome = "success"
+        await governed_service.governance_outbox.create_record(record)
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+
+        real_mutate = governed_service.governance_outbox.mutate
+        marker_pending = True
+
+        async def _mutate_after_marker_lands(fn):
+            nonlocal marker_pending
+            if marker_pending:
+                marker_pending = False
+                await real_mutate(_with_execution_started)
+            return await real_mutate(fn)
+
+        governed_service.governance_outbox.mutate = _mutate_after_marker_lands
+
+        await governed_service._relay_outbox_once()
+
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["executed_commitment"] == record.execution_commitment
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RESULT_REPORTED
+        )
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (OutboxState.CLAIMED, OutboxState.EXECUTION_STARTED),
+            # The marker can arrive late. It must not pull a record that is
+            # already reporting (or reported) back to EXECUTION_STARTED, which
+            # the relay does not retry from.
+            (OutboxState.RESULT_PENDING, OutboxState.RESULT_PENDING),
+            (OutboxState.RESULT_REPORTED, OutboxState.RESULT_REPORTED),
+            (OutboxState.NEEDS_ATTENTION, OutboxState.NEEDS_ATTENTION),
+        ],
+    )
+    def test_start_marker_only_advances_a_claimed_record(
+        self, governed_service, state, expected
+    ):
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        record.state = state
+
+        updated = _with_execution_started(record)
+
+        assert updated.state == expected
+        # The attestation is recorded whatever the state: the check passed.
+        assert updated.execution_attested is True
 
     @pytest.mark.asyncio
     async def test_relay_result_pending_permanent_error_marks_needs_attention(

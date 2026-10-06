@@ -76,6 +76,82 @@ def test_commitment_differs_across_conversations():
     ) != compute_execution_commitment(action, "conv-2")
 
 
+def test_keyed_commitment_is_not_the_unkeyed_hash_of_the_action():
+    # central-governance-api stores the commitment. If it were the plain
+    # SHA-256 of the canonical action, anyone holding that value could confirm
+    # a guessed short command by hashing the guess. Under a per-record key the
+    # unkeyed hash of the right guess no longer matches.
+    action = _action_event(command="ls")
+
+    unkeyed = compute_execution_commitment(action, "conv-1")
+    keyed = compute_execution_commitment(action, "conv-1", "k" * 64)
+
+    assert keyed != unkeyed
+    assert keyed != compute_execution_commitment(action, "conv-1", "j" * 64)
+    assert keyed == compute_execution_commitment(action, "conv-1", "k" * 64)
+
+
+def test_keyed_binding_passes_with_its_key():
+    action = _action_event()
+    binding = ActionBinding(
+        central_approval_id="approval-1",
+        action_event_id=action.id,
+        execution_commitment=compute_execution_commitment(action, "conv-1", "k" * 64),
+        commitment_key="k" * 64,
+    )
+
+    check_action_binding(binding, [action], "conv-1")
+
+
+@pytest.mark.parametrize("key", [None, "j" * 64], ids=["no-key", "wrong-key"])
+def test_keyed_binding_fails_without_the_right_key(key):
+    # The recomputation is what ties the pending action to the registered
+    # value: without the record's own key it cannot reproduce it.
+    action = _action_event()
+    binding = ActionBinding(
+        central_approval_id="approval-1",
+        action_event_id=action.id,
+        execution_commitment=compute_execution_commitment(action, "conv-1", "k" * 64),
+        commitment_key=key,
+    )
+
+    with pytest.raises(ActionBindingMismatchError):
+        check_action_binding(binding, [action], "conv-1")
+
+
+def test_keyed_binding_still_detects_a_changed_action():
+    original = _action_event(command="ls")
+    # Same event id, different content.
+    changed = _action_event(command="rm -rf /").model_copy(update={"id": original.id})
+    binding = ActionBinding(
+        central_approval_id="approval-1",
+        action_event_id=original.id,
+        execution_commitment=compute_execution_commitment(original, "conv-1", "k" * 64),
+        commitment_key="k" * 64,
+    )
+
+    with pytest.raises(ActionBindingMismatchError):
+        check_action_binding(binding, [changed], "conv-1")
+
+
+def test_the_key_is_not_part_of_the_fingerprint_or_the_repr():
+    # The fingerprint is logged and compared across callers, and a repr can
+    # end up in a log line; the key is a secret and must be in neither.
+    def binding(key: str) -> ActionBinding:
+        return ActionBinding(
+            central_approval_id="approval-1",
+            action_event_id="event-1",
+            execution_commitment="c" * 64,
+            commitment_key=key,
+        )
+
+    with_key = binding("s3cret-key")
+    other_key = binding("another-key")
+
+    assert with_key.fingerprint() == other_key.fingerprint()
+    assert "s3cret-key" not in repr(with_key)
+
+
 def test_fingerprint_stable_for_same_binding_fields():
     action = _action_event()
     binding = _binding_for(action)

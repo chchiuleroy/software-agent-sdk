@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -241,6 +242,26 @@ def _apply_claim(
     record.execution_attempt_id = execution_attempt_id
     record.executing_lease_expires_at = executing_lease_expires_at
     record.state = OutboxState.CLAIMED
+    return record
+
+
+def _with_execution_attested(record: OutboxRecord) -> OutboxRecord:
+    """Marks that the binding check passed right before execution started —
+    see OutboxRecord.execution_attested."""
+    record.execution_attested = True
+    return record
+
+
+def _with_execution_started(record: OutboxRecord) -> OutboxRecord:
+    """The marker written once execution has started: always records the
+    attestation, but only advances a record that is still CLAIMED. The marker
+    is scheduled as its own task and can land after the report path has already
+    moved the record on (RESULT_PENDING, then RESULT_REPORTED); moving it back
+    to EXECUTION_STARTED would take a pending report out of the states the
+    relay retries from."""
+    _with_execution_attested(record)
+    if record.state == OutboxState.CLAIMED:
+        record_attempt(record, new_state=OutboxState.EXECUTION_STARTED)
     return record
 
 
@@ -722,6 +743,7 @@ class EventService:
                 claim_response = await client.claim(
                     record.central_approval_id,
                     idempotency_key=f"claim-{record.request_id}",
+                    execution_commitment=record.registered_commitment(),
                 )
             except GovernancePermanentError:
                 logger.exception(
@@ -781,11 +803,16 @@ class EventService:
             assert record.execution_attempt_id is not None
             assert record.pending_report_outcome is not None
             try:
+                # The start marker is a separate task and may have landed since
+                # `record` was loaded; read the attestation from the current
+                # record, with no await between this and the call below.
+                latest = await self.governance_outbox.mutate(lambda r: r)
                 await client.report_result(
                     record.central_approval_id,
                     idempotency_key=f"report-{record.execution_attempt_id}",
                     execution_attempt_id=record.execution_attempt_id,
                     outcome=record.pending_report_outcome,
+                    executed_commitment=latest.attested_commitment(),
                 )
                 await self.governance_outbox.mutate(
                     lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
@@ -2251,6 +2278,13 @@ class EventService:
             return
         action_summary = display.summary
         action_payload = display.payload
+        # A fresh secret per approval. The commitment is an HMAC under it, so
+        # central can hold and compare it without being able to guess the
+        # action from it; the key stays in this device's outbox.
+        commitment_key = secrets.token_hex(32)
+        execution_commitment = compute_execution_commitment(
+            action, conversation_id, commitment_key
+        )
         action_payload_digest = compute_display_digest(
             action_type="tool_call",
             tool_name=action.tool_name,
@@ -2258,6 +2292,7 @@ class EventService:
             action_summary=action_summary,
             action_payload=action_payload,
             digest_salt=digest_salt,
+            execution_commitment=execution_commitment,
         )
         record = OutboxRecord(
             request_id=uuid4().hex,
@@ -2271,8 +2306,9 @@ class EventService:
             action_payload=action_payload,
             digest_salt=digest_salt,
             action_payload_digest=action_payload_digest,
-            execution_commitment=compute_execution_commitment(action, conversation_id),
+            execution_commitment=execution_commitment,
             origin_device_id=self.governance_origin_device_id,
+            commitment_key=commitment_key,
         )
         try:
             await self.governance_outbox.create_record(record)
@@ -2362,6 +2398,10 @@ class EventService:
                     "action_payload": record.action_payload,
                     "digest_salt": record.digest_salt,
                     "action_payload_digest": record.action_payload_digest,
+                    # None for a record created before commitments existed:
+                    # its digest never covered one, so sending it would not
+                    # verify.
+                    "execution_commitment": record.registered_commitment(),
                 },
                 idempotency_key=f"create-{record.request_id}",
             )
@@ -2442,7 +2482,10 @@ class EventService:
         # retry could re-classify a different outcome from a since-changed
         # event log — this way, _outbox_relay_loop()'s retry always
         # replays the exact same outcome via the same idempotency key.
-        await self.governance_outbox.mutate(
+        # Read the attestation from the record this mutate just wrote, not
+        # from the snapshot loaded above: the EXECUTION_STARTED marker is
+        # scheduled separately and may land in between.
+        pending = await self.governance_outbox.mutate(
             lambda r: record_attempt(
                 _with_pending_report_outcome(r, outcome),
                 new_state=OutboxState.RESULT_PENDING,
@@ -2454,6 +2497,7 @@ class EventService:
                 idempotency_key=f"report-{record.execution_attempt_id}",
                 execution_attempt_id=record.execution_attempt_id,
                 outcome=outcome,
+                executed_commitment=pending.attested_commitment(),
             )
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
@@ -2512,7 +2556,7 @@ class EventService:
         # deliberate: the outbox relay loop was already stopped just above
         # in close(), so nothing would ever retry a RESULT_PENDING left
         # behind by a process that is tearing down right now.
-        await self.governance_outbox.mutate(
+        pending = await self.governance_outbox.mutate(
             lambda r: record_attempt(
                 _with_pending_report_outcome(r, "failure_unknown"),
                 new_state=OutboxState.RESULT_PENDING,
@@ -2524,6 +2568,7 @@ class EventService:
                 idempotency_key=f"report-{record.execution_attempt_id}",
                 execution_attempt_id=record.execution_attempt_id,
                 outcome="failure_unknown",
+                executed_commitment=pending.attested_commitment(),
             )
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
@@ -2672,6 +2717,7 @@ class EventService:
                 claim_response = await client.claim(
                     central_approval_id,
                     idempotency_key=f"claim-{outbox_record.request_id}",
+                    execution_commitment=outbox_record.registered_commitment(),
                 )
             except Exception:
                 logger.exception(
@@ -2766,6 +2812,7 @@ class EventService:
             execution_commitment=outbox_record.execution_commitment,
             execution_attempt_id=execution_attempt_id,
             executing_lease_expires_at=datetime.fromisoformat(lease_expires_at_raw),
+            commitment_key=outbox_record.commitment_key,
         )
 
         # `self.run()` only *schedules* the actual conversation run as a
@@ -2808,11 +2855,7 @@ class EventService:
             # marker either.
             def _mark_started_on_loop() -> None:
                 task = asyncio.create_task(
-                    self.governance_outbox.mutate(
-                        lambda r: record_attempt(
-                            r, new_state=OutboxState.EXECUTION_STARTED
-                        )
-                    )
+                    self.governance_outbox.mutate(_with_execution_started)
                 )
                 self._pending_governance_report_tasks.add(task)
                 task.add_done_callback(
