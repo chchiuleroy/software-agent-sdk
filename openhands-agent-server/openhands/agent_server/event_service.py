@@ -25,9 +25,9 @@ from openhands.agent_server.governance_client import (
 )
 from openhands.agent_server.governance_display import (
     POLICY_REVISION,
-    DisplayProjection,
     build_display,
     truncation_reason,
+    unprojected_reason,
 )
 from openhands.agent_server.governance_outbox import (
     RETRIABLE_STATES,
@@ -336,6 +336,7 @@ class EventService:
     governance_client: GovernanceClient | None = None
     governance_origin_device_id: str = "unset-device-id"
     governance_refuse_truncated_actions: bool = True
+    governance_refuse_unprojected_actions: bool = True
     _conversation: LocalConversation | None = field(default=None, init=False)
     _pub_sub: PubSub[Event] = field(
         default_factory=lambda: PubSub[Event](max_subscribers=50), init=False
@@ -2239,7 +2240,14 @@ class EventService:
         # deterministic, bounded, redacted projection (governance_display.py).
         display = build_display(action)
         if self.governance_refuse_truncated_actions and display.is_truncated:
-            await self._refuse_truncated_action(action, display)
+            await self._refuse_unreviewable_action(
+                action, truncation_reason(display), "approval preview is truncated"
+            )
+            return
+        if self.governance_refuse_unprojected_actions and display.is_unprojected:
+            await self._refuse_unreviewable_action(
+                action, unprojected_reason(), "no approval preview exists for the tool"
+            )
             return
         action_summary = display.summary
         action_payload = display.payload
@@ -2274,14 +2282,15 @@ class EventService:
             return
         await self._send_create_approval(record)
 
-    async def _refuse_truncated_action(
-        self, action: ActionEvent, display: DisplayProjection
+    async def _refuse_unreviewable_action(
+        self, action: ActionEvent, reason: str, why: str
     ) -> None:
-        """Reject a pending action that no approver could be shown in full.
+        """Reject a pending action that no approver could be shown in full:
+        its projection was cut, or the tool has none (``why`` says which).
 
         An approver sees the bounded projection, so approving an action whose
-        projection was cut would approve text nobody read. No outbox record
-        exists for it, so run() already refuses it (see
+        projection was cut, or absent, would approve something nobody read. No
+        outbox record exists for it, so run() already refuses it (see
         check_governed_binding_required()); rejecting turns that dead end into
         feedback the agent can act on. reject_pending_actions() rejects
         whatever is pending, and a human may have rejected this action
@@ -2292,11 +2301,11 @@ class EventService:
         which run() still refuses: the safe outcome holds, so this only logs.
         """
         logger.warning(
-            "team mode: refusing action %s (tool %s) for conversation %s: its "
-            "approval preview is truncated",
+            "team mode: refusing action %s (tool %s) for conversation %s: %s",
             action.id,
             action.tool_name,
             self.stored.id,
+            why,
         )
         try:
             loop = asyncio.get_running_loop()
@@ -2304,11 +2313,11 @@ class EventService:
                 None,
                 self._reject_if_still_pending_sync,
                 action.id,
-                truncation_reason(display),
+                reason,
             )
         except Exception:
             logger.exception(
-                "team mode: could not reject the truncated action %s for "
+                "team mode: could not reject the unreviewable action %s for "
                 "conversation %s; it stays unapproved",
                 action.id,
                 self.stored.id,

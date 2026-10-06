@@ -73,8 +73,10 @@ from openhands.sdk.security.roy_action_binding import (
     compute_execution_commitment,
 )
 from openhands.sdk.subagent.schema import AgentDefinition
+from openhands.sdk.tool import Action
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+from openhands.tools.browser_use.definition import BrowserTypeAction
 from openhands.tools.terminal import TerminalAction, TerminalObservation
 from tests.agent_server.stress.scripts import (
     SlowTestLLM,
@@ -3789,6 +3791,29 @@ def _governance_pending_action(
     )
 
 
+class _NoPreviewAction(Action):
+    """What an MCP tool's action looks like to governance: not from a built-in
+    package, so no projection exists for it."""
+
+    query: str
+
+
+def _governance_pending_other_action(
+    tool_name: str, action: Action, call_id: str = "call_1"
+) -> ActionEvent:
+    return ActionEvent(
+        source="agent",
+        thought=[TextContent(text="calling a tool")],
+        action=action,
+        tool_name=tool_name,
+        tool_call_id=call_id,
+        tool_call=MessageToolCall(
+            id=call_id, name=tool_name, arguments="{}", origin="completion"
+        ),
+        llm_response_id="response_1",
+    )
+
+
 class TestEventServiceGovernanceOrchestration:
     """Team-mode central-governance-api orchestration: the Phase B
     create-approval hook (``maybe_register_governance_approval`` /
@@ -6017,6 +6042,64 @@ class TestEventServiceGovernanceOrchestration:
         client, conversation = await self._register_pending(governed_service, action)
 
         client.create_approval.assert_awaited_once()
+        conversation.reject_pending_actions.assert_not_called()
+        await self._drain_wait_for_decision_task(governed_service)
+
+    @pytest.mark.asyncio
+    async def test_tool_without_a_preview_is_refused_instead_of_sent_for_approval(
+        self, governed_service
+    ):
+        """An approver of an MCP tool's action would see only argument names:
+        approval means nothing. The device refuses it itself, with a reason
+        the agent can act on that does not echo anything from the action."""
+        secret = "ZZ-private-query-ZZ"
+        action = _governance_pending_other_action(
+            "mcp_search", _NoPreviewAction(query=secret)
+        )
+
+        client, conversation = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_not_awaited()
+        assert governed_service.governance_outbox.load() is None
+        conversation.reject_pending_actions.assert_called_once()
+        (reason,) = conversation.reject_pending_actions.call_args.args
+        assert "no approval preview" in reason
+        assert "built-in tool" in reason
+        assert secret not in reason
+        assert "mcp_search" not in reason
+
+    @pytest.mark.asyncio
+    async def test_tool_without_a_preview_goes_to_central_when_the_refusal_is_off(
+        self, governed_service
+    ):
+        governed_service.governance_refuse_unprojected_actions = False
+        action = _governance_pending_other_action(
+            "mcp_search", _NoPreviewAction(query="q")
+        )
+
+        client, conversation = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_awaited_once()
+        conversation.reject_pending_actions.assert_not_called()
+        await self._drain_wait_for_decision_task(governed_service)
+
+    @pytest.mark.asyncio
+    async def test_built_in_tool_with_a_preview_still_goes_to_central(
+        self, governed_service
+    ):
+        # browser_type shows its text length only — withheld by design, not a
+        # reason to refuse.
+        action = _governance_pending_other_action(
+            "browser_type", BrowserTypeAction(index=1, text="hello")
+        )
+
+        client, conversation = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_awaited_once()
+        (body,), _ = client.create_approval.call_args
+        assert body["action_payload"]["kind"] == "tool_args"
+        assert body["action_payload"]["text_length"] == 5
+        assert "hello" not in json.dumps(body)
         conversation.reject_pending_actions.assert_not_called()
         await self._drain_wait_for_decision_task(governed_service)
 
