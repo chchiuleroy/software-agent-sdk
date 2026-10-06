@@ -118,6 +118,8 @@ _PERMANENT_ERROR_CODES = frozenset(
         "execution_attempt_mismatch",
         "record_not_found",
         "digest_mismatch",
+        "execution_commitment_mismatch",
+        "execution_commitment_required",
         "idempotency_key_reused",
         "device_not_found",
         "device_already_registered",

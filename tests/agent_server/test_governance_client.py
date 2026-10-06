@@ -152,6 +152,29 @@ async def test_authorization_denied_is_permanent():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error_code"),
+    [
+        (409, "execution_commitment_mismatch"),
+        (400, "execution_commitment_required"),
+    ],
+)
+async def test_commitment_refusals_are_permanent(status, error_code):
+    # Retrying the same claim/create with the same commitment cannot succeed;
+    # it must go to NEEDS_ATTENTION, not loop in the relay.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        return httpx.Response(status, json={"error_code": error_code, "detail": "x"})
+
+    client = _make_client(handler)
+    with pytest.raises(GovernancePermanentError) as exc_info:
+        await client.claim("a1", idempotency_key="k1", execution_commitment="ab" * 32)
+    assert exc_info.value.error_code == error_code
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_unrecognized_error_code_fails_closed_to_permanent():
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == "http://keycloak.example/token":
