@@ -252,6 +252,19 @@ def _with_execution_attested(record: OutboxRecord) -> OutboxRecord:
     return record
 
 
+def _with_execution_started(record: OutboxRecord) -> OutboxRecord:
+    """The marker written once execution has started: always records the
+    attestation, but only advances a record that is still CLAIMED. The marker
+    is scheduled as its own task and can land after the report path has already
+    moved the record on (RESULT_PENDING, then RESULT_REPORTED); moving it back
+    to EXECUTION_STARTED would take a pending report out of the states the
+    relay retries from."""
+    _with_execution_attested(record)
+    if record.state == OutboxState.CLAIMED:
+        record_attempt(record, new_state=OutboxState.EXECUTION_STARTED)
+    return record
+
+
 def _with_pending_report_outcome(record: OutboxRecord, outcome: str) -> OutboxRecord:
     """Sets the outcome about to be reported — see OutboxRecord.
     pending_report_outcome's own docstring for why this must be persisted
@@ -790,12 +803,16 @@ class EventService:
             assert record.execution_attempt_id is not None
             assert record.pending_report_outcome is not None
             try:
+                # The start marker is a separate task and may have landed since
+                # `record` was loaded; read the attestation from the current
+                # record, with no await between this and the call below.
+                latest = await self.governance_outbox.mutate(lambda r: r)
                 await client.report_result(
                     record.central_approval_id,
                     idempotency_key=f"report-{record.execution_attempt_id}",
                     execution_attempt_id=record.execution_attempt_id,
                     outcome=record.pending_report_outcome,
-                    executed_commitment=record.attested_commitment(),
+                    executed_commitment=latest.attested_commitment(),
                 )
                 await self.governance_outbox.mutate(
                     lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
@@ -2838,12 +2855,7 @@ class EventService:
             # marker either.
             def _mark_started_on_loop() -> None:
                 task = asyncio.create_task(
-                    self.governance_outbox.mutate(
-                        lambda r: record_attempt(
-                            _with_execution_attested(r),
-                            new_state=OutboxState.EXECUTION_STARTED,
-                        )
-                    )
+                    self.governance_outbox.mutate(_with_execution_started)
                 )
                 self._pending_governance_report_tasks.add(task)
                 task.add_done_callback(

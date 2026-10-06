@@ -23,6 +23,7 @@ from openhands.agent_server.event_service import (
     GovernanceStartRejectedError,
     _GovernanceHandshake,
     _with_execution_attested,
+    _with_execution_started,
     _with_pending_report_outcome,
 )
 from openhands.agent_server.governance_client import (
@@ -4265,7 +4266,7 @@ class TestEventServiceGovernanceOrchestration:
         [
             # What the SDK auto-generates when the LLM leaves `summary` empty:
             # the tool name plus ALL raw arguments.
-            'terminal: {"command": "curl -H \'Authorization: Bearer sk-FAKE-1\' x"}',
+            "terminal: {\"command\": \"curl -H 'Authorization: Bearer sk-FAKE-1' x\"}",
             # What an LLM (or an injected prompt) may claim instead.
             "running unit tests to verify the fix",
             None,
@@ -5525,7 +5526,9 @@ class TestEventServiceGovernanceOrchestration:
     async def test_run_blocks_bindingless_call_when_governed_action_claimed(
         self, governed_service
     ):
-        await self._create_outbox_record(governed_service, state=OutboxState.CLAIMED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CLAIMED
+        )
         governed_service._conversation = self._governed_conversation()
 
         with pytest.raises(ActionBindingMismatchError):
@@ -5965,7 +5968,9 @@ class TestEventServiceGovernanceOrchestration:
     # inclusion in RETRIABLE_STATES.
 
     @pytest.mark.asyncio
-    async def test_dispatch_claimed_run_calls_run_with_binding(self, governed_service):
+    async def test_dispatch_claimed_run_calls_run_with_binding(
+        self, governed_service
+    ):
         record = await self._create_outbox_record(
             governed_service, state=OutboxState.CLAIMED
         )
@@ -6055,7 +6060,9 @@ class TestEventServiceGovernanceOrchestration:
         )
 
         governed_service._ensure_claim_redispatch_task(record)
-        first_task = cast("asyncio.Task[None]", governed_service._claim_redispatch_task)
+        first_task = cast(
+            "asyncio.Task[None]", governed_service._claim_redispatch_task
+        )
         governed_service._ensure_claim_redispatch_task(record)
 
         assert governed_service._claim_redispatch_task is first_task
@@ -6144,7 +6151,9 @@ class TestEventServiceGovernanceOrchestration:
         GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS for the next relay
         cycle to notice (mirrors the existing CREATED/wait-for-decision
         crash-recovery just above)."""
-        await self._create_outbox_record(governed_service, state=OutboxState.CLAIMED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CLAIMED
+        )
         governed_service._external_lease_renewal = True
         conversation = self._governed_conversation()
         conversation._state.set_write_guard = MagicMock()
@@ -6591,6 +6600,70 @@ class TestEventServiceGovernanceOrchestration:
         assert updated.state == OutboxState.RESULT_REPORTED
 
     @pytest.mark.asyncio
+    async def test_relay_resend_attests_a_marker_that_landed_after_the_load(
+        self, governed_service
+    ):
+        """The relay loads the record once, but the start marker is its own
+        task and can land before the resend goes out; the attestation must
+        come from the current record (found by review)."""
+        action = _governance_pending_action()
+        record = self._keyed(
+            governed_service, action, self._claimed_record(governed_service, action)
+        )
+        record.state = OutboxState.RESULT_PENDING
+        record.pending_report_outcome = "success"
+        await governed_service.governance_outbox.create_record(record)
+        fake_client = MagicMock()
+        fake_client.report_result = AsyncMock(return_value={})
+        governed_service.governance_client = fake_client
+
+        real_mutate = governed_service.governance_outbox.mutate
+        marker_pending = True
+
+        async def _mutate_after_marker_lands(fn):
+            nonlocal marker_pending
+            if marker_pending:
+                marker_pending = False
+                await real_mutate(_with_execution_started)
+            return await real_mutate(fn)
+
+        governed_service.governance_outbox.mutate = _mutate_after_marker_lands
+
+        await governed_service._relay_outbox_once()
+
+        _, kwargs = fake_client.report_result.call_args
+        assert kwargs["executed_commitment"] == record.execution_commitment
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RESULT_REPORTED
+        )
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (OutboxState.CLAIMED, OutboxState.EXECUTION_STARTED),
+            # The marker can arrive late. It must not pull a record that is
+            # already reporting (or reported) back to EXECUTION_STARTED, which
+            # the relay does not retry from.
+            (OutboxState.RESULT_PENDING, OutboxState.RESULT_PENDING),
+            (OutboxState.RESULT_REPORTED, OutboxState.RESULT_REPORTED),
+            (OutboxState.NEEDS_ATTENTION, OutboxState.NEEDS_ATTENTION),
+        ],
+    )
+    def test_start_marker_only_advances_a_claimed_record(
+        self, governed_service, state, expected
+    ):
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        record.state = state
+
+        updated = _with_execution_started(record)
+
+        assert updated.state == expected
+        # The attestation is recorded whatever the state: the check passed.
+        assert updated.execution_attested is True
+
+    @pytest.mark.asyncio
     async def test_relay_result_pending_permanent_error_marks_needs_attention(
         self, governed_service
     ):
@@ -6617,7 +6690,9 @@ class TestEventServiceGovernanceOrchestration:
         assert updated.state == OutboxState.NEEDS_ATTENTION
 
     @pytest.mark.asyncio
-    async def test_start_creates_outbox_relay_task_in_team_mode(self, governed_service):
+    async def test_start_creates_outbox_relay_task_in_team_mode(
+        self, governed_service
+    ):
         assert governed_service.governance_deployment_mode == "team"
         assert governed_service._outbox_relay_task is None
         governed_service._external_lease_renewal = True  # skip lease task setup
@@ -6673,7 +6748,9 @@ class TestEventServiceGovernanceOrchestration:
     async def test_wait_for_decision_calls_run_and_wait_for_start_on_accept(
         self, governed_service
     ):
-        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             return_value={"id": "approval-1", "status": "accepted", "changed": True}
@@ -6696,7 +6773,9 @@ class TestEventServiceGovernanceOrchestration:
     async def test_wait_for_decision_calls_reject_pending_actions_on_reject(
         self, governed_service
     ):
-        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             return_value={"id": "approval-1", "status": "rejected", "changed": True}
@@ -6715,7 +6794,9 @@ class TestEventServiceGovernanceOrchestration:
         """cancelled/expired, or any status this MVP slice's own event
         handling doesn't expect to observe here — nothing this device can
         safely automate a response to."""
-        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             return_value={"id": "approval-1", "status": "cancelled", "changed": True}
@@ -6734,7 +6815,9 @@ class TestEventServiceGovernanceOrchestration:
         """changed=False is a server-side long-poll timeout with no
         decision yet — the correct response is to call /wait again
         immediately, not treat it as an error or give up."""
-        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             side_effect=[
@@ -6753,7 +6836,9 @@ class TestEventServiceGovernanceOrchestration:
         governed_service.run_and_wait_for_start.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_wait_for_decision_stops_when_outbox_moved_on(self, governed_service):
+    async def test_wait_for_decision_stops_when_outbox_moved_on(
+        self, governed_service
+    ):
         """The outbox advancing past CREATED for a reason this loop didn't
         cause (archived for a new action, or a relay cycle got there
         first) means there is nothing left for this loop to wait for —
@@ -6769,12 +6854,16 @@ class TestEventServiceGovernanceOrchestration:
     async def test_wait_for_decision_noop_without_client_configured(
         self, governed_service
     ):
-        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
         governed_service.governance_client = None
         await governed_service._wait_for_decision_loop("approval-1")  # must not raise
 
     @pytest.mark.asyncio
-    async def test_ensure_wait_for_decision_task_is_idempotent(self, governed_service):
+    async def test_ensure_wait_for_decision_task_is_idempotent(
+        self, governed_service
+    ):
         """_send_create_approval calls this on every CREATE success,
         including a relay retry of a stuck PENDING_CREATE for the same
         action — must not spawn a second concurrent long-poll for the same
@@ -6804,13 +6893,17 @@ class TestEventServiceGovernanceOrchestration:
             await first_task
 
     @pytest.mark.asyncio
-    async def test_start_resumes_wait_for_decision_after_crash(self, governed_service):
+    async def test_start_resumes_wait_for_decision_after_crash(
+        self, governed_service
+    ):
         """A record already at CREATED when start() runs means a prior
         process instance sent create and was waiting on decide when it
         stopped — resume watching it rather than leaving it to sit until
         some other trigger notices (the relay loop's own state-by-state
         handling doesn't touch CREATED at all; see _relay_outbox_once)."""
-        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
         governed_service._external_lease_renewal = True  # skip lease task setup
         conversation = self._governed_conversation()
         conversation._state.set_write_guard = MagicMock()
@@ -6901,3 +6994,4 @@ async def test_update_secrets_resolves_new_sources_before_a_loop_thread_mask(
     assert registry.mask_secrets_in_output(f"leak: {_UPDATE_SECRETS_VALUE}") == (
         "leak: <secret-hidden>"
     )
+
