@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -109,6 +110,19 @@ class PendingApprovalRecord(Base):
     # payload may contain low-entropy secrets").
     digest_salt: Mapped[str | None] = mapped_column(String(64), nullable=True)
     action_payload_digest: Mapped[str] = mapped_column(String(128))
+
+    # Execution-commitment binding (see approvals/digest.py). All three are
+    # NULL for a record whose device does not send one (nothing is checked
+    # for those). ``execution_commitment`` is an opaque keyed hash the
+    # device registered at create time, covered by ``action_payload_digest``
+    # so it is fixed BEFORE the approver decides; this service cannot
+    # recompute it (it never sees the action or the key). ``executed_commitment``
+    # is what the device later attested at report-result;
+    # ``commitment_verified`` is True/False when both exist and were
+    # compared, NULL when the device did not attest.
+    execution_commitment: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    executed_commitment: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    commitment_verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     risk_level: Mapped[str] = mapped_column(String(16), default="HIGH")
 
