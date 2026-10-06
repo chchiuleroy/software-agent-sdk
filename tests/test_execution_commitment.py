@@ -102,43 +102,70 @@ async def _report(client, signing_key, approval_id: str, **fields):  # noqa: F81
 # --- digest -----------------------------------------------------------------
 
 
+def _digest(execution_commitment: str | None = None) -> str:
+    return compute_display_digest(
+        action_type="t",
+        tool_name="n",
+        policy_revision="v1",
+        action_summary="s",
+        action_payload={"a": 1},
+        digest_salt=None,
+        execution_commitment=execution_commitment,
+    )
+
+
+def _verify(expected: str, execution_commitment: str | None = None) -> bool:
+    return verify_display_digest(
+        action_type="t",
+        tool_name="n",
+        policy_revision="v1",
+        action_summary="s",
+        action_payload={"a": 1},
+        digest_salt=None,
+        execution_commitment=execution_commitment,
+        expected_digest=expected,
+    )
+
+
+def _golden(execution_commitment: str | None = None) -> str:
+    return compute_display_digest(
+        action_type="tool_call",
+        tool_name="terminal",
+        policy_revision="agent-server-display-v2",
+        action_summary="terminal: ls",
+        action_payload={"kind": "terminal", "command_preview": "ls"},
+        digest_salt="salt-1",
+        execution_commitment=execution_commitment,
+    )
+
+
 def test_digest_without_a_commitment_is_unchanged():
     # Records created before this field existed, and devices that do not send
     # one, must keep hashing exactly as they did: the commitment key is added
     # to the canonical form only when present.
-    args = dict(
-        action_type="t",
-        tool_name="n",
-        policy_revision="v1",
-        action_summary="s",
-        action_payload={"a": 1},
-        digest_salt=None,
+    assert _digest() == _digest(None)
+    assert _digest() != _digest(COMMITMENT)
+
+
+def test_digest_matches_the_agent_server_golden_vectors():
+    # Literals computed by agent-server's own compute_display_digest and
+    # asserted there too (tests/agent_server/test_governance_client.py): the
+    # two copies are separate deployment units, so this is what notices one of
+    # them drifting.
+    assert (
+        _golden() == "e0a423a81c6c2f5b5d9e03201eaec983829b01d009e11449a40713dd08eef158"
     )
-    assert compute_display_digest(**args) == compute_display_digest(
-        **args, execution_commitment=None
-    )
-    assert compute_display_digest(**args) != compute_display_digest(
-        **args, execution_commitment=COMMITMENT
+    assert (
+        _golden(COMMITMENT)
+        == "d87cae0970a399e31e6afa849490f60f57799de5be140c109ca435a083c1733f"
     )
 
 
 def test_digest_covers_the_commitment():
-    args = dict(
-        action_type="t",
-        tool_name="n",
-        policy_revision="v1",
-        action_summary="s",
-        action_payload={"a": 1},
-        digest_salt=None,
-    )
-    digest = compute_display_digest(**args, execution_commitment=COMMITMENT)
-    assert verify_display_digest(
-        **args, execution_commitment=COMMITMENT, expected_digest=digest
-    )
-    assert not verify_display_digest(
-        **args, execution_commitment=OTHER, expected_digest=digest
-    )
-    assert not verify_display_digest(**args, expected_digest=digest)
+    digest = _digest(COMMITMENT)
+    assert _verify(digest, COMMITMENT)
+    assert not _verify(digest, OTHER)
+    assert not _verify(digest)
 
 
 # --- create -----------------------------------------------------------------
@@ -280,7 +307,7 @@ async def test_claim_of_a_legacy_record_ignores_a_presented_commitment(
 # --- report-result ----------------------------------------------------------
 
 
-async def _claimed(client, signing_key, commitment=COMMITMENT):  # noqa: F811
+async def _claimed(client, signing_key, commitment: str | None = COMMITMENT):  # noqa: F811
     created = await _create(client, signing_key, _body_with_commitment(commitment))
     await _accept(client, signing_key, created["id"])
     body = {"execution_commitment": commitment} if commitment is not None else None
