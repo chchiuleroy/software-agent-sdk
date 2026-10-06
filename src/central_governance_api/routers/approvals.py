@@ -122,6 +122,7 @@ from central_governance_api.models import (
     PendingApprovalRecord,
     ReconciliationFinding,
 )
+from central_governance_api.routers.devices import ensure_device_bound
 
 
 router = APIRouter(prefix="/api/v1/approvals", tags=["approvals"])
@@ -191,6 +192,12 @@ async def create_approval(
         return ApprovalSummary.model_validate(replayed)
 
     authorize_create(principal)
+    await ensure_device_bound(
+        session,
+        principal,
+        body.origin_device_id,
+        enforced=settings.device_binding_enforced,
+    )
 
     if not verify_display_digest(
         action_type=body.action_type,
@@ -448,6 +455,15 @@ async def claim_approval(
 
     record = await _load_record(session, approval_id)
     authorize_on_record(principal, ApprovalAction.CLAIM, _ownership(record))
+    # Re-checked at claim time (not only at create): the device may have been
+    # revoked while the request waited for a decision, and claim is the step
+    # that actually lets the action execute.
+    await ensure_device_bound(
+        session,
+        principal,
+        record.origin_device_id,
+        enforced=settings.device_binding_enforced,
+    )
 
     current = ApprovalStatus(record.status)
     next_status(current, ApprovalEvent.CLAIM)  # raises if illegal from here
