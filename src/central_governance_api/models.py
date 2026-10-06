@@ -118,11 +118,13 @@ class PendingApprovalRecord(Base):
     # so it is fixed BEFORE the approver decides; this service cannot
     # recompute it (it never sees the action or the key). ``executed_commitment``
     # is what the device later attested at report-result;
-    # ``commitment_verified`` is True/False when both exist and were
+    # ``commitment_matched`` (device-attested: it says the device's claim
+    # equals the registered value, not that this service verified an
+    # execution) is True/False when both exist and were
     # compared, NULL when the device did not attest.
     execution_commitment: Mapped[str | None] = mapped_column(String(64), nullable=True)
     executed_commitment: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    commitment_verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    commitment_matched: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     risk_level: Mapped[str] = mapped_column(String(16), default="HIGH")
 

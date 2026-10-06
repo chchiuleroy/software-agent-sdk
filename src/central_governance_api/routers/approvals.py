@@ -78,6 +78,7 @@ from central_governance_api.approvals.errors import (
     DigestMismatchError,
     ExecutionAttemptMismatchError,
     ExecutionCommitmentMismatchError,
+    ExecutionCommitmentRequiredError,
     RecordNotFoundError,
     RecordNotTerminalError,
 )
@@ -201,6 +202,9 @@ async def create_approval(
         body.origin_device_id,
         enforced=settings.device_binding_enforced,
     )
+
+    if settings.require_execution_commitment and body.execution_commitment is None:
+        raise ExecutionCommitmentRequiredError()
 
     if not verify_display_digest(
         action_type=body.action_type,
@@ -648,7 +652,7 @@ async def report_result(
             verified = hmac.compare_digest(
                 body.executed_commitment, record.execution_commitment
             )
-            update_values["commitment_verified"] = verified
+            update_values["commitment_matched"] = verified
             commitment_mismatch = not verified
 
     result = await session.execute(

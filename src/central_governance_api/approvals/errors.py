@@ -48,6 +48,18 @@ class ExecutionCommitmentMismatchError(Exception):
         )
 
 
+class ExecutionCommitmentRequiredError(Exception):
+    """CREATE only, when ``require_execution_commitment`` is on: the request
+    carried no ``execution_commitment``. Maps to HTTP 400 — the request does
+    not meet this deployment's policy; nothing was written."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this deployment requires an execution_commitment on every new "
+            "approval request"
+        )
+
+
 class ExecutionAttemptMismatchError(Exception):
     """REPORT_RESULT (execution-result shape only): the caller supplied an
     ``execution_attempt_id`` that doesn't match the record's current

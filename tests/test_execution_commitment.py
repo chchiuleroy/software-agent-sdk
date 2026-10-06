@@ -177,7 +177,7 @@ async def test_create_stores_the_commitment(client, signing_key, db_session):  #
     row = await db_session.get(PendingApprovalRecord, uuid.UUID(created["id"]))
     assert row.execution_commitment == COMMITMENT
     assert row.executed_commitment is None
-    assert row.commitment_verified is None
+    assert row.commitment_matched is None
 
 
 async def test_create_with_a_swapped_commitment_is_a_digest_mismatch(
@@ -336,7 +336,7 @@ async def test_matching_attestation_is_recorded_as_verified(
     row = await db_session.get(PendingApprovalRecord, uuid.UUID(approval_id))
     await db_session.refresh(row)
     assert row.executed_commitment == COMMITMENT
-    assert row.commitment_verified is True
+    assert row.commitment_matched is True
 
 
 async def test_mismatching_attestation_is_recorded_not_rejected(
@@ -362,7 +362,7 @@ async def test_mismatching_attestation_is_recorded_not_rejected(
     assert resp.json()["status"] == "applied"
     row = await db_session.get(PendingApprovalRecord, uuid.UUID(approval_id))
     await db_session.refresh(row)
-    assert row.commitment_verified is False
+    assert row.commitment_matched is False
     assert row.executed_commitment == OTHER
     events = (
         (
@@ -402,7 +402,7 @@ async def test_report_without_an_attestation_leaves_verification_unknown(
     row = await db_session.get(PendingApprovalRecord, uuid.UUID(approval_id))
     await db_session.refresh(row)
     assert row.executed_commitment is None
-    assert row.commitment_verified is None
+    assert row.commitment_matched is None
 
 
 async def test_attestation_on_a_pre_claim_abort_is_rejected(client, signing_key):  # noqa: F811
@@ -435,7 +435,7 @@ async def test_attestation_for_a_legacy_record_is_stored_but_not_compared(
     assert resp.status_code == 200, resp.text
     row = await db_session.get(PendingApprovalRecord, uuid.UUID(approval_id))
     await db_session.refresh(row)
-    assert row.commitment_verified is None
+    assert row.commitment_matched is None
 
 
 async def test_refused_claim_audit_row_survives_the_error_path(

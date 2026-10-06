@@ -31,6 +31,7 @@ from central_governance_api.approvals.errors import (
     DigestMismatchError,
     ExecutionAttemptMismatchError,
     ExecutionCommitmentMismatchError,
+    ExecutionCommitmentRequiredError,
     RecordNotFoundError,
     RecordNotTerminalError,
 )
@@ -70,6 +71,7 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     ConcurrentModificationError: (409, "concurrent_modification"),
     ExecutionAttemptMismatchError: (409, "execution_attempt_mismatch"),
     ExecutionCommitmentMismatchError: (409, "execution_commitment_mismatch"),
+    ExecutionCommitmentRequiredError: (400, "execution_commitment_required"),
     RecordNotTerminalError: (409, "record_not_terminal"),
     RecordNotFoundError: (404, "record_not_found"),
     DigestMismatchError: (400, "digest_mismatch"),
