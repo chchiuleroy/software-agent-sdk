@@ -36,6 +36,7 @@ from urllib.parse import urlsplit
 
 from openhands.agent_server.governance_redaction import REDACTION_VERSION, redact
 from openhands.sdk.event import ActionEvent
+from openhands.sdk.security.roy_governance import is_builtin_action
 
 
 PROJECTION_VERSION = 1
@@ -366,14 +367,20 @@ def _project_browser_set_storage(
     truncated = truncated or len(cookies) > MAX_STORAGE_ITEMS
     truncated = truncated or len(origins) > MAX_STORAGE_ITEMS
 
+    clipped = False
+
     def short(value: Any) -> str:
-        return _clip(red.text(str(value)), MAX_URL_CHARS)[0]
+        nonlocal clipped
+        text, was_clipped = _clip(red.text(str(value)), MAX_URL_CHARS)
+        clipped = clipped or was_clipped
+        return text
 
     cookie_names = [
         f"{short(c.get('name', ''))}@{short(c.get('domain', ''))}"
         for c in cookies[:MAX_STORAGE_ITEMS]
     ]
     origin_names = [short(o.get("origin", "")) for o in origins[:MAX_STORAGE_ITEMS]]
+    truncated = truncated or clipped
     storage_items = 0
     for origin in origins:
         for kind in ("localStorage", "sessionStorage"):
@@ -547,14 +554,13 @@ _PROJECTORS = {
 }
 
 # A projection is chosen by tool NAME, but a name is whatever the tool's author
-# says it is. Only an Action class that comes from these packages is trusted to
-# be the built-in the name claims; anything else is unprojected.
-_BUILTIN_ACTION_MODULES = ("openhands.tools.", "openhands.sdk.tool.builtins.")
+# says it is. Only an Action class that really comes from a built-in package
+# (see is_builtin_action) is trusted to be the built-in the name claims;
+# anything else is unprojected.
 
 
 def _is_builtin(action: ActionEvent) -> bool:
-    act = action.action
-    return act is not None and type(act).__module__.startswith(_BUILTIN_ACTION_MODULES)
+    return action.action is not None and is_builtin_action(action.action)
 
 
 def _agent_claim(action: ActionEvent, red: _Redactions) -> dict[str, Any] | None:

@@ -540,6 +540,31 @@ def test_browser_set_storage_that_cannot_be_shown_in_full_is_flagged(state):
     assert projection.is_truncated is True
 
 
+def test_browser_set_storage_with_a_clipped_name_is_flagged():
+    # A cookie name or origin cut to the display limit is something the
+    # approver did not see in full (found by review).
+    state = {
+        "cookies": [{"name": "n" * (MAX_URL_CHARS + 1), "domain": "d"}],
+        "origins": [],
+    }
+    projection = build_display(
+        _event("browser_set_storage", BrowserSetStorageAction(storage_state=state))
+    )
+
+    assert projection.is_truncated is True
+
+
+def test_a_class_that_only_claims_a_built_in_module_is_unprojected():
+    # ``__module__`` is a string any class can set (found by review).
+    class _Forger(Action):
+        command: str
+
+    _Forger.__module__ = "openhands.tools.terminal.definition"
+    projection = build_display(_event("terminal", _Forger(command="rm -rf /")))
+
+    assert projection.is_unprojected is True
+
+
 def test_gemini_write_file_is_shown_like_a_file_edit():
     projection = build_display(
         _event("write_file", WriteFileAction(file_path="/w/a.py", content="x = 1\n"))
