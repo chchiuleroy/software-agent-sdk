@@ -4767,8 +4767,10 @@ class TestEventServiceGovernanceOrchestration:
             }
         )
 
+        seen_bindings: list = []
+
         async def _fake_run(*, expected_binding, on_governed_start, **_kwargs):
-            self.seen_binding = expected_binding
+            seen_bindings.append(expected_binding)
             asyncio.get_running_loop().call_soon(on_governed_start)
 
         governed_service.run = AsyncMock(side_effect=_fake_run)
@@ -4781,7 +4783,7 @@ class TestEventServiceGovernanceOrchestration:
         await asyncio.sleep(0)
         if governed_service._pending_governance_report_tasks:
             await asyncio.gather(*governed_service._pending_governance_report_tasks)
-        return fake_client
+        return fake_client, seen_bindings
 
     @pytest.mark.asyncio
     async def test_claim_presents_the_registered_commitment_and_marks_attested(
@@ -4801,11 +4803,11 @@ class TestEventServiceGovernanceOrchestration:
         record.state = OutboxState.CREATED
         record.execution_attempt_id = None
 
-        client = await self._claim_with_fake_central(governed_service, record)
+        client, seen = await self._claim_with_fake_central(governed_service, record)
 
         _, kwargs = client.claim.call_args
         assert kwargs["execution_commitment"] == record.execution_commitment
-        assert self.seen_binding.commitment_key == record.commitment_key
+        assert seen[0].commitment_key == record.commitment_key
         updated = governed_service.governance_outbox.load()
         assert updated.execution_attested is True
 
@@ -4820,7 +4822,7 @@ class TestEventServiceGovernanceOrchestration:
         record.state = OutboxState.CREATED
         record.execution_attempt_id = None
 
-        client = await self._claim_with_fake_central(governed_service, record)
+        client, _ = await self._claim_with_fake_central(governed_service, record)
 
         _, kwargs = client.claim.call_args
         assert kwargs["execution_commitment"] is None

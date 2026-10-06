@@ -137,13 +137,16 @@ def test_keyed_binding_still_detects_a_changed_action():
 def test_the_key_is_not_part_of_the_fingerprint_or_the_repr():
     # The fingerprint is logged and compared across callers, and a repr can
     # end up in a log line; the key is a secret and must be in neither.
-    base = dict(
-        central_approval_id="approval-1",
-        action_event_id="event-1",
-        execution_commitment="c" * 64,
-    )
-    with_key = ActionBinding(**base, commitment_key="s3cret-key")
-    other_key = ActionBinding(**base, commitment_key="another-key")
+    def binding(key: str) -> ActionBinding:
+        return ActionBinding(
+            central_approval_id="approval-1",
+            action_event_id="event-1",
+            execution_commitment="c" * 64,
+            commitment_key=key,
+        )
+
+    with_key = binding("s3cret-key")
+    other_key = binding("another-key")
 
     assert with_key.fingerprint() == other_key.fingerprint()
     assert "s3cret-key" not in repr(with_key)

@@ -337,14 +337,18 @@ def test_compute_display_digest_matches_known_vector():
 # The same literals are asserted in central-governance-api's
 # tests/test_execution_commitment.py, each computed by that side's own
 # function: a drift in either copy breaks one of the two files.
-_GOLDEN_ARGS = dict(
-    action_type="tool_call",
-    tool_name="terminal",
-    policy_revision="agent-server-display-v2",
-    action_summary="terminal: ls",
-    action_payload={"kind": "terminal", "command_preview": "ls"},
-    digest_salt="salt-1",
-)
+def _golden_digest(execution_commitment: str | None = None) -> str:
+    return compute_display_digest(
+        action_type="tool_call",
+        tool_name="terminal",
+        policy_revision="agent-server-display-v2",
+        action_summary="terminal: ls",
+        action_payload={"kind": "terminal", "command_preview": "ls"},
+        digest_salt="salt-1",
+        execution_commitment=execution_commitment,
+    )
+
+
 _GOLDEN_COMMITMENT = "ab" * 32
 _GOLDEN_PLAIN = "e0a423a81c6c2f5b5d9e03201eaec983829b01d009e11449a40713dd08eef158"
 _GOLDEN_WITH_COMMITMENT = (
@@ -354,18 +358,11 @@ _GOLDEN_WITH_COMMITMENT = (
 
 def test_digest_without_a_commitment_matches_central_and_is_unchanged():
     # A record that registered no commitment must hash exactly as before.
-    assert compute_display_digest(**_GOLDEN_ARGS) == _GOLDEN_PLAIN
-    assert (
-        compute_display_digest(**_GOLDEN_ARGS, execution_commitment=None)
-        == _GOLDEN_PLAIN
-    )
+    assert _golden_digest() == _GOLDEN_PLAIN
 
 
 def test_digest_covering_a_commitment_matches_central():
-    digest = compute_display_digest(
-        **_GOLDEN_ARGS, execution_commitment=_GOLDEN_COMMITMENT
-    )
-    assert digest == _GOLDEN_WITH_COMMITMENT
+    assert _golden_digest(_GOLDEN_COMMITMENT) == _GOLDEN_WITH_COMMITMENT
 
 
 def _recording_client(captured: list):
