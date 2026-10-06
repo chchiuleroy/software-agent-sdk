@@ -33,11 +33,11 @@ def upgrade() -> None:
     )
     op.add_column(
         "pending_approval_records",
-        sa.Column("commitment_verified", sa.Boolean(), nullable=True),
+        sa.Column("commitment_matched", sa.Boolean(), nullable=True),
     )
 
 
 def downgrade() -> None:
-    op.drop_column("pending_approval_records", "commitment_verified")
+    op.drop_column("pending_approval_records", "commitment_matched")
     op.drop_column("pending_approval_records", "executed_commitment")
     op.drop_column("pending_approval_records", "execution_commitment")
