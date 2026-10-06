@@ -458,8 +458,19 @@ class Config(BaseModel):
             "for approval at all: this agent-server rejects it with a reason "
             "that tells the agent to split it into smaller steps. Set false to "
             "send such actions for approval anyway, with the cut recorded in "
-            "the projection's 'truncated' flags. Unknown tools are not "
-            "affected either way: their argument values are never shown."
+            "the projection's 'truncated' flags."
+        ),
+    )
+    governance_refuse_unprojected_actions: bool = Field(
+        default=True,
+        description=(
+            "Only used when governance_deployment_mode is 'team'. A tool with "
+            "no approval preview (every MCP tool, and any built-in without a "
+            "projection) would show the approver nothing about what it does. "
+            "When true (default), such an action is not sent for approval at "
+            "all: this agent-server rejects it with a reason that tells the "
+            "agent to use a built-in tool instead. Set false to send them for "
+            "approval anyway, showing only the tool's argument names."
         ),
     )
 

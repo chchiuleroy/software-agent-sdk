@@ -4,7 +4,8 @@ The invariants that matter, each tested on its own below:
 - no known secret survives in ANY tool's output (``SECRET_CORPUS``);
 - output size is bounded whatever the input size;
 - redaction happens before clipping;
-- unknown tools show argument names, never values;
+- tools with no projection show argument names, never values, and are
+  marked unprojected (the device refuses them);
 - the LLM's summary is labelled untrusted and the SDK's raw-argument fallback
   summary is never shown.
 """
@@ -15,6 +16,7 @@ import pytest
 
 from openhands.agent_server import governance_display as gd
 from openhands.agent_server.governance_display import (
+    MAX_ARG_CHARS,
     MAX_COMMAND_PREVIEW_CHARS,
     MAX_PREVIEW_LINE_CHARS,
     MAX_PREVIEW_LINES,
@@ -24,15 +26,49 @@ from openhands.agent_server.governance_display import (
     PROJECTION_VERSION,
     build_display,
     truncation_reason,
+    unprojected_reason,
 )
 from openhands.agent_server.governance_redaction import REDACTION_VERSION
 from openhands.sdk.event import ActionEvent
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.tool import Action
+from openhands.sdk.tool.builtins.invoke_skill import InvokeSkillAction
+from openhands.sdk.tool.builtins.switch_llm import SwitchLLMAction
+from openhands.sdk.tool.builtins.vision_inspect import VisionInspectAction
 from openhands.tools.apply_patch.definition import ApplyPatchAction
-from openhands.tools.browser_use.definition import BrowserNavigateAction
+from openhands.tools.ask_oracle.definition import AskOracleAction
+from openhands.tools.browser_use.definition import (
+    BrowserClickAction,
+    BrowserCloseTabAction,
+    BrowserGetContentAction,
+    BrowserGetStateAction,
+    BrowserGetStorageAction,
+    BrowserGoBackAction,
+    BrowserListTabsAction,
+    BrowserNavigateAction,
+    BrowserScrollAction,
+    BrowserSetStorageAction,
+    BrowserStartRecordingAction,
+    BrowserStopRecordingAction,
+    BrowserSwitchTabAction,
+    BrowserTypeAction,
+)
+from openhands.tools.delegate.definition import DelegateAction
 from openhands.tools.file_editor.definition import FileEditorAction
+from openhands.tools.gemini.edit.definition import EditAction
+from openhands.tools.gemini.list_directory.definition import ListDirectoryAction
+from openhands.tools.gemini.read_file.definition import ReadFileAction
+from openhands.tools.gemini.write_file.definition import WriteFileAction
+from openhands.tools.glob.definition import GlobAction
+from openhands.tools.grep.definition import GrepAction
+from openhands.tools.task.definition import TaskAction
+from openhands.tools.task_tracker.definition import TaskItem, TaskTrackerAction
 from openhands.tools.terminal.definition import TerminalAction
+from openhands.tools.tom_consult.definition import (
+    ConsultTomAction,
+    SleeptimeComputeAction,
+)
+from openhands.tools.workflow.definition import WorkflowAction
 
 
 class _McpLikeAction(Action):
@@ -144,6 +180,34 @@ SECRET_CORPUS = [
     (
         "mcpsecret11",
         _event("mcp_tool", _McpLikeAction(query="hi", api_token="mcpsecret11")),
+    ),
+]
+
+# The tools projected after the first four: a secret in their free text must
+# not survive either.
+SECRET_CORPUS += [
+    (
+        _FAKE_GH,
+        _event(
+            "write_file", WriteFileAction(file_path="/w/.env", content=f"T={_FAKE_GH}")
+        ),
+    ),
+    (
+        _FAKE_GH,
+        _event(
+            "ask_oracle", AskOracleAction(question="why", context=f"tok {_FAKE_GH}")
+        ),
+    ),
+    (
+        _FAKE_GH,
+        _event(
+            "workflow",
+            WorkflowAction(name="w", script=f"TOKEN = '{_FAKE_GH}'"),
+        ),
+    ),
+    (
+        _FAKE_GH,
+        _event("grep", GrepAction(pattern=_FAKE_GH)),
     ),
 ]
 
@@ -403,6 +467,311 @@ def test_unknown_tool_shows_argument_names_and_never_values():
     assert projection.payload["arg_names"] == ["api_token", "query"]
     assert "private question" not in _shown(projection)
     assert projection.summary == "mcp_tool (2 argument(s))"
+
+
+# --- built-in tools without a bespoke projector ------------------------------
+# What leaves the device for each is decided by ``_TOOL_ARGS`` (deny by
+# default). These tests pin the decisions that matter, and the ways the table
+# can silently stop covering a tool.
+
+
+class _ThirdPartyCommand(Action):
+    command: str
+
+
+def test_browser_type_shows_the_length_of_the_text_never_the_text():
+    # The typed text may be a password; no redaction pattern recognises one.
+    secret = "correct horse battery staple 9"
+    projection = build_display(
+        _event("browser_type", BrowserTypeAction(index=3, text=secret))
+    )
+
+    assert projection.payload["kind"] == "tool_args"
+    assert projection.payload["arg_index"] == 3
+    assert projection.payload["text_length"] == len(secret)
+    assert "horse" not in _shown(projection)
+    # Withheld by design is not a cut: such an action is still approvable.
+    assert projection.is_truncated is False
+    assert projection.is_unprojected is False
+
+
+def test_browser_set_storage_shows_names_and_counts_never_values():
+    state = {
+        "cookies": [
+            {"name": "session", "value": "cookie-value-zz1", "domain": "a.example"},
+            {"name": "csrf", "value": "cookie-value-zz2", "domain": "b.example"},
+        ],
+        "origins": [
+            {
+                "origin": "https://a.example",
+                "localStorage": [{"name": "jwt", "value": "local-value-zz3"}],
+            }
+        ],
+    }
+    projection = build_display(
+        _event("browser_set_storage", BrowserSetStorageAction(storage_state=state))
+    )
+
+    assert projection.payload["cookie_count"] == 2
+    assert projection.payload["cookie_names"] == ["session@a.example", "csrf@b.example"]
+    assert projection.payload["origins"] == ["https://a.example"]
+    assert projection.payload["storage_item_count"] == 1
+    assert "zz1" not in _shown(projection)
+    assert "zz3" not in _shown(projection)
+    assert projection.is_truncated is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"cookies": "not-a-list"},
+        {"cookies": [], "origins": [], "extra": {"token": "zz"}},
+        {"cookies": [{"name": f"c{i}", "domain": "d"} for i in range(60)]},
+    ],
+    ids=["wrong-shape", "unknown-key", "too-many-cookies"],
+)
+def test_browser_set_storage_that_cannot_be_shown_in_full_is_flagged(state):
+    # Content the projection did not show counts as a cut, so the action is
+    # refused instead of approved blind.
+    projection = build_display(
+        _event("browser_set_storage", BrowserSetStorageAction(storage_state=state))
+    )
+
+    assert projection.is_truncated is True
+
+
+def test_browser_set_storage_with_a_clipped_name_is_flagged():
+    # A cookie name or origin cut to the display limit is something the
+    # approver did not see in full (found by review).
+    state = {
+        "cookies": [{"name": "n" * (MAX_URL_CHARS + 1), "domain": "d"}],
+        "origins": [],
+    }
+    projection = build_display(
+        _event("browser_set_storage", BrowserSetStorageAction(storage_state=state))
+    )
+
+    assert projection.is_truncated is True
+
+
+def test_a_class_that_only_claims_a_built_in_module_is_unprojected():
+    # ``__module__`` is a string any class can set (found by review).
+    class _Forger(Action):
+        command: str
+
+    _Forger.__module__ = "openhands.tools.terminal.definition"
+    projection = build_display(_event("terminal", _Forger(command="rm -rf /")))
+
+    assert projection.is_unprojected is True
+
+
+def test_gemini_write_file_is_shown_like_a_file_edit():
+    projection = build_display(
+        _event("write_file", WriteFileAction(file_path="/w/a.py", content="x = 1\n"))
+    )
+
+    assert projection.payload["kind"] == "file_edit"
+    assert projection.payload["path"] == "/w/a.py"
+    assert projection.payload["diff_preview"] == ["+x = 1"]
+    assert projection.summary == "write_file create /w/a.py"
+    assert projection.is_truncated is False
+
+
+def test_gemini_write_file_over_the_preview_limit_is_flagged():
+    content = "\n".join(f"line {i}" for i in range(MAX_PREVIEW_LINES + 5))
+    projection = build_display(
+        _event("write_file", WriteFileAction(file_path="/w/a.py", content=content))
+    )
+
+    assert projection.is_truncated is True
+
+
+def test_gemini_edit_is_a_replacement_unless_old_string_is_empty():
+    replace = build_display(
+        _event(
+            "edit",
+            EditAction(file_path="/w/a.py", old_string="a = 1", new_string="a = 2"),
+        )
+    )
+    create = build_display(
+        _event(
+            "edit", EditAction(file_path="/w/b.py", old_string="", new_string="b = 1")
+        )
+    )
+
+    assert replace.payload["command"] == "str_replace"
+    assert "-a = 1" in replace.payload["diff_preview"]
+    assert "+a = 2" in replace.payload["diff_preview"]
+    assert replace.payload["expected_replacements"] == 1
+    assert create.payload["command"] == "create"
+    assert create.payload["diff_preview"] == ["+b = 1"]
+
+
+def test_gemini_edit_redacts_secrets_in_the_old_and_new_text():
+    projection = build_display(
+        _event(
+            "edit",
+            EditAction(
+                file_path="/w/.env",
+                old_string="GH=x",
+                new_string=f"GH={_FAKE_GH}",
+            ),
+        )
+    )
+
+    assert _FAKE_GH not in _shown(projection)
+
+
+def test_grep_shows_pattern_and_path():
+    projection = build_display(
+        _event("grep", GrepAction(pattern="TODO", path="/etc", include="*.conf"))
+    )
+
+    assert projection.payload["arg_pattern"] == "TODO"
+    assert projection.payload["arg_path"] == "/etc"
+    assert projection.payload["arg_include"] == "*.conf"
+    assert projection.is_truncated is False
+
+
+def test_a_shown_argument_longer_than_the_limit_is_flagged():
+    projection = build_display(
+        _event("grep", GrepAction(pattern="x" * (MAX_ARG_CHARS + 1)))
+    )
+
+    assert projection.is_truncated is True
+    assert len(projection.payload["arg_pattern"]) == MAX_ARG_CHARS
+
+
+def test_workflow_script_is_previewed_and_a_long_one_is_flagged():
+    short = build_display(
+        _event("workflow", WorkflowAction(name="w", script="async def main(wf): pass"))
+    )
+    long_script = "\n".join(f"step_{i}()" for i in range(MAX_PREVIEW_LINES + 1))
+    long = build_display(
+        _event("workflow", WorkflowAction(name="w", script=long_script))
+    )
+
+    assert short.payload["arg_script"] == ["async def main(wf): pass"]
+    assert short.is_truncated is False
+    assert long.is_truncated is True
+
+
+def test_subagent_prompt_is_redacted_before_it_is_shown():
+    projection = build_display(
+        _event(
+            "task",
+            TaskAction(
+                description="d",
+                prompt=f"use token {_FAKE_GH} to push",
+                subagent_type="default",
+            ),
+        )
+    )
+
+    assert _FAKE_GH not in _shown(projection)
+    assert projection.payload["redactions"]
+
+
+def test_task_tracker_shows_how_many_tasks_not_their_text():
+    projection = build_display(
+        _event(
+            "task_tracker",
+            TaskTrackerAction(
+                command="plan", task_list=[TaskItem(title="private plan", notes="n")]
+            ),
+        )
+    )
+
+    assert projection.payload["task_list_count"] == 1
+    assert "private plan" not in _shown(projection)
+
+
+def test_a_tool_with_no_projection_is_unprojected():
+    projection = build_display(
+        _event("mcp_tool", _McpLikeAction(query="private question", api_token="t"))
+    )
+
+    assert projection.is_unprojected is True
+    assert projection.is_truncated is False
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["terminal", "file_editor", "browser_type", "read_file", "workflow", "task"],
+)
+def test_a_third_party_tool_cannot_borrow_a_built_in_name(tool_name):
+    # A projection is chosen by name, but the name is the tool author's. An MCP
+    # tool called "browser_type" would otherwise get "text: length only".
+    projection = build_display(_event(tool_name, _ThirdPartyCommand(command="x")))
+
+    assert projection.payload["kind"] == "generic"
+    assert projection.is_unprojected is True
+
+
+def test_a_built_in_with_a_new_unlisted_argument_is_unprojected(monkeypatch):
+    # If a built-in grows a field the table does not name, showing the rest
+    # would hide part of the action: the whole action is treated as unprojected.
+    narrowed = {k: v for k, v in gd._TOOL_ARGS["grep"].items() if k != "include"}
+    monkeypatch.setitem(gd._TOOL_ARGS, "grep", narrowed)
+
+    projection = build_display(_event("grep", GrepAction(pattern="x")))
+
+    assert projection.is_unprojected is True
+
+
+_TOOL_ACTION_CLASSES = {
+    "read_file": ReadFileAction,
+    "list_directory": ListDirectoryAction,
+    "grep": GrepAction,
+    "glob": GlobAction,
+    "browser_type": BrowserTypeAction,
+    "browser_click": BrowserClickAction,
+    "browser_scroll": BrowserScrollAction,
+    "browser_switch_tab": BrowserSwitchTabAction,
+    "browser_close_tab": BrowserCloseTabAction,
+    "browser_get_state": BrowserGetStateAction,
+    "browser_get_content": BrowserGetContentAction,
+    "browser_go_back": BrowserGoBackAction,
+    "browser_list_tabs": BrowserListTabsAction,
+    "browser_get_storage": BrowserGetStorageAction,
+    "browser_start_recording": BrowserStartRecordingAction,
+    "browser_stop_recording": BrowserStopRecordingAction,
+    "workflow": WorkflowAction,
+    "task": TaskAction,
+    "delegate": DelegateAction,
+    "ask_oracle": AskOracleAction,
+    "tom_consult": ConsultTomAction,
+    "sleeptime_compute": SleeptimeComputeAction,
+    "task_tracker": TaskTrackerAction,
+    "invoke_skill": InvokeSkillAction,
+    "switch_llm": SwitchLLMAction,
+    "vision_inspect": VisionInspectAction,
+}
+
+
+def test_the_argument_table_names_every_field_of_every_listed_tool():
+    # Drift detector: a field added to a built-in later must be added to
+    # _TOOL_ARGS on purpose (it decides what an approver sees of it), not
+    # silently turn that tool into "refused".
+    assert set(_TOOL_ACTION_CLASSES) == set(gd._TOOL_ARGS)
+    for tool_name, cls in _TOOL_ACTION_CLASSES.items():
+        fields = set(cls.model_fields) - gd._FRAMEWORK_ARG_KEYS
+        assert fields == set(gd._TOOL_ARGS[tool_name]), tool_name
+
+
+def test_policy_revision_moved_with_what_the_approver_sees():
+    # New projections change what an approver sees, so the digest envelope's
+    # revision must not still say v1.
+    assert POLICY_REVISION != "agent-server-display-v1"
+
+
+def test_unprojected_reason_never_echoes_the_action():
+    # A third-party tool's own name is attacker-controlled; the agent-facing
+    # reason is fixed text.
+    reason = unprojected_reason()
+
+    assert "approval preview" in reason
+    assert "terminal or file_editor" in reason
 
 
 # --- the agent's own claim --------------------------------------------------
