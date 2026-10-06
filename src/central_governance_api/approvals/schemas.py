@@ -15,6 +15,11 @@ from pydantic import BaseModel, Field, model_validator
 from central_governance_api.schemas_base import RequestModel
 
 
+# A keyed SHA-256 (HMAC) in lowercase hex. Opaque to this service; the format is
+# pinned only so the column and the audit payload never hold arbitrary text.
+COMMITMENT_PATTERN = r"^[0-9a-f]{64}$"
+
+
 class CreateApprovalRequest(RequestModel):
     """``request_id`` is client-generated (models.py: "client-generated
     before create, so the requester can compute its envelope digest before
@@ -40,6 +45,12 @@ class CreateApprovalRequest(RequestModel):
         max_length=128,
         description="Client-computed; verified server-side against the "
         "other fields at create time — see approvals/digest.py.",
+    )
+    execution_commitment: str | None = Field(
+        default=None,
+        pattern=COMMITMENT_PATTERN,
+        description="Optional keyed hash of the action the device will "
+        "execute, covered by action_payload_digest — see approvals/digest.py.",
     )
 
 
@@ -102,6 +113,15 @@ class DecideResponse(BaseModel):
     decided_at: datetime
 
 
+class ClaimRequest(RequestModel):
+    """Optional body. A record that was created with an
+    ``execution_commitment`` is only claimable by presenting the same value;
+    a record without one ignores this body (and a bodyless claim keeps working
+    for it)."""
+
+    execution_commitment: str | None = Field(default=None, pattern=COMMITMENT_PATTERN)
+
+
 class ClaimResponse(BaseModel):
     """Echoes ``action_payload_digest`` back so the claiming device — the
     only party that still holds the canonical payload (see digest.py) —
@@ -133,6 +153,13 @@ class ReportResultRequest(RequestModel):
 
     execution_attempt_id: uuid.UUID | None = None
     outcome: Literal["success", "failure_definite", "failure_unknown"] | None = None
+    executed_commitment: str | None = Field(
+        default=None,
+        pattern=COMMITMENT_PATTERN,
+        description="The device attests that, immediately before execution "
+        "started, the action it was about to run matched this commitment. "
+        "Execution results only; omit when the device could not attest.",
+    )
 
     @model_validator(mode="after")
     def _both_or_neither(self) -> ReportResultRequest:
@@ -143,6 +170,11 @@ class ReportResultRequest(RequestModel):
                 "execution_attempt_id and outcome must both be set "
                 "(reporting an execution result) or both omitted "
                 "(pre-claim abort) — not one without the other"
+            )
+        if self.executed_commitment is not None and not has_attempt:
+            raise ValueError(
+                "executed_commitment only belongs to an execution result, "
+                "not a pre-claim abort"
             )
         return self
 

@@ -35,6 +35,31 @@ class DigestMismatchError(Exception):
     """
 
 
+class ExecutionCommitmentMismatchError(Exception):
+    """CLAIM only: the record was created with an ``execution_commitment`` and
+    the claiming device did not present the same one (or none). No lease is
+    handed out. Maps to HTTP 409. The message never includes either value."""
+
+    def __init__(self, *, approval_id: uuid.UUID) -> None:
+        self.approval_id = approval_id
+        super().__init__(
+            f"execution commitment for approval {approval_id} was not presented "
+            "or does not match the one registered when it was created"
+        )
+
+
+class ExecutionCommitmentRequiredError(Exception):
+    """CREATE only, when ``require_execution_commitment`` is on: the request
+    carried no ``execution_commitment``. Maps to HTTP 400 — the request does
+    not meet this deployment's policy; nothing was written."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this deployment requires an execution_commitment on every new "
+            "approval request"
+        )
+
+
 class ExecutionAttemptMismatchError(Exception):
     """REPORT_RESULT (execution-result shape only): the caller supplied an
     ``execution_attempt_id`` that doesn't match the record's current

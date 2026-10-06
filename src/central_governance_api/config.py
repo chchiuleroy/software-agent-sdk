@@ -104,6 +104,18 @@ class Settings(BaseSettings):
         "on requires each agent-server's service account to register its "
         "governance_origin_device_id first.",
     )
+    require_execution_commitment: bool = Field(
+        default=False,
+        description="When True, CREATE must carry an execution_commitment, "
+        "otherwise 400 execution_commitment_required and nothing is written. "
+        "Without it a device that omits the field (an older agent-server, or "
+        "a bug) silently falls back to the unprotected path: the approval is "
+        "created, but nothing is registered to compare at claim and "
+        "report-result. Default False so a freshly deployed central keeps "
+        "accepting agent-servers that do not send one yet; turn it on after "
+        "every agent-server has been updated. Applies to new approvals only — "
+        "records already stored without a commitment stay claimable.",
+    )
     device_registration_quota: int = Field(
         default=20,
         gt=0,

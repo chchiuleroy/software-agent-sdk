@@ -31,6 +31,24 @@ DB write bypassing this API is out of scope, matching this project's
 established threat-model boundary elsewhere (see e.g.
 ``roy_governance_lock.py``'s docstring in the sibling SDK repo).
 
+Execution-commitment binding (added 2026-10-06): the "stronger scheme"
+the next paragraphs call future work is now partly in place, within the
+limits below. A device may send an opaque ``execution_commitment`` at
+create time: a keyed hash (HMAC with a per-record key that never leaves
+the device) of the exact action it will execute. It is folded into this
+digest only when present, so a record without one hashes exactly as
+before. Because the digest is verified at create, the commitment is fixed
+before any approver decides; the device cannot later claim a different one.
+This service still cannot recompute the commitment (no action, no key); it
+only (a) refuses to hand out an execution lease at claim time unless the
+device presents the same value, and (b) records whether the value the device
+attests at report-result equals it. That catches a device whose stored
+approval record was swapped or corrupted between create and execution, and
+leaves evidence for an audit, which can recompute the commitment from the
+device's own copy of the action and key. It does NOT stop a device that is
+itself compromised: such a device can present the registered value and
+execute something else, and nothing here can tell.
+
 This is a narrower, server-side-only interpretation of the round-10 fix,
 reconstructed without the verbatim v11 text — flagged for review like the
 approvals/state_machine.py and approvals/authorize.py design decisions.
@@ -76,6 +94,7 @@ def compute_display_digest(
     action_summary: str,
     action_payload: dict[str, Any],
     digest_salt: str | None,
+    execution_commitment: str | None = None,
 ) -> str:
     """SHA-256 hex digest over a canonical JSON encoding of every field
     that makes up this service's stored half of the approval envelope.
@@ -96,6 +115,10 @@ def compute_display_digest(
         "action_payload": action_payload,
         "digest_salt": digest_salt,
     }
+    if execution_commitment is not None:
+        # Added only when present so every digest computed before this field
+        # existed (and every device that does not send one) stays valid.
+        canonical["execution_commitment"] = execution_commitment
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -109,6 +132,7 @@ def verify_display_digest(
     action_payload: dict[str, Any],
     digest_salt: str | None,
     expected_digest: str,
+    execution_commitment: str | None = None,
 ) -> bool:
     return (
         compute_display_digest(
@@ -118,6 +142,7 @@ def verify_display_digest(
             action_summary=action_summary,
             action_payload=action_payload,
             digest_salt=digest_salt,
+            execution_commitment=execution_commitment,
         )
         == expected_digest
     )

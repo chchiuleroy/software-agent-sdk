@@ -601,3 +601,30 @@ uv run pyright
 「資料庫/憑證隔離」兩項（見上方「MVP 正式環境驗證」章節）；其餘條件（DB
 拒絕桌面端直連的網路層限制、migration 專用帳號與執行期帳號分離等）**尚未
 落實**，目前仍是 MVP 等級的隔離，不是完整的 15 條件正式部署。
+
+
+## 執行 commitment `CGA_REQUIRE_EXECUTION_COMMITMENT`（2026-10-06）
+
+裝置可在建立核准時登記一個不透明的 commitment（對「真正要執行的動作」算的 HMAC，
+金鑰只留在裝置）。它納入 create-time digest，所以在人類決定**之前**就被固定；
+claim 時必須出示相同值（缺少或不同＝409 `execution_commitment_mismatch`、不發執行
+租約、留一筆 `approval_claim_commitment_mismatch` 稽核）；回報結果時裝置可附
+`executed_commitment`，本服務比對後寫 `commitment_matched`（`true`／`false`／
+`NULL`＝裝置沒有證明），不符只記錄（`approval_executed_commitment_mismatch`）、不拒絕，
+因為動作已經執行。
+
+本服務**無法重算** commitment（它沒有動作也沒有金鑰），所以保證的只是「裝置手上的
+值等於核准前登記的值」；**不防禦被入侵的裝置**（它可以出示已登記的值卻執行別的
+動作）。`executed_commitment` 是裝置的自我證明，欄位 `commitment_matched` 的意思是
+「裝置自述的值與登記值一致」，不是「本服務驗證了執行」；欄位刻意不叫 verified。
+
+**預設關閉**（`false`）：沒送 commitment 的裝置照舊運作，沒有任何東西可比對。設
+`CGA_REQUIRE_EXECUTION_COMMITMENT=true` 後，新建立的核准必須帶 commitment，否則 400
+`execution_commitment_required` 且不寫任何列；已存在、沒有 commitment 的紀錄仍可認領。
+
+**上線順序**：先部署本服務（新欄位皆可選，舊 agent-server 照常運作）→ 更新所有
+agent-server → 最後才打開這個開關。新 agent-server 對舊版本服務會被 422
+（請求模型不接受未知欄位）。
+
+遷移 `a3c5e91b7d20` 只新增三個可為 NULL 的欄位（`execution_commitment`、
+`executed_commitment`、`commitment_matched`）。

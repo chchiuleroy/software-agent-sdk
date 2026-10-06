@@ -56,6 +56,7 @@ Pattern shared by every write endpoint below:
 
 from __future__ import annotations
 
+import hmac
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -76,6 +77,8 @@ from central_governance_api.approvals.errors import (
     ConcurrentModificationError,
     DigestMismatchError,
     ExecutionAttemptMismatchError,
+    ExecutionCommitmentMismatchError,
+    ExecutionCommitmentRequiredError,
     RecordNotFoundError,
     RecordNotTerminalError,
 )
@@ -92,6 +95,7 @@ from central_governance_api.approvals.notify import (
 from central_governance_api.approvals.schemas import (
     ApprovalSummary,
     CancelResponse,
+    ClaimRequest,
     ClaimResponse,
     CreateApprovalRequest,
     DecideRequest,
@@ -199,6 +203,9 @@ async def create_approval(
         enforced=settings.device_binding_enforced,
     )
 
+    if settings.require_execution_commitment and body.execution_commitment is None:
+        raise ExecutionCommitmentRequiredError()
+
     if not verify_display_digest(
         action_type=body.action_type,
         tool_name=body.tool_name,
@@ -207,6 +214,7 @@ async def create_approval(
         action_payload=body.action_payload,
         digest_salt=body.digest_salt,
         expected_digest=body.action_payload_digest,
+        execution_commitment=body.execution_commitment,
     ):
         raise DigestMismatchError(
             "action_payload_digest does not match a digest computed from "
@@ -230,6 +238,7 @@ async def create_approval(
         action_payload=body.action_payload,
         digest_salt=body.digest_salt,
         action_payload_digest=body.action_payload_digest,
+        execution_commitment=body.execution_commitment,
         status=ApprovalStatus.PENDING.value,
         expires_at=now + timedelta(seconds=settings.approval_decision_ttl_seconds),
     )
@@ -435,12 +444,17 @@ _CLAIM_ENDPOINT = "POST /approvals/{id}/claim"
 async def claim_approval(
     approval_id: uuid.UUID,
     idempotency_key: IdempotencyKeyHeader,
+    body: ClaimRequest | None = None,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(get_settings_dependency),
 ) -> ClaimResponse:
     resource_id = str(approval_id)
-    fingerprint = fingerprint_request({})  # no request body to fingerprint
+    # A bodyless claim (every device that predates the commitment) keeps the
+    # fingerprint it always had.
+    fingerprint = fingerprint_request(
+        body.model_dump(mode="json") if body is not None else {}
+    )
     replayed = await find_replayed_response(
         session,
         principal_issuer=principal.issuer,
@@ -467,6 +481,27 @@ async def claim_approval(
 
     current = ApprovalStatus(record.status)
     next_status(current, ApprovalEvent.CLAIM)  # raises if illegal from here
+
+    if record.execution_commitment is not None:
+        presented = body.execution_commitment if body is not None else None
+        if presented is None or not hmac.compare_digest(
+            presented, record.execution_commitment
+        ):
+            # Persist the evidence BEFORE raising: the error path rolls the
+            # request's transaction back, and a refused claim is exactly the
+            # event an audit needs to see. No lease is handed out.
+            session.add(
+                AdminAuditEvent(
+                    event_type="approval_claim_commitment_mismatch",
+                    actor_issuer=principal.issuer,
+                    actor_sub=principal.sub,
+                    origin_device_id=record.origin_device_id,
+                    approval_request_id=approval_id,
+                    payload={"presented": presented is not None},
+                )
+            )
+            await session.commit()
+            raise ExecutionCommitmentMismatchError(approval_id=approval_id)
 
     now = now_utc()
     attempt_id = uuid.uuid4()
@@ -607,16 +642,41 @@ async def report_result(
         # silently bypass fail-closed.
         where_clauses.append(PendingApprovalRecord.executing_lease_expires_at > now)
 
+    update_values: dict[str, Any] = {"status": target.value}
+    commitment_mismatch = False
+    if body.executed_commitment is not None:
+        # Evidence only: the action has already run, so a mismatch cannot
+        # change the outcome being reported. It is recorded, never rejected.
+        update_values["executed_commitment"] = body.executed_commitment
+        if record.execution_commitment is not None:
+            verified = hmac.compare_digest(
+                body.executed_commitment, record.execution_commitment
+            )
+            update_values["commitment_matched"] = verified
+            commitment_mismatch = not verified
+
     result = await session.execute(
         update(PendingApprovalRecord)
         .where(*where_clauses)
-        .values(status=target.value)
+        .values(**update_values)
         .returning(PendingApprovalRecord.id)
     )
     if result.scalar_one_or_none() is None:
         raise ConcurrentModificationError(approval_id=approval_id)
 
     await notify_status_changed(session, approval_id=approval_id, status=target.value)
+
+    if commitment_mismatch:
+        session.add(
+            AdminAuditEvent(
+                event_type="approval_executed_commitment_mismatch",
+                actor_issuer=principal.issuer,
+                actor_sub=principal.sub,
+                origin_device_id=record.origin_device_id,
+                approval_request_id=approval_id,
+                payload={"outcome": body.outcome},
+            )
+        )
 
     if body.is_pre_claim_abort:
         # Code-review Medium: pre-claim abort and a plain pre-decision
