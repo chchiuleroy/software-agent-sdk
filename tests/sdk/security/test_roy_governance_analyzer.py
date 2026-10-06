@@ -229,6 +229,17 @@ def test_third_party_tool_cannot_borrow_a_built_in_name(analyzer, workspace):
     assert risk == SecurityRisk.UNKNOWN
 
 
+def test_a_class_that_only_claims_a_built_in_module_is_not_trusted(analyzer, workspace):
+    # ``__module__`` is a string any class can set. The class must really be
+    # the one registered under that module name (found by review).
+    class _Forger(Action):
+        path: str
+
+    _Forger.__module__ = "openhands.tools.file_editor.definition"
+    action = _Forger(path=str(workspace / "a.txt"))
+    assert _risk(analyzer, "file_editor", action) == SecurityRisk.UNKNOWN
+
+
 def test_third_party_command_field_is_still_high(analyzer):
     # Stricter, so it needs no tool identity.
     action = _ThirdPartyCommandAction(command="anything")

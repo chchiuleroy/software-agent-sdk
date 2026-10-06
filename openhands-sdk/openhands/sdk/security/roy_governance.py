@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 
 from openhands.sdk.event.llm_convertible import ActionEvent
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
@@ -64,11 +65,26 @@ def _pattern_may_leave_path(pattern: object) -> bool:
     )
 
 
-# A tool is "built-in" only if its Action class comes from this package. The
+# A tool is "built-in" only if its Action class comes from these packages. The
 # tool name alone is not enough: a third-party tool (an MCP server's, a plugin's)
 # can be called ``file_editor`` or have a field named ``path``, and treating it
 # like the built-in would make a path inside the workspace mean "no approval".
-_BUILTIN_TOOL_MODULE_PREFIX = "openhands.tools."
+_BUILTIN_ACTION_MODULE_PREFIXES = ("openhands.tools.", "openhands.sdk.tool.builtins.")
+
+
+def is_builtin_action(act: object) -> bool:
+    """True if ``act`` is an instance of an Action class defined by a built-in
+    package. ``__module__`` alone is just a string a class can set to anything,
+    so the class must also be the one registered under that name in
+    ``sys.modules``: an MCP tool's dynamically built class, or one that merely
+    claims a built-in module name, is not. (Code that can register a module
+    under a built-in name already runs inside this process; this keeps a
+    third-party tool from borrowing trust, it is not a sandbox.)"""
+    cls = type(act)
+    if not cls.__module__.startswith(_BUILTIN_ACTION_MODULE_PREFIXES):
+        return False
+    module = sys.modules.get(cls.__module__)
+    return getattr(module, cls.__qualname__, None) is cls
 
 
 class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
@@ -104,9 +120,7 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
         act = action.action
 
         spec = _PATH_TOOLS.get(action.tool_name)
-        if spec is not None and type(act).__module__.startswith(
-            _BUILTIN_TOOL_MODULE_PREFIX
-        ):
+        if spec is not None and is_builtin_action(act):
             field, relative_to_workspace = spec
             path = getattr(act, field, None)
             pattern_field = _PATTERN_FIELD_BY_TOOL.get(action.tool_name)
