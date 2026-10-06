@@ -19,29 +19,78 @@ DEFAULT_WORKSPACE_ROOT = os.environ.get(
     os.path.join(os.path.expanduser("~"), "openhands-governance", "poc", "test-workspace"),
 )
 
+# Built-in tools whose single path argument decides the risk, keyed by the tool's
+# name. Value: (name of the path field, whether a relative path is resolved
+# against the workspace by the tool itself).
+#
+# The second flag mirrors each tool's own executor, so the analyzer judges the
+# file the tool will really touch: the gemini tools join a relative path onto
+# the workspace root, while file_editor / grep / glob resolve it against the
+# server process's cwd (file_editor refuses a relative path outright).
+#
+# A path-less call (grep/glob without ``path``) is not listed as safe: glob
+# may take a directory out of its pattern, so it stays UNKNOWN (= approval).
+_PATH_TOOLS: dict[str, tuple[str, bool]] = {
+    "file_editor": ("path", False),
+    "planning_file_editor": ("path", False),
+    "grep": ("path", False),
+    "glob": ("path", False),
+    "read_file": ("file_path", True),
+    "write_file": ("file_path", True),
+    "edit": ("file_path", True),
+    "list_directory": ("dir_path", True),
+}
+
+# A tool is "built-in" only if its Action class comes from this package. The
+# tool name alone is not enough: a third-party tool (an MCP server's, a plugin's)
+# can be called ``file_editor`` or have a field named ``path``, and treating it
+# like the built-in would make a path inside the workspace mean "no approval".
+_BUILTIN_TOOL_MODULE_PREFIX = "openhands.tools."
+
 
 class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
     """對應 dsh-authz-roles 的 pathWithin payload matcher + preexecute 的
     riskTier 判定,合併成單一 security_risk() 決策。
 
-    - FileEditorAction.path 在工作區內 -> LOW(免核准)
-    - FileEditorAction.path 在工作區外 -> HIGH(需核准)
-    - TerminalAction(任何 command)     -> HIGH(比照 dsh bash/pwsh 一律問)
+    依「工具身分」而非「欄位名稱」分流:
+
+    - 內建檔案/搜尋工具(``_PATH_TOOLS``)的路徑在工作區內 -> LOW(免核准)
+    - 同上,路徑在工作區外 -> HIGH(需核准)
+    - 同上,但沒給路徑(grep/glob 不帶 path)-> UNKNOWN(需核准)
+    - 任何有 ``command`` 欄位的動作(TerminalAction 等)-> HIGH
+      (比照 dsh bash/pwsh 一律問;只會更嚴格,所以不限工具身分)
+    - 其餘一律 UNKNOWN(需核准),**包含第三方/MCP 工具**,不論它有沒有叫
+      ``path`` 的欄位——工具叫什麼、欄位叫什麼都是對方說了算,不能當作
+      「這個動作無害」的依據
     """
 
     workspace_root: str = DEFAULT_WORKSPACE_ROOT
 
+    def _is_in_workspace(self, path: str, *, relative_to_workspace: bool) -> bool:
+        if relative_to_workspace and not os.path.isabs(path):
+            path = os.path.join(self.workspace_root, path)
+        resolved = os.path.realpath(path)
+        root = os.path.realpath(self.workspace_root)
+        try:
+            return os.path.commonpath([resolved, root]) == root
+        except ValueError:
+            return False
+
     def security_risk(self, action: ActionEvent) -> SecurityRisk:
         act = action.action
-        path = getattr(act, "path", None)
-        if path is not None:
-            resolved = os.path.realpath(path)
-            root = os.path.realpath(self.workspace_root)
-            try:
-                in_workspace = os.path.commonpath([resolved, root]) == root
-            except ValueError:
-                in_workspace = False
-            return SecurityRisk.LOW if in_workspace else SecurityRisk.HIGH
+
+        spec = _PATH_TOOLS.get(action.tool_name)
+        if spec is not None and type(act).__module__.startswith(
+            _BUILTIN_TOOL_MODULE_PREFIX
+        ):
+            field, relative_to_workspace = spec
+            path = getattr(act, field, None)
+            if isinstance(path, str) and path:
+                in_workspace = self._is_in_workspace(
+                    path, relative_to_workspace=relative_to_workspace
+                )
+                return SecurityRisk.LOW if in_workspace else SecurityRisk.HIGH
+            return SecurityRisk.UNKNOWN
 
         if getattr(act, "command", None) is not None:
             return SecurityRisk.HIGH
