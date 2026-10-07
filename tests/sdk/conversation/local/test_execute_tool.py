@@ -217,39 +217,48 @@ def test_execute_tool_multiple_calls():
         assert result.result == f"executed_call_{i}"
 
 
+# These two classes must live at module level, not inside the test below.
+# ``ToolDefinition`` subclasses are tracked through ``__subclasses__()``, and
+# ``_get_checked_concrete_subclasses`` raises "Local classes not supported!" for
+# any live subclass whose qualname contains "<locals>". The autouse
+# ``_tool_registry_snapshot`` fixture only restores the tool registry, not that
+# subclass tracking, so a function-local subclass outlives the test and makes a
+# later ``GET /openapi.json`` in the same process fail, in whichever OpenAPI
+# test happens to run next (hence the run-order-dependent failures).
+class ContextAwareExecutor(
+    ToolExecutor[ExecuteToolTestAction, ExecuteToolTestObservation]
+):
+    """Executor that uses conversation context."""
+
+    def __call__(
+        self,
+        action: ExecuteToolTestAction,
+        conversation: "LocalConversation | None" = None,
+    ) -> ExecuteToolTestObservation:
+        # Verify conversation is passed
+        conv_id = str(conversation.id) if conversation else "no_conversation"
+        return ExecuteToolTestObservation.from_text(
+            f"conv_id: {conv_id}", result=f"context_{action.value}"
+        )
+
+
+class ContextAwareTool(
+    ToolDefinition[ExecuteToolTestAction, ExecuteToolTestObservation]
+):
+    @classmethod
+    def create(cls, conv_state=None, **params):
+        return [
+            cls(
+                description="Context-aware test tool",
+                action_type=ExecuteToolTestAction,
+                observation_type=ExecuteToolTestObservation,
+                executor=ContextAwareExecutor(),
+            )
+        ]
+
+
 def test_execute_tool_with_conversation_context():
     """Test that execute_tool passes conversation context to the executor."""
-
-    class ContextAwareExecutor(
-        ToolExecutor[ExecuteToolTestAction, ExecuteToolTestObservation]
-    ):
-        """Executor that uses conversation context."""
-
-        def __call__(
-            self,
-            action: ExecuteToolTestAction,
-            conversation: "LocalConversation | None" = None,
-        ) -> ExecuteToolTestObservation:
-            # Verify conversation is passed
-            conv_id = str(conversation.id) if conversation else "no_conversation"
-            return ExecuteToolTestObservation.from_text(
-                f"conv_id: {conv_id}", result=f"context_{action.value}"
-            )
-
-    class ContextAwareTool(
-        ToolDefinition[ExecuteToolTestAction, ExecuteToolTestObservation]
-    ):
-        @classmethod
-        def create(cls, conv_state=None, **params):
-            return [
-                cls(
-                    description="Context-aware test tool",
-                    action_type=ExecuteToolTestAction,
-                    observation_type=ExecuteToolTestObservation,
-                    executor=ContextAwareExecutor(),
-                )
-            ]
-
     register_tool_public("context_aware", ContextAwareTool)
 
     agent = ExecuteToolDummyAgent(tools=[Tool(name="context_aware", params={})])
@@ -262,3 +271,29 @@ def test_execute_tool_with_conversation_context():
     assert "conv_id:" in result.text
     assert isinstance(result, ExecuteToolTestObservation)
     assert result.result == "context_test"
+
+
+def test_no_function_local_tool_subclasses_leak_from_this_module():
+    """Fail here, next to the cause, if a test in this module defines a
+    ``ToolDefinition`` subclass inside a function.
+
+    Such a class stays in ``ToolDefinition.__subclasses__()`` after the test,
+    and every later ``GET /openapi.json`` in the same process then raises
+    "Local classes not supported!" in an unrelated OpenAPI test. Only classes
+    defined in this module are checked, so another file's leak cannot make
+    this test fail.
+    """
+    import gc
+
+    def all_subclasses(cls):
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from all_subclasses(sub)
+
+    gc.collect()
+    leaked = [
+        c.__qualname__
+        for c in all_subclasses(ToolDefinition)
+        if c.__module__ == __name__ and "<locals>" in c.__qualname__
+    ]
+    assert leaked == []
