@@ -48,6 +48,9 @@ from openhands.agent_server.event_service import (
 from openhands.agent_server.file_router import file_router
 from openhands.agent_server.git_router import git_router
 from openhands.agent_server.governance_router import governance_router
+from openhands.agent_server.governance_subagents import (
+    install_team_mode_subagent_guard,
+)
 from openhands.agent_server.hooks_router import hooks_router
 from openhands.agent_server.init_router import (
     InitService,
@@ -867,6 +870,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     )
     _add_exception_handlers(app)
 
+    # Last, so an app that fails to build does not leave a hold behind. Here
+    # rather than in load_config(), so a Config handed in directly (an
+    # embedding host, not the env/file path) is covered as well.
+    install_team_mode_subagent_guard(config)
     return app
 
 

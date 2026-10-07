@@ -42,6 +42,75 @@ if TYPE_CHECKING:
 
 ConfirmationHandler = Callable[[str, list["ActionEvent"]], bool]
 
+# Process-wide fallback for a manager that was given no handler of its own.
+# A handler is a callable, so it cannot ride in the JSON ``Tool(params=...)`` and
+# nothing else passes one; without this a host (the agent-server in team mode)
+# has no way to stop sub-agent actions from being run unconfirmed.
+# One tuple, assigned in one step and read in one step, so a thread never sees a
+# new handler paired with an old limit (or the reverse) while another sets it.
+_default_confirmation: tuple[ConfirmationHandler | None, int | None] = (None, None)
+
+
+def set_default_confirmation_handler(
+    handler: ConfirmationHandler | None,
+    max_refusals: int | None = None,
+) -> None:
+    """Set (or with ``None`` clear) the handler used when a manager has none.
+
+    Read when a sub-agent actually stops for confirmation, not when the manager
+    is built, so managers that already exist follow it too.
+
+    ``max_refusals`` bounds how often this default handler may refuse within one
+    run of one sub-agent. The resume loop has no bound of its own: it just
+    resumes the sub-agent after each refusal, and a sub-agent that keeps
+    re-proposing the action would go on for as long as the LLM answers. A person
+    answering a prompt eventually stops; an automatic refusal never does. Past
+    the limit the run raises ``RefusalLimitExceeded``. ``None`` means no limit,
+    and a handler passed to a manager directly is never limited.
+    """
+    global _default_confirmation
+    _default_confirmation = (handler, max_refusals if handler is not None else None)
+
+
+def get_default_confirmation_handler() -> ConfirmationHandler | None:
+    return _default_confirmation[0]
+
+
+def get_default_max_refusals() -> int | None:
+    return _default_confirmation[1]
+
+
+class RefusalLimitExceeded(Exception):
+    """A sub-agent kept proposing actions the default handler refuses."""
+
+
+class ConfirmationGate:
+    """Decides whether one sub-agent run may execute its pending actions.
+
+    Built once per ``_run_until_finished`` call, so the refusal count belongs to
+    that run alone. (Task ids are not unique across managers, so they cannot key
+    a count shared across runs.)
+    """
+
+    def __init__(self, handler: ConfirmationHandler | None) -> None:
+        self._handler = handler
+        self._refusals = 0
+
+    def allows(self, task_id: str, pending: "list[ActionEvent]") -> bool:
+        if self._handler is not None:
+            return self._handler(task_id, pending)
+        default, limit = _default_confirmation
+        if default is None or default(task_id, pending):
+            return True
+        self._refusals += 1
+        if limit is not None and self._refusals > limit:
+            raise RefusalLimitExceeded(
+                "Sub-agent stopped: it kept proposing actions that need "
+                "confirmation, which this server does not allow it to run. "
+                f"Gave up after {limit} refusals."
+            )
+        return False
+
 
 logger = get_logger(__name__)
 
@@ -434,6 +503,7 @@ class TaskManager:
         self, task_id: str, conversation: LocalConversation
     ) -> None:
         """Run a sub-agent conversation to completion, handling confirmations."""
+        gate = ConfirmationGate(self._confirmation_handler)
         conversation.run()
         while (
             conversation.state.execution_status
@@ -443,9 +513,7 @@ class TaskManager:
             if not pending:
                 break
 
-            if self._confirmation_handler is None or self._confirmation_handler(
-                task_id, pending
-            ):
+            if gate.allows(task_id, pending):
                 conversation.run()
             else:
                 conversation.reject_pending_actions("User rejected the actions")

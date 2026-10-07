@@ -30,6 +30,10 @@ from openhands.agent_server.config import (
     validate_team_mode_config,
 )
 from openhands.agent_server.conversation_service import ConversationService
+from openhands.agent_server.governance_subagents import (
+    install_team_mode_subagent_guard,
+    release_team_mode_subagent_guard,
+)
 from openhands.agent_server.server_details_router import mark_initialization_complete
 from openhands.agent_server.telemetry import (
     build_telemetry_sink,
@@ -266,8 +270,16 @@ class InitService:
                 )
             self._state = "initializing"
             self._error = None
+        # A personal->team flip also needs the sub-agent guard (create_app() only
+        # sees the config the server started with). The hold is given back in
+        # the finally below if this attempt does not reach 'ready', so a failed
+        # or cancelled init, which goes back to dormant and may be retried as
+        # personal, leaves nothing behind and cannot clear another server's hold.
+        guard_held = False
+        initialized = False
         try:
             new_config = _build_initialized_config(self._base_config, req)
+            guard_held = install_team_mode_subagent_guard(new_config)
             if req.env:
                 # Setting env vars before services boot lets things like
                 # the cipher pick up OH_SECRET_KEY-style overrides, and
@@ -314,6 +326,7 @@ class InitService:
             # attempt never produces a start and a retry cannot double-emit.
             emit_server_started()
             logger.info("deferred_init: server transitioned to ready")
+            initialized = True
             return self.snapshot()
         except Exception as exc:  # pragma: no cover - logged + re-raised
             logger.exception("deferred_init: /api/init failed; rolling back to dormant")
@@ -323,6 +336,9 @@ class InitService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=self._error,
             ) from exc
+        finally:
+            if guard_held and not initialized:
+                release_team_mode_subagent_guard()
 
     async def teardown(self) -> None:
         """Tear down the conversation service if /api/init succeeded.

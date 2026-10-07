@@ -15,6 +15,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.subagent import get_agent_factory
 from openhands.sdk.tool.tool import ToolExecutor
 from openhands.tools.delegate.definition import DelegateObservation
+from openhands.tools.task.manager import ConfirmationGate
 
 
 if TYPE_CHECKING:
@@ -112,6 +113,7 @@ class DelegateExecutor(ToolExecutor):
         self, agent_id: str, conversation: LocalConversation
     ) -> None:
         """Run a sub-agent conversation to completion, handling confirmations."""
+        gate = ConfirmationGate(self._confirmation_handler)
         conversation.run()
         while (
             conversation.state.execution_status
@@ -121,9 +123,7 @@ class DelegateExecutor(ToolExecutor):
             if not pending:
                 break
 
-            if self._confirmation_handler is None or self._confirmation_handler(
-                agent_id, pending
-            ):
+            if gate.allows(agent_id, pending):
                 conversation.run()
             else:
                 conversation.reject_pending_actions("User rejected the actions")
