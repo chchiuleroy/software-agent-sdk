@@ -275,14 +275,16 @@ def check_governed_binding_required(
     Rejecting the pending actions (``reject_pending_actions()``) does not go
     through ``run()`` and still unblocks the conversation.
 
-    Scope: this guard covers only callers that reach ``EventService.run()``,
-    i.e. the agent-server boundary. A caller that uses the SDK directly and
-    calls ``LocalConversation.run()`` never reaches it. That method has its
-    own ``expected_binding`` check, but ``None`` (the default) skips it, and
-    it knows nothing of the outbox record. Such a caller can resume a
-    conversation that is waiting for confirmation with no central approval.
-    The guarantee therefore holds for the agent-server, not for embedding
-    the SDK in another process.
+    Scope: this guard covers only conversations driven through
+    ``EventService.run()``. Anything that calls ``LocalConversation.run()``
+    directly never reaches it, even inside the agent-server process. That
+    method has its own ``expected_binding`` check, but ``None`` (the
+    default) skips it, and it knows nothing of the outbox record, so such a
+    caller can resume a conversation that is waiting for confirmation with
+    no central approval. Known direct callers: an application that embeds
+    the SDK, ``run_goal()``, and the sub-agent conversations that the
+    delegate and task tools run to completion (``_run_until_finished``).
+    The guarantee is "this entry point", not "this process".
 
     Compares only ``central_approval_id`` and ``action_event_id`` — the two
     fields that identify *which* governed workflow is in flight — rather
