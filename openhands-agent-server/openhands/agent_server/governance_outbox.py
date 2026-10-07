@@ -275,6 +275,15 @@ def check_governed_binding_required(
     Rejecting the pending actions (``reject_pending_actions()``) does not go
     through ``run()`` and still unblocks the conversation.
 
+    Scope: this guard covers only callers that reach ``EventService.run()``,
+    i.e. the agent-server boundary. A caller that uses the SDK directly and
+    calls ``LocalConversation.run()`` never reaches it. That method has its
+    own ``expected_binding`` check, but ``None`` (the default) skips it, and
+    it knows nothing of the outbox record. Such a caller can resume a
+    conversation that is waiting for confirmation with no central approval.
+    The guarantee therefore holds for the agent-server, not for embedding
+    the SDK in another process.
+
     Compares only ``central_approval_id`` and ``action_event_id`` — the two
     fields that identify *which* governed workflow is in flight — rather
     than recomputing the full ``ActionBinding.fingerprint()`` (which also
