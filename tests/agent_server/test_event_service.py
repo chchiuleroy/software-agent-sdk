@@ -1572,10 +1572,19 @@ class TestEventServiceRespondToConfirmation:
         identity that counts is the one central-governance-api verified from
         the approver's OIDC token when they decided the request (recorded as
         its ``decision_actor``). A caller-supplied ``approver_identity`` is
-        self-reported and must never reach the local self-approval path, so a
-        client cannot use it to claim (or to dodge) a self-approval check.
-        Pinning this keeps ``approver_identity`` from being mistaken for an
-        authorization boundary by a future change."""
+        self-reported, so it is not an authorization boundary.
+
+        What this pins, and no more: on the team-mode accept path
+        ``respond_to_confirmation`` itself (a) hands only ``central_approval_id``
+        to the handshake, (b) never calls the plain ``run(...)`` (the path that
+        forwards ``approver_identity``), (c) never calls
+        ``check_not_self_approval`` with the client-supplied value, and (d) never
+        puts the value into the recorded calls of the three objects observed
+        here (the handshake, the plain ``run`` and the conversation). The
+        handshake is mocked, so what happens *inside* it (including the
+        ``run()`` it ends up calling with ``approver_identity=None``) is
+        covered by the handshake tests, not by this one."""
+        claimed = "someone-claimed-by-the-client"
         event_service.governance_deployment_mode = "team"
         event_service._conversation = MagicMock()
         event_service.run = AsyncMock()
@@ -1586,9 +1595,12 @@ class TestEventServiceRespondToConfirmation:
         request = ConfirmationResponseRequest(
             accept=True,
             central_approval_id="approval-1",
-            approver_identity="someone-claimed-by-the-client",
+            approver_identity=claimed,
         )
-        await event_service.respond_to_confirmation(request)
+        with patch(
+            "openhands.agent_server.event_service.check_not_self_approval"
+        ) as self_approval_check:
+            await event_service.respond_to_confirmation(request)
 
         event_service.run_and_wait_for_start.assert_awaited_once_with(
             central_approval_id="approval-1"
@@ -1596,6 +1608,16 @@ class TestEventServiceRespondToConfirmation:
         # The plain path is the only one that forwards approver_identity; it
         # must not run at all in team mode.
         event_service.run.assert_not_awaited()
+        # The local self-approval check must not be fed the client's claim by
+        # this method (a regression that consumes the field *before* calling
+        # the handshake would still satisfy the two assertions above).
+        self_approval_check.assert_not_called()
+        for collaborator in (
+            event_service.run,
+            event_service.run_and_wait_for_start,
+            event_service._conversation,
+        ):
+            assert claimed not in repr(collaborator.mock_calls)
 
     @pytest.mark.asyncio
     async def test_respond_to_confirmation_raises_on_pending_unknown_outcome(

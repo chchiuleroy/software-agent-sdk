@@ -448,8 +448,10 @@ class Config(BaseModel):
             "If central-governance-api runs with CGA_DEVICE_BINDING_ENFORCED, "
             "this value must first be registered by THIS process's own "
             "governance_client_id service account (POST /api/v1/devices/"
-            "register) and not revoked, or every create/claim answers 403 "
-            "device_not_bound."
+            "register) and not revoked, or create/claim answer 403 "
+            "device_not_bound. Central checks this only after looking up an "
+            "idempotent replay, so a retry that reuses an earlier request's "
+            "idempotency key is answered from the stored response instead."
         ),
     )
     governance_refuse_truncated_actions: bool = Field(
