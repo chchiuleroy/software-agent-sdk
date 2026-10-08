@@ -2608,12 +2608,15 @@ class EventService:
         client = self.governance_client
         if client is None:
             return
-        record = self.governance_outbox.load()
-        if record is None or record.state != OutboxState.CREATED:
-            return
-        assert record.central_approval_id is not None
-        approval_id = record.central_approval_id
         try:
+            # Loading is inside the try on purpose: an unreadable outbox file
+            # must not turn into a failed deletion.
+            record = self.governance_outbox.load()
+            if record is None or record.state != OutboxState.CREATED:
+                return
+            approval_id = record.central_approval_id
+            if approval_id is None:
+                return
             try:
                 await client.cancel(
                     approval_id, idempotency_key=f"cancel-{record.request_id}"
@@ -2636,9 +2639,10 @@ class EventService:
             )
         except Exception:
             logger.warning(
-                "failed to cancel unclaimed governance approval %s while "
-                "deleting conversation; it will lapse at its deadline",
-                approval_id,
+                "failed to cancel the unclaimed governance approval of "
+                "conversation %s while deleting it; it will lapse at its "
+                "deadline",
+                self.stored.id,
                 exc_info=True,
             )
 

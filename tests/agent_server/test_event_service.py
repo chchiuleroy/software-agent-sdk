@@ -5369,6 +5369,21 @@ class TestEventServiceGovernanceOrchestration:
         assert updated.state == OutboxState.CREATED
 
     @pytest.mark.asyncio
+    async def test_cancel_unclaimed_survives_an_unreadable_outbox(
+        self, governed_service
+    ):
+        """Same "never blocks deletion" promise for a damaged outbox file:
+        reading it is part of the best-effort step, not before it."""
+        client = MagicMock()
+        client.cancel = AsyncMock(return_value={})
+        governed_service.governance_client = client
+        governed_service.governance_outbox._path.write_text("{ not json")
+
+        await governed_service.cancel_unclaimed_governance_approval()  # no raise
+
+        client.cancel.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "state",
         [
