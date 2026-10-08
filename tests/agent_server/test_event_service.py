@@ -5259,6 +5259,159 @@ class TestEventServiceGovernanceOrchestration:
 
         fake_client.report_result.assert_not_awaited()
 
+    # ---------- cancel_unclaimed_governance_approval (conversation delete) ----------
+
+    async def _created_record_service(self, governed_service, client):
+        record = self._claimed_record(governed_service, _governance_pending_action())
+        record.state = OutboxState.CREATED
+        record.execution_attempt_id = None
+        await governed_service.governance_outbox.create_record(record)
+        governed_service.governance_client = client
+        governed_service._conversation = None  # keep close() minimal
+        return record
+
+    @staticmethod
+    def _illegal_transition() -> GovernancePermanentError:
+        return GovernancePermanentError(
+            "illegal", error_code="illegal_transition", status_code=409
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_unclaimed_cancels_a_pending_approval(self, governed_service):
+        client = MagicMock()
+        client.cancel = AsyncMock(return_value={})
+        client.report_result = AsyncMock(return_value={})
+        record = await self._created_record_service(governed_service, client)
+
+        await governed_service.cancel_unclaimed_governance_approval()
+
+        client.cancel.assert_awaited_once_with(
+            "approval-1", idempotency_key=f"cancel-{record.request_id}"
+        )
+        client.report_result.assert_not_awaited()
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_close_alone_keeps_an_unclaimed_approval_alive(
+        self, governed_service
+    ):
+        """Why cancelling is a separate step called only on delete: close()
+        also runs on server shutdown and idle eviction, and the next load
+        resumes waiting on this very approval from the persisted outbox.
+        Cancelling there would destroy approvals that should survive."""
+        client = MagicMock()
+        client.cancel = AsyncMock(return_value={})
+        client.report_result = AsyncMock(return_value={})
+        await self._created_record_service(governed_service, client)
+
+        await governed_service.close()
+
+        client.cancel.assert_not_awaited()
+        client.report_result.assert_not_awaited()
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CREATED
+
+    @pytest.mark.asyncio
+    async def test_cancel_unclaimed_aborts_an_already_accepted_approval(
+        self, governed_service
+    ):
+        """Central refuses cancel once someone accepted; the way out of an
+        accepted-but-never-claimed approval is the pre-claim abort, which is
+        report-result without an execution attempt."""
+        client = MagicMock()
+        client.cancel = AsyncMock(side_effect=self._illegal_transition())
+        client.report_result = AsyncMock(return_value={})
+        record = await self._created_record_service(governed_service, client)
+
+        await governed_service.cancel_unclaimed_governance_approval()
+
+        client.report_result.assert_awaited_once_with(
+            "approval-1", idempotency_key=f"abort-{record.request_id}"
+        )
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_cancel_unclaimed_leaves_an_already_terminal_approval_alone(
+        self, governed_service
+    ):
+        client = MagicMock()
+        client.cancel = AsyncMock(side_effect=self._illegal_transition())
+        client.report_result = AsyncMock(side_effect=self._illegal_transition())
+        await self._created_record_service(governed_service, client)
+
+        await governed_service.cancel_unclaimed_governance_approval()  # no raise
+
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CREATED
+
+    @pytest.mark.asyncio
+    async def test_cancel_unclaimed_failure_never_blocks_the_caller(
+        self, governed_service
+    ):
+        """It runs inside conversation deletion, which must still succeed
+        when central is unreachable; the approval then lapses at its deadline."""
+        client = MagicMock()
+        client.cancel = AsyncMock(side_effect=ConnectionError("central down"))
+        client.report_result = AsyncMock(return_value={})
+        await self._created_record_service(governed_service, client)
+
+        await governed_service.cancel_unclaimed_governance_approval()  # no raise
+
+        client.report_result.assert_not_awaited()
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CREATED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state",
+        [
+            OutboxState.PENDING_CREATE,
+            OutboxState.CLAIM_INFLIGHT,
+            OutboxState.CLAIMED,
+            OutboxState.RESULT_REPORTED,
+        ],
+    )
+    async def test_cancel_unclaimed_only_touches_created_records(
+        self, governed_service, state
+    ):
+        """No id yet (PENDING_CREATE), claim possibly landed (CLAIM_INFLIGHT),
+        or an execution lease exists (CLAIMED): cancel would be wrong or is
+        another path's job."""
+        client = MagicMock()
+        client.cancel = AsyncMock(return_value={})
+        client.report_result = AsyncMock(return_value={})
+        record = self._claimed_record(governed_service, _governance_pending_action())
+        record.state = state
+        await governed_service.governance_outbox.create_record(record)
+        governed_service.governance_client = client
+
+        await governed_service.cancel_unclaimed_governance_approval()
+
+        client.cancel.assert_not_awaited()
+        client.report_result.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancel_unclaimed_noop_without_a_governance_client(
+        self, governed_service
+    ):
+        record = self._claimed_record(governed_service, _governance_pending_action())
+        record.state = OutboxState.CREATED
+        await governed_service.governance_outbox.create_record(record)
+        governed_service.governance_client = None
+
+        await governed_service.cancel_unclaimed_governance_approval()
+
+        updated = governed_service.governance_outbox.load()
+        assert updated is not None
+        assert updated.state == OutboxState.CREATED
+
     @pytest.mark.asyncio
     async def test_close_waits_for_pending_reject_report_before_reconciling(
         self, governed_service

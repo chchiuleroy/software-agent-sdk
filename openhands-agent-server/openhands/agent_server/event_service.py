@@ -2582,6 +2582,66 @@ class EventService:
                 lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
             )
 
+    async def cancel_unclaimed_governance_approval(self) -> None:
+        """Called when this conversation is being *deleted* (after ``close()``,
+        before its directory is removed): tell central that an approval it
+        registered but never claimed is no longer wanted.
+
+        Deliberately not part of ``close()``: that also runs on server
+        shutdown and idle eviction, and an unclaimed approval must survive
+        those — the persisted outbox lets the next load pick the wait back
+        up. Only deletion destroys the outbox, so only here would the
+        approval otherwise sit in the approver's inbox until its deadline.
+
+        Only ``OutboxState.CREATED`` is handled (central id known, claim
+        never attempted). ``PENDING_CREATE`` has no id to cancel, and
+        ``CLAIM_INFLIGHT`` may already be claimed; both are left to central's
+        deadline/lease expiry. ``CLAIMED``/``EXECUTION_STARTED`` are settled
+        by ``_reconcile_governance_after_close()``.
+
+        Central only allows ``cancel`` while the approval is still pending. If
+        someone already accepted it, the equivalent is the pre-claim abort
+        (report-result without an attempt id). Anything else is already
+        terminal there. Best effort: a failure is logged and never blocks the
+        deletion.
+        """
+        client = self.governance_client
+        if client is None:
+            return
+        record = self.governance_outbox.load()
+        if record is None or record.state != OutboxState.CREATED:
+            return
+        assert record.central_approval_id is not None
+        approval_id = record.central_approval_id
+        try:
+            try:
+                await client.cancel(
+                    approval_id, idempotency_key=f"cancel-{record.request_id}"
+                )
+            except GovernancePermanentError as exc:
+                if exc.error_code != "illegal_transition":
+                    raise
+                # Not pending any more: accepted (abort it) or already
+                # terminal (the abort is then refused the same way).
+                try:
+                    await client.report_result(
+                        approval_id, idempotency_key=f"abort-{record.request_id}"
+                    )
+                except GovernancePermanentError as abort_exc:
+                    if abort_exc.error_code != "illegal_transition":
+                        raise
+                    return
+            await self.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.CANCELLED)
+            )
+        except Exception:
+            logger.warning(
+                "failed to cancel unclaimed governance approval %s while "
+                "deleting conversation; it will lapse at its deadline",
+                approval_id,
+                exc_info=True,
+            )
+
     async def run_and_wait_for_start(
         self, *, central_approval_id: str, timeout_seconds: float = 20.0
     ) -> GovernanceStartOutcome:

@@ -2824,6 +2824,32 @@ class TestConversationServiceDeleteConversation:
             )
 
     @pytest.mark.asyncio
+    async def test_delete_conversation_cancels_unclaimed_approval_before_rmtree(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """The outbox that remembers the central approval lives in the
+        conversation directory, so cancelling has to happen after close()
+        (the service is quiet) and before the directory is removed."""
+        conversation_id = sample_stored_conversation.id
+        order: list[str] = []
+        mock_service = AsyncMock(spec=EventService)
+        mock_service.conversation_dir = "/tmp/test_conversation"
+        mock_service.stored = sample_stored_conversation
+        mock_service.close.side_effect = lambda: order.append("close")
+        mock_service.cancel_unclaimed_governance_approval.side_effect = (
+            lambda: order.append("cancel")
+        )
+        conversation_service._event_services[conversation_id] = mock_service
+
+        with patch(
+            "openhands.agent_server.conversation_service.safe_rmtree",
+            side_effect=lambda *_a, **_k: order.append("rmtree"),
+        ):
+            assert await conversation_service.delete_conversation(conversation_id)
+
+        assert order == ["close", "cancel", "rmtree"]
+
+    @pytest.mark.asyncio
     async def test_delete_conversation_notifies_webhooks_with_deleting_status(
         self, conversation_service, sample_stored_conversation
     ):
