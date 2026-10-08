@@ -109,6 +109,9 @@ from openhands.sdk.security.roy_action_binding import (
     compute_execution_commitment,
 )
 from openhands.sdk.security.roy_self_approval import check_not_self_approval
+from openhands.sdk.security.roy_tool_permissions import (
+    denial_reason as tool_permission_denial_reason,
+)
 from openhands.sdk.utils.async_utils import AsyncCallbackWrapper
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.utils.files import atomic_write_text
@@ -2265,6 +2268,16 @@ class EventService:
         # unverified claim or, when empty, the SDK's auto-generated
         # "{tool_name}: {every raw argument}". Central only ever sees this
         # deterministic, bounded, redacted projection (governance_display.py).
+        # Department tool permissions come first: a tool this department may not
+        # use is refused whatever its preview looks like. The analyzer already
+        # forced such an action here (see RoyPathPayloadSecurityAnalyzer), so even
+        # a harmless-looking low-risk call cannot run without being checked.
+        denied = tool_permission_denial_reason(action.tool_name)
+        if denied is not None:
+            await self._refuse_unreviewable_action(
+                action, denied, "tool not permitted for this department"
+            )
+            return
         display = build_display(action)
         if self.governance_refuse_truncated_actions and display.is_truncated:
             await self._refuse_unreviewable_action(

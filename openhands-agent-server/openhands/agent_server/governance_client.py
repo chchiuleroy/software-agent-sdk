@@ -126,6 +126,7 @@ _PERMANENT_ERROR_CODES = frozenset(
         "device_revoked",
         "device_quota_exceeded",
         "device_already_revoked",
+        "tool_not_permitted",
     }
 )
 
@@ -436,6 +437,13 @@ class GovernanceClient:
             f"/api/v1/approvals/{approval_id}/cancel",
             idempotency_key=idempotency_key,
         )
+        return response.json()
+
+    async def tool_permissions(self) -> dict[str, Any]:
+        """This agent-server's department tool permissions
+        (``GET /api/v1/me/tool-permissions``): the tools its department may
+        use, a revision, and how long the answer may be relied on."""
+        response = await self._request("GET", "/api/v1/me/tool-permissions")
         return response.json()
 
     async def reconciliation_finding(

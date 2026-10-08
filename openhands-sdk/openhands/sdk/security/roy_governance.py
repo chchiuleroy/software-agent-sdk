@@ -14,6 +14,7 @@ import sys
 from openhands.sdk.event.llm_convertible import ActionEvent
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.risk import SecurityRisk
+from openhands.sdk.security.roy_tool_permissions import is_permitted
 
 
 DEFAULT_WORKSPACE_ROOT = os.environ.get(
@@ -117,6 +118,14 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
             return False
 
     def security_risk(self, action: ActionEvent) -> SecurityRisk:
+        # Department tool permissions (team mode only; a no-op otherwise): a
+        # tool the department may not use always needs confirmation, however
+        # harmless the path looks, so it reaches the refusal in
+        # EventService._create_governance_approval() instead of running as
+        # a low-risk action that never asks anyone.
+        if not is_permitted(action.tool_name):
+            return SecurityRisk.HIGH
+
         act = action.action
 
         spec = _PATH_TOOLS.get(action.tool_name)

@@ -77,6 +77,9 @@ from openhands.sdk.observability.laminar import (
     should_enable_observability,
 )
 from openhands.sdk.observability.utils import extract_action_name
+from openhands.sdk.security.roy_tool_permissions import (
+    denial_reason as tool_permission_denial_reason,
+)
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -1366,6 +1369,27 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 f"Tool '{action_event.tool_name}' not found. This should not happen "
                 "as it was checked earlier."
             )
+
+        # Department tool permissions (team mode only; a no-op otherwise). This
+        # is the authoritative check: it sits where every tool call of every
+        # conversation, sub-agents included, actually runs, so it holds
+        # whatever confirmation policy or security analyzer the conversation
+        # has. The analyzer and EventService checks only spare an approver a
+        # question about a tool that would be refused anyway.
+        denied = tool_permission_denial_reason(action_event.tool_name)
+        if denied is not None:
+            logger.warning(
+                "Refusing tool call %s: not permitted for this department",
+                action_event.tool_call.id,
+            )
+            return [
+                AgentErrorEvent(
+                    error=denied,
+                    tool_name=tool.name,
+                    tool_call_id=action_event.tool_call.id,
+                    classification=AGENT_OUTCOME,
+                )
+            ]
 
         # Execute actions!
         try:
