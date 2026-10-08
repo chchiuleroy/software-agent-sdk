@@ -49,7 +49,13 @@ logger = logging.getLogger(__name__)
 # The three governance roles from the design doc. An IdP-side roles claim
 # is untrusted input filtered against this closed set, never trusted
 # verbatim — matches oidc_principal.py's KNOWN_ROLES.
-KNOWN_ROLES = frozenset({"governance.admin", "agent.operator", "agent.approver"})
+#
+# ``governance.superadmin`` (account requests / departments) is deliberately
+# NOT a superset of ``governance.admin``: nothing in approvals/authorize.py
+# checks it, so granting it widens no existing approval power.
+KNOWN_ROLES = frozenset(
+    {"governance.admin", "agent.operator", "agent.approver", "governance.superadmin"}
+)
 
 _SAFE_SIGNING_ALGORITHMS = frozenset(
     {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
@@ -69,6 +75,11 @@ class Principal:
     display_name: str
     roles: frozenset[str]
     azp: str | None
+    # Account-request flow (docs/account-requests-departments-design-v1.md):
+    # ``email`` is lower-cased; ``email_verified`` is True only when the IdP
+    # sent the JSON boolean ``true`` (a string "true" is not trusted).
+    email: str | None = None
+    email_verified: bool = False
 
     @property
     def subject(self) -> str:
@@ -272,8 +283,22 @@ class OIDCPrincipalResolver:
         if isinstance(name, str) and name:
             display_name = name
 
+        raw_email = token.claims.get("email")
+        email = (
+            raw_email.strip().lower()
+            if isinstance(raw_email, str) and raw_email.strip()
+            else None
+        )
+        email_verified = token.claims.get("email_verified") is True
+
         return Principal(
-            issuer=iss, sub=sub, display_name=display_name, roles=roles, azp=azp
+            issuer=iss,
+            sub=sub,
+            display_name=display_name,
+            roles=roles,
+            azp=azp,
+            email=email,
+            email_verified=email_verified,
         )
 
     async def _decode_token(self, bearer_token: str) -> jwt.Token:
