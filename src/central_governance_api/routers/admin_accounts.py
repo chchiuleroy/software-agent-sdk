@@ -186,7 +186,22 @@ async def _check_exists_and_not_self(
     ).first()
     if row is None:
         raise AccountRequestNotFoundError()
-    if principal.email is not None and principal.email == row.email:
+    # The caller's own addresses: the token's e-mail claim (if any) plus the
+    # e-mail of the membership bound to this login. The second covers a token
+    # that carries no e-mail claim; an operator created outside this flow with
+    # neither is not detectable here.
+    own = (
+        await session.execute(
+            select(AccountMembership.email).where(
+                AccountMembership.bound_issuer == principal.issuer,
+                AccountMembership.bound_sub == principal.sub,
+            )
+        )
+    ).scalars()
+    own_emails = set(own)
+    if principal.email is not None:
+        own_emails.add(principal.email)
+    if row.email in own_emails:
         raise SelfApprovalNotAllowedError()
     return row.email
 
@@ -203,7 +218,11 @@ async def approve_account_request(
     await _check_exists_and_not_self(session, request_id, principal)
     department = (
         await session.execute(
-            select(Department).where(Department.id == body.department_id)
+            # FOR SHARE: a concurrent disable needs a row write lock, so it
+            # waits for this approval instead of slipping in after the check.
+            select(Department)
+            .where(Department.id == body.department_id)
+            .with_for_update(read=True)
         )
     ).scalar_one_or_none()
     if department is None:

@@ -48,6 +48,9 @@ from central_governance_api.models import AccountMembership, AccountRequest
 
 router = APIRouter(prefix="/api/v1/account-requests", tags=["account-requests"])
 
+# Arbitrary constant keying the advisory lock that serializes submissions.
+_SUBMIT_LOCK_KEY = 0x4F485341
+
 
 def require_enabled(settings: Settings = Depends(get_settings_dependency)) -> Settings:
     if not settings.account_requests_enabled:
@@ -77,24 +80,12 @@ async def create_account_request(
     if domain not in settings.account_email_domains:
         raise EmailDomainNotAllowedError()
 
-    # An address that already has an account or an application under review
-    # gets the same reply as a fresh one and no second e-mail: the response
-    # must not reveal whether the address is known.
-    has_membership = (
-        await session.execute(
-            select(AccountMembership.id).where(AccountMembership.email == body.email)
-        )
-    ).first()
-    in_review = (
-        await session.execute(
-            select(AccountRequest.id).where(
-                AccountRequest.email == body.email,
-                AccountRequest.status == "pending_review",
-            )
-        )
-    ).first()
-    if has_membership is not None or in_review is not None:
-        return AccountRequestAccepted()
+    # One transaction-scoped lock serializes the quota check and the insert
+    # below; without it concurrent submissions for different addresses all
+    # read the same unfilled count and overshoot the global limit. Released
+    # at commit/rollback. Fine at this service's scale (a handful of
+    # applications an hour); revisit if the limit is ever raised a lot.
+    await session.execute(select(func.pg_advisory_xact_lock(_SUBMIT_LOCK_KEY)))
 
     now = now_utc()
     per_email = (
@@ -119,6 +110,38 @@ async def create_account_request(
         or overall >= settings.account_requests_global_per_hour
     ):
         raise AccountRequestRateLimitedError()
+
+    # An address that already has an account or an application under review
+    # gets the same reply as a fresh one and no e-mail. It also spends the
+    # same quota (a counted, already-expired row), so exhausting the limit
+    # cannot be used to tell known addresses from unknown ones. Residual:
+    # skipping the SMTP round trip is still a timing difference.
+    has_membership = (
+        await session.execute(
+            select(AccountMembership.id).where(AccountMembership.email == body.email)
+        )
+    ).first()
+    in_review = (
+        await session.execute(
+            select(AccountRequest.id).where(
+                AccountRequest.email == body.email,
+                AccountRequest.status == "pending_review",
+            )
+        )
+    ).first()
+    if has_membership is not None or in_review is not None:
+        session.add(
+            AccountRequest(
+                email=body.email,
+                display_name=body.display_name,
+                requested_department=body.requested_department,
+                reason="",
+                status="expired",
+                code_attempts=0,
+            )
+        )
+        await session.commit()
+        return AccountRequestAccepted()
 
     code = generate_code()
     row = AccountRequest(

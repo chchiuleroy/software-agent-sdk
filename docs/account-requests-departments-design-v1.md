@@ -53,3 +53,4 @@
 - **寄信失敗時刪除該列**並回 503，避免我們的 SMTP 故障耗掉申請人的每日額度。
 - **superadmin 的決定動作不使用 Idempotency-Key**，改靠條件式狀態轉換；重送得 409 `account_request_not_pending`。
 - **未涵蓋**：第三者可用已知 EMAIL 耗盡該 EMAIL 的每日 3 次額度（造成暫時性拒絕服務）；速率限制不含來源 IP；對 `email_verified` 的信任取決於 Keycloak realm 設定（是否允許使用者自改 EMAIL、是否要求驗證）——尚未核實。
+- **小o 審查後的修正**（4 項 confirmed，小c 逐項回原始碼核對屬實）：①全域額度檢查與插入之間加 `pg_advisory_xact_lock` 序列化（並行不同 EMAIL 原本可超額）；②速率檢查提前到「已知地址」分支之前，已有帳號／審核中的地址改為寫入一筆已過期的計數列，使額度耗盡時已知與未知地址行為一致（殘留：跳過寄信仍有時間差）；③superadmin 不得決定自己申請的規則，改為同時比對 token 的 EMAIL 與「綁定到此登入的 membership」的 EMAIL（兩者皆無的帶外建立帳號仍偵測不到）；④批准時對部門列加 `FOR SHARE`，使並行停用必須等批准提交。

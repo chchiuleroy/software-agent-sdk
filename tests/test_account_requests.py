@@ -253,7 +253,10 @@ async def test_address_already_in_review_gets_the_same_reply_and_no_mail(
     assert resp.status_code == 202
     assert resp.json() == {"status": "verification_sent"}
     assert len(mailer.sent) == sent_before
-    assert len(await _rows(db_session, "alice@corp.example")) == 1
+    # The repeat spends quota as a counted, already-expired row (see the
+    # oracle test below) but never opens a second application.
+    statuses = sorted(r.status for r in await _rows(db_session, "alice@corp.example"))
+    assert statuses == ["expired", "pending_review"]
 
 
 async def test_address_with_an_account_gets_the_same_reply_and_no_mail(
@@ -443,3 +446,76 @@ async def test_exhausted_budget_refuses_even_the_correct_code(
         json={"email": "alice@corp.example", "code": good},
     )
     assert resp.status_code == 400
+
+
+async def test_known_and_unknown_addresses_hit_the_limit_identically(
+    db_session, mailer
+):
+    # Why: if known addresses skipped the quota, exhausting it would tell an
+    # outsider which addresses already have an account or an application.
+    settings = _settings(account_requests_per_email_per_day=2)
+    known = "known@corp.example"
+    async with await _client(settings, db_session, mailer) as c:
+        await c.post("/api/v1/account-requests", json=_body(known))
+        await c.post(
+            "/api/v1/account-requests/verify",
+            json={"email": known, "code": mailer.last_code()},
+        )  # known now has an application in review
+        # The first submit already spent one slot; compare the next calls.
+        known_seq = [
+            (await c.post("/api/v1/account-requests", json=_body(known))).status_code
+            for _ in range(2)
+        ]
+        unknown = "unknown@corp.example"
+        unknown_seq = [
+            (await c.post("/api/v1/account-requests", json=_body(unknown))).status_code
+            for _ in range(3)
+        ]
+    assert known_seq == [202, 429]
+    assert unknown_seq == [202, 202, 429]
+
+
+async def test_concurrent_submissions_cannot_overshoot_the_global_limit(
+    settings_factory=None,
+):
+    # Why: count-then-insert races. The advisory lock must make N parallel
+    # submissions for different addresses stop at the limit. Needs real
+    # concurrent connections, so rows are committed and cleaned up.
+    import asyncio
+
+    from sqlalchemy import delete
+
+    from central_governance_api.db import create_engine, create_session_factory
+
+    cfg = _settings(account_requests_global_per_hour=3)
+    engine = create_engine(cfg)
+    try:
+        async with engine.connect():
+            pass
+    except Exception as exc:
+        await engine.dispose()
+        pytest.skip(f"no reachable test Postgres: {exc}")
+    factory = create_session_factory(engine)
+    fake = FakeMailer()
+    emails = [f"burst{i}@corp.example" for i in range(10)]
+    try:
+        app = create_app(cfg)
+        app.state.mailer = fake
+        app.state.db_session_factory = factory
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            responses = await asyncio.gather(
+                *[c.post("/api/v1/account-requests", json=_body(e)) for e in emails]
+            )
+        accepted = [r for r in responses if r.status_code == 202]
+        assert len(accepted) == 3
+        assert all(r.status_code in (202, 429) for r in responses)
+        assert len(fake.sent) == 3
+    finally:
+        async with factory() as s:
+            await s.execute(
+                delete(AccountRequest).where(AccountRequest.email.in_(emails))
+            )
+            await s.commit()
+        await engine.dispose()

@@ -352,3 +352,62 @@ async def test_cannot_reject_a_request_that_is_not_awaiting_review(
     await db_session.refresh(req)
     assert req.status == status
     assert req.decision_reason is None
+
+
+async def test_self_decision_is_caught_through_the_bound_membership(
+    client, db_session, signing_key
+):
+    # Why: a token with no e-mail claim must not slip past the self-decision
+    # rule; the superadmin's own bound membership still names their address.
+    from datetime import UTC, datetime
+
+    from .conftest import ISSUER
+
+    dept = await _department(db_session)
+    own = await _request(db_session, "root@corp.example", "approved")
+    db_session.add(
+        AccountMembership(
+            email="root@corp.example",
+            department_id=dept.id,
+            account_request_id=own.id,
+            bound_issuer=ISSUER,
+            bound_sub="root",
+            bound_at=datetime.now(UTC),
+        )
+    )
+    again = await _request(db_session, "root@corp.example", "pending_review")
+    await db_session.flush()
+    resp = await client.post(
+        f"/api/v1/admin/account-requests/{again.id}/reject",
+        json={"reason": "x"},
+        headers=_super(signing_key),  # no e-mail claim in this token
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error_code"] == "cannot_decide_own_request"
+
+
+async def test_approval_locks_the_department_row(client, db_session, signing_key):
+    # Why: without the row lock, a disable committed between the check and
+    # the insert still lets a member land in a disabled department. A true
+    # interleaving needs two connections; this pins the lock itself.
+    from sqlalchemy import event
+
+    dept_id = (await _department(db_session)).id
+    req_id = (await _request(db_session)).id
+    statements: list[str] = []
+    engine = db_session.bind.sync_engine  # pyright: ignore[reportAttributeAccessIssue]
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        resp = await client.post(
+            f"/api/v1/admin/account-requests/{req_id}/approve",
+            json={"department_id": str(dept_id)},
+            headers=_super(signing_key),
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+    assert resp.status_code == 200
+    assert any("FROM departments" in x and "FOR SHARE" in x for x in statements)
