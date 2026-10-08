@@ -26,10 +26,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from central_governance_api.accounts.errors import (
+    AccountRequestNotFoundError,
+    AccountRequestNotPendingError,
     AccountRequestRateLimitedError,
+    DepartmentDisabledError,
+    DepartmentExistsError,
+    DepartmentNotFoundError,
     EmailDomainNotAllowedError,
     InvalidVerificationCodeError,
     MailUnavailableError,
+    SelfApprovalNotAllowedError,
 )
 from central_governance_api.approvals.authorize import AuthorizationDeniedError
 from central_governance_api.approvals.errors import (
@@ -50,6 +56,9 @@ from central_governance_api.db import create_engine, create_session_factory
 from central_governance_api.mailer import build_mailer
 from central_governance_api.routers.account_requests import (
     router as account_requests_router,
+)
+from central_governance_api.routers.admin_accounts import (
+    router as admin_accounts_router,
 )
 from central_governance_api.routers.approvals import router as approvals_router
 from central_governance_api.routers.audit import router as audit_router
@@ -96,6 +105,12 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     AccountRequestRateLimitedError: (429, "rate_limited"),
     InvalidVerificationCodeError: (400, "invalid_code"),
     MailUnavailableError: (503, "mail_unavailable"),
+    DepartmentNotFoundError: (404, "department_not_found"),
+    DepartmentExistsError: (409, "department_exists"),
+    DepartmentDisabledError: (409, "department_disabled"),
+    AccountRequestNotFoundError: (404, "account_request_not_found"),
+    AccountRequestNotPendingError: (409, "account_request_not_pending"),
+    SelfApprovalNotAllowedError: (403, "cannot_decide_own_request"),
 }
 
 
@@ -157,6 +172,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(audit_router)
     app.include_router(inbox_router)
     app.include_router(account_requests_router)
+    app.include_router(admin_accounts_router)
     _install_exception_handlers(app)
     return app
 

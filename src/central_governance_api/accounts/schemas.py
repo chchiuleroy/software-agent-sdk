@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import uuid
+from datetime import datetime
 from typing import Annotated
 
 from pydantic import BaseModel, Field, StringConstraints, field_validator
@@ -52,3 +54,46 @@ class AccountRequestAccepted(BaseModel):
 
 class AccountRequestVerified(BaseModel):
     status: str = Field(default="pending_review")
+
+
+class CreateDepartmentRequest(RequestModel):
+    name: Annotated[
+        str, StringConstraints(min_length=1, max_length=128, strip_whitespace=True)
+    ]
+
+
+class DepartmentResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+    disabled_at: datetime | None
+
+
+class ApproveAccountRequest(RequestModel):
+    department_id: uuid.UUID
+
+
+class RejectAccountRequest(RequestModel):
+    reason: Annotated[str, StringConstraints(min_length=1, max_length=1000)]
+
+
+class AccountRequestSummary(BaseModel):
+    id: uuid.UUID
+    email: str
+    display_name: str
+    requested_department: str
+    reason: str
+    status: str
+    created_at: datetime
+    email_verified_at: datetime | None
+    decided_at: datetime | None
+    decision_reason: str | None
+    approved_department_id: uuid.UUID | None
+
+
+class MembershipSummary(BaseModel):
+    id: uuid.UUID
+    email: str
+    department_id: uuid.UUID
+    created_at: datetime
+    bound_at: datetime | None
