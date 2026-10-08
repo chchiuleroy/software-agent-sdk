@@ -15,6 +15,7 @@ from weakref import WeakValueDictionary
 import httpx
 from pydantic import BaseModel
 
+from openhands.agent_server import governance_tool_permissions
 from openhands.agent_server.config import ACPSkillSourcing, Config, WebhookSpec
 from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -727,6 +728,8 @@ class ConversationService:
     governance_origin_device_id: str = "unset-device-id"
     governance_refuse_truncated_actions: bool = True
     governance_refuse_unprojected_actions: bool = True
+    governance_enforce_tool_permissions: bool = False
+    _tool_permissions_started: bool = field(default=False, init=False)
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
     _conversation_records: dict[UUID, _ConversationRecord] = field(
         default_factory=dict, init=False
@@ -2105,6 +2108,13 @@ class ConversationService:
 
     async def __aenter__(self):
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
+        if (
+            self.governance_deployment_mode == "team"
+            and self.governance_enforce_tool_permissions
+            and self.governance_client is not None
+        ):
+            governance_tool_permissions.start(self.governance_client)
+            self._tool_permissions_started = True
         self._run_executor = ThreadPoolExecutor(
             max_workers=self.max_concurrent_runs,
             thread_name_prefix="conversation-run",
@@ -2236,6 +2246,10 @@ class ConversationService:
                         pending.setdefault(secret_name, binding)
 
     async def __aexit__(self, exc_type, exc_value, traceback):
+        if self._tool_permissions_started:
+            self._tool_permissions_started = False
+            await governance_tool_permissions.stop()
+
         if self._eviction_task is not None:
             self._eviction_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -2353,6 +2367,9 @@ class ConversationService:
             ),
             governance_refuse_unprojected_actions=(
                 config.governance_refuse_unprojected_actions
+            ),
+            governance_enforce_tool_permissions=(
+                config.governance_enforce_tool_permissions
             ),
         )
 

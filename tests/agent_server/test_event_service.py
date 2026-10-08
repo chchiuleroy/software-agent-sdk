@@ -6522,6 +6522,93 @@ class TestEventServiceGovernanceOrchestration:
         conversation.reject_pending_actions.assert_not_called()
         await self._drain_wait_for_decision_task(governed_service)
 
+    # ---------------- department tool permissions ----------------
+
+    @pytest.fixture
+    def tool_permissions(self):
+        """Process-wide state: reset around every test that uses it."""
+        from openhands.sdk.security import roy_tool_permissions as permissions
+
+        permissions.reset()
+        yield permissions
+        permissions.reset()
+
+    @staticmethod
+    def _allow_only(permissions, *tools):
+        import time
+
+        from openhands.sdk.security.roy_tool_permissions import ToolPermissionSnapshot
+
+        permissions.set_enforcing(True)
+        permissions.set_snapshot(
+            ToolPermissionSnapshot(
+                tools=frozenset(tools),
+                revision="r1",
+                department_name="Finance",
+                max_age_seconds=600.0,
+                fetched_at=time.monotonic(),
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_outside_the_department_is_refused_before_anything_is_sent(
+        self, governed_service, tool_permissions
+    ):
+        """The tool has a perfectly good preview, so only the permission list can
+        stop it. Nothing may reach central and no outbox record may exist, and
+        the reason the agent sees must name neither the tool nor the department."""
+        self._allow_only(tool_permissions, "file_editor")
+        action = _governance_pending_action(command="ls")
+
+        client, conversation = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_not_awaited()
+        assert governed_service.governance_outbox.load() is None
+        conversation.reject_pending_actions.assert_called_once()
+        (reason,) = conversation.reject_pending_actions.call_args.args
+        assert "not permitted" in reason
+        assert "Finance" not in reason
+        assert action.tool_name not in reason
+
+    @pytest.mark.asyncio
+    async def test_tool_inside_the_department_still_goes_to_central(
+        self, governed_service, tool_permissions
+    ):
+        action = _governance_pending_action(command="ls")
+        self._allow_only(tool_permissions, action.tool_name)
+
+        client, conversation = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_awaited_once()
+        conversation.reject_pending_actions.assert_not_called()
+        await self._drain_wait_for_decision_task(governed_service)
+
+    @pytest.mark.asyncio
+    async def test_without_a_fetched_list_enforcement_refuses_instead_of_guessing(
+        self, governed_service, tool_permissions
+    ):
+        tool_permissions.set_enforcing(True)  # on, but nothing fetched yet
+        action = _governance_pending_action(command="ls")
+
+        client, conversation = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_not_awaited()
+        (reason,) = conversation.reject_pending_actions.call_args.args
+        assert "no current list" in reason
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_refused_for_permissions_while_enforcement_is_off(
+        self, governed_service, tool_permissions
+    ):
+        # Why: team mode without the opt-in must behave exactly as before.
+        action = _governance_pending_action(command="ls")
+
+        client, conversation = await self._register_pending(governed_service, action)
+
+        client.create_approval.assert_awaited_once()
+        conversation.reject_pending_actions.assert_not_called()
+        await self._drain_wait_for_decision_task(governed_service)
+
     @pytest.mark.asyncio
     async def test_refusal_does_not_reject_when_the_pending_action_has_changed(
         self, governed_service

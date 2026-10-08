@@ -481,6 +481,20 @@ class Config(BaseModel):
         ),
     )
 
+    governance_enforce_tool_permissions: bool = Field(
+        default=False,
+        description=(
+            "Only used when governance_deployment_mode is 'team'. When true, "
+            "this agent-server fetches its department's tool allow-list from "
+            "central-governance-api (GET /api/v1/me/tool-permissions) and "
+            "refuses any tool not on it; if it cannot keep the list fresh, "
+            "every tool except the side-effect-free built-ins (finish, think) "
+            "is refused. Default false so a server whose service account has "
+            "no department yet is not locked out; turn it on after central "
+            "has assigned this server's account to a department."
+        ),
+    )
+
     @field_validator("governance_client_secret")
     @classmethod
     def _reject_blank_governance_client_secret(

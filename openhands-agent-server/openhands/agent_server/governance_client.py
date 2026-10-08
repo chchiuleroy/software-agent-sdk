@@ -438,6 +438,13 @@ class GovernanceClient:
         )
         return response.json()
 
+    async def tool_permissions(self) -> dict[str, Any]:
+        """This agent-server's department tool permissions
+        (``GET /api/v1/me/tool-permissions``): the tools its department may
+        use, a revision, and how long the answer may be relied on."""
+        response = await self._request("GET", "/api/v1/me/tool-permissions")
+        return response.json()
+
     async def reconciliation_finding(
         self,
         approval_id: str,
