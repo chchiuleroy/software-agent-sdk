@@ -1,6 +1,6 @@
 """Tests for the SecurityAnalyzer class."""
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from openhands.sdk.event import ActionEvent, PauseEvent
 from openhands.sdk.llm import MessageToolCall, TextContent
@@ -21,9 +21,23 @@ class SecurityAnalyzer(SecurityAnalyzerBase):
     """
 
     risk_return_value: SecurityRisk = SecurityRisk.LOW
-    security_risk_calls: list[ActionEvent] = Field(default_factory=list)
     handle_api_request_calls: list[dict] = Field(default_factory=list)
     close_calls: list[bool] = Field(default_factory=list)
+
+    # Deliberately NOT a pydantic field. This class is a module-level subclass of
+    # SecurityAnalyzerBase, so it exists in every process that merely imports this
+    # test module. Measured: declared as a public ``list[ActionEvent]`` field
+    # (``Field(default_factory=list)``), it makes the agent-server OpenAPI schema
+    # contain "Action-Input" / "Action-Output" instead of "Action", so
+    # tests/agent_server/test_openapi_discriminator.py fails in the same process
+    # without any test from this file having to run. ``list[dict]`` and
+    # ``list[bool]`` fields do not do this, and a private attribute (not part of the
+    # schema) does not either. The reason is not established here.
+    _security_risk_calls: list[ActionEvent] = PrivateAttr(default_factory=list)
+
+    @property
+    def security_risk_calls(self) -> list[ActionEvent]:
+        return self._security_risk_calls
 
     def security_risk(self, action: ActionEvent) -> SecurityRisk:
         """Return configurable risk level for testing."""
