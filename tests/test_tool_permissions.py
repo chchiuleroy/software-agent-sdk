@@ -394,3 +394,149 @@ async def test_claim_is_refused_after_the_permission_is_revoked(
     )
     assert claim.status_code == 403
     assert claim.json()["error_code"] == "tool_not_permitted"
+
+
+async def _accepted_approval(enforcing_client, db_session, signing_key, body):
+    token = _sign(signing_key, sub="svc", roles=["agent.operator"])
+    created = await enforcing_client.post(
+        "/api/v1/approvals", json=body, headers=_auth(token, "create-fixed-key")
+    )
+    assert created.status_code == 201, created.text
+    approver = _sign(signing_key, sub="carol", roles=["agent.approver"])
+    decided = await enforcing_client.post(
+        f"/api/v1/approvals/{created.json()['id']}/decide",
+        json={"decision": "accept"},
+        headers=_auth(approver, f"decide-{uuid.uuid4()}"),
+    )
+    assert decided.status_code == 200, decided.text
+    return created.json()["id"], token
+
+
+async def test_a_replayed_create_is_refused_after_revocation(
+    enforcing_client, db_session, signing_key
+):
+    # Why: the stored answer to a replay is what a device acts on; it must not
+    # outlive the permission it was given under.
+    dept = await _department(db_session)
+    await _grant(db_session, dept, "bash")
+    await _assign(db_session, dept, "svc")
+    body = _create_body(tool_name="bash")
+    token = _sign(signing_key, sub="svc", roles=["agent.operator"])
+    headers = _auth(token, "create-fixed-key")
+    assert (
+        await enforcing_client.post("/api/v1/approvals", json=body, headers=headers)
+    ).status_code == 201
+    await db_session.execute(delete(DepartmentToolPermission))
+    again = await enforcing_client.post("/api/v1/approvals", json=body, headers=headers)
+    assert again.status_code == 403
+    assert again.json()["error_code"] == "tool_not_permitted"
+
+
+async def test_a_lost_claim_response_cannot_be_replayed_after_revocation(
+    enforcing_client, db_session, signing_key
+):
+    # Why: the stored claim response IS the execution lease. If the first
+    # response was lost and the permission revoked since, the retry must not
+    # hand the lease back.
+    dept = await _department(db_session)
+    await _grant(db_session, dept, "bash")
+    await _assign(db_session, dept, "svc")
+    approval_id, token = await _accepted_approval(
+        enforcing_client, db_session, signing_key, _create_body(tool_name="bash")
+    )
+    headers = _auth(token, "claim-fixed-key")
+    first = await enforcing_client.post(
+        f"/api/v1/approvals/{approval_id}/claim", headers=headers
+    )
+    assert first.status_code == 200, first.text
+    await db_session.execute(delete(DepartmentToolPermission))
+    replay = await enforcing_client.post(
+        f"/api/v1/approvals/{approval_id}/claim", headers=headers
+    )
+    assert replay.status_code == 403
+    assert replay.json()["error_code"] == "tool_not_permitted"
+
+
+async def test_concurrent_replaces_of_one_department_never_merge(
+    public_jwks, signing_key
+):
+    # Why: replace is read-before, write-diff. Without the row lock two
+    # concurrent replaces both read the same "before" and the department ends
+    # up with the union of two lists nobody asked for. Needs real concurrent
+    # connections, so rows are committed and cleaned up.
+    import asyncio
+
+    from sqlalchemy import delete as sa_delete
+
+    from central_governance_api.db import create_engine, create_session_factory
+
+    settings = _settings()
+    engine = create_engine(settings)
+    try:
+        async with engine.connect():
+            pass
+    except Exception as exc:
+        await engine.dispose()
+        pytest.skip(f"no reachable test Postgres: {exc}")
+    factory = create_session_factory(engine)
+    names = [f"RaceDept{i}" for i in range(8)]
+    ids: list[uuid.UUID] = []
+    try:
+        async with factory() as s:
+            for n in names:
+                d = Department(name=n)
+                s.add(d)
+                await s.flush()
+                ids.append(d.id)
+            await s.commit()
+        app = create_app(settings)
+        app.state.db_session_factory = factory
+        resolver = OIDCPrincipalResolver(
+            settings, preloaded_keys=public_jwks, never_refresh_keys=True
+        )
+        app.dependency_overrides[get_oidc_resolver] = lambda: resolver
+        headers = _super(signing_key)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            calls = []
+            for dept in ids:
+                for tool in ("tool_a", "tool_b"):
+                    calls.append(
+                        c.put(
+                            f"/api/v1/admin/departments/{dept}/tools",
+                            json={"tools": [tool]},
+                            headers=headers,
+                        )
+                    )
+            responses = await asyncio.gather(*calls)
+        assert all(r.status_code == 200 for r in responses)
+        async with factory() as s:
+            for dept in ids:
+                got = set(
+                    (
+                        await s.execute(
+                            select(DepartmentToolPermission.tool_name).where(
+                                DepartmentToolPermission.department_id == dept
+                            )
+                        )
+                    ).scalars()
+                )
+                assert got in ({"tool_a"}, {"tool_b"}), got
+    finally:
+        async with factory() as s:
+            await s.execute(
+                sa_delete(AdminAuditEvent).where(
+                    AdminAuditEvent.payload["department_id"].astext.in_(
+                        [str(i) for i in ids]
+                    )
+                )
+            )
+            await s.execute(
+                sa_delete(DepartmentToolPermission).where(
+                    DepartmentToolPermission.department_id.in_(ids)
+                )
+            )
+            await s.execute(sa_delete(Department).where(Department.id.in_(ids)))
+            await s.commit()
+        await engine.dispose()

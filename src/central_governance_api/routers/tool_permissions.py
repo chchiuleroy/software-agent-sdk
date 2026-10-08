@@ -108,6 +108,21 @@ async def _require_department(session: AsyncSession, department_id: uuid.UUID) -
         raise DepartmentNotFoundError()
 
 
+async def _lock_department(session: AsyncSession, department_id: uuid.UUID) -> None:
+    """Like :func:`_require_department`, but takes the row lock, so two
+    concurrent replaces of one department run one after the other instead of
+    both reading the same "before" set and merging into a set nobody asked for."""
+    found = (
+        await session.execute(
+            select(Department.id)
+            .where(Department.id == department_id)
+            .with_for_update()
+        )
+    ).first()
+    if found is None:
+        raise DepartmentNotFoundError()
+
+
 async def _current_tools(session: AsyncSession, department_id: uuid.UUID) -> list[str]:
     rows = await session.execute(
         select(DepartmentToolPermission.tool_name)
@@ -138,7 +153,7 @@ async def set_department_tools(
 ) -> ToolsResponse:
     """Replace the whole set. A no-op (nothing added or removed) writes no
     audit event."""
-    await _require_department(session, department_id)
+    await _lock_department(session, department_id)
     before = set(await _current_tools(session, department_id))
     after = set(body.tools)
     added, removed = sorted(after - before), sorted(before - after)

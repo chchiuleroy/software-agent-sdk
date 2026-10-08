@@ -194,6 +194,14 @@ async def create_approval(
         request_fingerprint=fingerprint,
     )
     if replayed is not None:
+        # A replay must not outlive a revocation: the stored answer is what a
+        # device would act on.
+        await ensure_tool_permitted(
+            session,
+            principal,
+            body.tool_name,
+            enforced=settings.enforce_tool_permissions,
+        )
         return ApprovalSummary.model_validate(replayed)
 
     authorize_create(principal)
@@ -469,6 +477,17 @@ async def claim_approval(
         request_fingerprint=fingerprint,
     )
     if replayed is not None:
+        # Same reason as at create, and more so: the stored ClaimResponse is
+        # the execution lease. If the response to the first claim was lost
+        # and the permission has been revoked since, the retry must not hand
+        # the lease back.
+        replayed_record = await _load_record(session, approval_id)
+        await ensure_tool_permitted(
+            session,
+            principal,
+            replayed_record.tool_name,
+            enforced=settings.enforce_tool_permissions,
+        )
         return ClaimResponse.model_validate(replayed)
 
     record = await _load_record(session, approval_id)
