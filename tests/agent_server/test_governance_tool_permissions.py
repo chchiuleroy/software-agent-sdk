@@ -222,3 +222,26 @@ def test_central_refusing_a_tool_is_a_permanent_error_not_a_retry():
     with pytest.raises(GovernancePermanentError) as info:
         _classify_response(response)
     assert info.value.error_code == "tool_not_permitted"
+
+
+async def test_a_failed_startup_does_not_leave_a_hold_behind(tmp_path, monkeypatch):
+    # Why: __aexit__ does not run for an __aenter__ that raised, so a hold
+    # taken before the failing step would never be given back and would keep
+    # enforcement (and a refresher bound to a dead service) alive.
+    started: list = []
+    monkeypatch.setattr(refresher, "start", lambda client: started.append(client))
+    service = ConversationService(
+        conversations_dir=tmp_path,
+        governance_deployment_mode="team",
+        governance_client=MagicMock(aclose=AsyncMock()),
+        governance_enforce_tool_permissions=True,
+    )
+
+    def _boom():
+        raise RuntimeError("startup failed")
+
+    monkeypatch.setattr(service, "_renew_all_leases_loop", _boom)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        await service.__aenter__()
+    assert started == []
+    assert permissions.is_enforcing() is False

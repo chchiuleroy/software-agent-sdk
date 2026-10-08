@@ -2108,13 +2108,6 @@ class ConversationService:
 
     async def __aenter__(self):
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
-        if (
-            self.governance_deployment_mode == "team"
-            and self.governance_enforce_tool_permissions
-            and self.governance_client is not None
-        ):
-            governance_tool_permissions.start(self.governance_client)
-            self._tool_permissions_started = True
         self._run_executor = ThreadPoolExecutor(
             max_workers=self.max_concurrent_runs,
             thread_name_prefix="conversation-run",
@@ -2158,6 +2151,15 @@ class ConversationService:
                 self._evict_idle_conversations_loop()
             )
 
+        # Last on purpose: a hold taken earlier would leak if any step above
+        # raised, because __aexit__ does not run for an __aenter__ that failed.
+        if (
+            self.governance_deployment_mode == "team"
+            and self.governance_enforce_tool_permissions
+            and self.governance_client is not None
+        ):
+            governance_tool_permissions.start(self.governance_client)
+            self._tool_permissions_started = True
         return self
 
     async def _renew_all_leases_loop(self) -> None:
