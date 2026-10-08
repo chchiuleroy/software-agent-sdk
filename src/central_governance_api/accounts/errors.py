@@ -83,3 +83,26 @@ class SelfApprovalNotAllowedError(Exception):
 
     def __init__(self) -> None:
         super().__init__("cannot decide an account request for your own e-mail")
+
+
+class PrincipalAlreadyAssignedError(Exception):
+    """This service-account identity already belongs to a department. Maps
+    to 409."""
+
+    def __init__(self) -> None:
+        super().__init__("principal is already assigned to a department")
+
+
+class PrincipalAssignmentNotFoundError(Exception):
+    """No such department assignment. Maps to 404."""
+
+    def __init__(self) -> None:
+        super().__init__("no such department assignment")
+
+
+class ToolNotPermittedError(Exception):
+    """The caller's department is not permitted to use this tool. Maps to
+    403. The message names no tool and no department."""
+
+    def __init__(self) -> None:
+        super().__init__("this tool is not permitted for the caller's department")

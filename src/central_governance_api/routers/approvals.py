@@ -65,6 +65,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from central_governance_api.accounts.tool_permissions import ensure_tool_permitted
 from central_governance_api.approvals.authorize import (
     ApprovalAction,
     ApprovalOwnership,
@@ -201,6 +202,9 @@ async def create_approval(
         principal,
         body.origin_device_id,
         enforced=settings.device_binding_enforced,
+    )
+    await ensure_tool_permitted(
+        session, principal, body.tool_name, enforced=settings.enforce_tool_permissions
     )
 
     if settings.require_execution_commitment and body.execution_commitment is None:
@@ -477,6 +481,11 @@ async def claim_approval(
         principal,
         record.origin_device_id,
         enforced=settings.device_binding_enforced,
+    )
+    # Also at claim: a permission revoked while the request waited for a
+    # decision must stop the action from executing.
+    await ensure_tool_permitted(
+        session, principal, record.tool_name, enforced=settings.enforce_tool_permissions
     )
 
     current = ApprovalStatus(record.status)
