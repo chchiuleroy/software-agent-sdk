@@ -10,8 +10,10 @@ RFC 9068 ``at+jwt`` profile this module deliberately does not assume).
 
 from __future__ import annotations
 
+from typing import Self
+
 from fastapi import Request
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -199,6 +201,59 @@ class Settings(BaseSettings):
         "narrative; a reasoned default balancing DB load against how "
         "promptly a `/wait` caller learns a record expired.",
     )
+
+    # --- Account requests (docs/account-requests-departments-design-v1.md) ---
+    # The numeric limits below are reasoned defaults (judgement values), not
+    # measured ones.
+    account_requests_enabled: bool = Field(
+        default=False,
+        description="When False every /account-requests route answers 404. "
+        "The submit/verify routes are unauthenticated by design (the "
+        "applicant has no account yet), so exposing them is a deployment "
+        "decision, not a default.",
+    )
+    account_email_domains: tuple[str, ...] = Field(
+        default=(),
+        description="Lower-case company e-mail domains an applicant may "
+        "use. Empty = every application is refused (fail closed).",
+    )
+    account_request_hmac_key: SecretStr | None = Field(
+        default=None,
+        description="Server secret keying the HMAC of the emailed "
+        "verification code. Required (at least 32 characters) when "
+        "account_requests_enabled is True.",
+    )
+    account_requests_per_email_per_day: int = Field(default=3, gt=0)
+    account_requests_global_per_hour: int = Field(default=50, gt=0)
+    account_code_ttl_seconds: int = Field(default=900, gt=0)
+    account_code_max_attempts: int = Field(default=5, gt=0)
+    smtp_host: str | None = Field(
+        default=None,
+        description="SMTP relay for the verification e-mail. Unset = the "
+        "submit route answers 503 rather than accept a request it cannot "
+        "verify.",
+    )
+    smtp_port: int = Field(default=587, gt=0)
+    smtp_username: str | None = Field(default=None)
+    smtp_password: SecretStr | None = Field(default=None)
+    smtp_from: str | None = Field(default=None)
+    smtp_starttls: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def _check_account_requests(self) -> Self:
+        if self.account_requests_enabled:
+            key = self.account_request_hmac_key
+            if key is None or len(key.get_secret_value()) < 32:
+                raise ValueError(
+                    "account_requests_enabled requires account_request_hmac_key "
+                    "of at least 32 characters"
+                )
+        if any(d != d.strip().lower() or "@" in d for d in self.account_email_domains):
+            raise ValueError(
+                "account_email_domains must be bare lower-case domains "
+                "(e.g. 'corp.example'), no '@'"
+            )
+        return self
 
     @field_validator("oidc_issuer", "oidc_jwks_url")
     @classmethod

@@ -37,6 +37,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -458,6 +459,16 @@ class AccountRequest(Base):
             "status IN ('pending_verification','pending_review','approved',"
             "'rejected','expired')",
             name="ck_account_request_status",
+        ),
+        # At most one open application per e-mail: makes "supersede the old
+        # one, then insert" race-safe instead of relying on a prior SELECT.
+        Index(
+            "uq_account_request_open_email",
+            "email",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending_verification','pending_review')"
+            ),
         ),
     )
 

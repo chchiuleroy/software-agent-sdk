@@ -25,6 +25,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from central_governance_api.accounts.errors import (
+    AccountRequestRateLimitedError,
+    EmailDomainNotAllowedError,
+    InvalidVerificationCodeError,
+    MailUnavailableError,
+)
 from central_governance_api.approvals.authorize import AuthorizationDeniedError
 from central_governance_api.approvals.errors import (
     ConcurrentModificationError,
@@ -41,6 +47,10 @@ from central_governance_api.approvals.sweep import run_expiry_sweep_forever
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.config import Settings, get_settings
 from central_governance_api.db import create_engine, create_session_factory
+from central_governance_api.mailer import build_mailer
+from central_governance_api.routers.account_requests import (
+    router as account_requests_router,
+)
 from central_governance_api.routers.approvals import router as approvals_router
 from central_governance_api.routers.audit import router as audit_router
 from central_governance_api.routers.devices import (
@@ -82,6 +92,10 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     DeviceRevokedError: (409, "device_revoked"),
     DeviceQuotaExceededError: (429, "device_quota_exceeded"),
     DeviceAlreadyRevokedError: (409, "device_already_revoked"),
+    EmailDomainNotAllowedError: (422, "email_domain_not_allowed"),
+    AccountRequestRateLimitedError: (429, "rate_limited"),
+    InvalidVerificationCodeError: (400, "invalid_code"),
+    MailUnavailableError: (503, "mail_unavailable"),
 }
 
 
@@ -107,6 +121,7 @@ def _install_exception_handlers(app: FastAPI) -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings: Settings = app.state.settings
     app.state.oidc_resolver = OIDCPrincipalResolver(settings)
+    app.state.mailer = build_mailer(settings)
 
     engine = create_engine(settings)
     app.state.db_engine = engine
@@ -141,6 +156,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(devices_router)
     app.include_router(audit_router)
     app.include_router(inbox_router)
+    app.include_router(account_requests_router)
     _install_exception_handlers(app)
     return app
 

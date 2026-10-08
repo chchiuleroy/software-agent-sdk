@@ -75,6 +75,13 @@ def upgrade() -> None:
     op.create_index(
         "ix_account_requests_created_at", "account_requests", ["created_at"]
     )
+    op.create_index(
+        "uq_account_request_open_email",
+        "account_requests",
+        ["email"],
+        unique=True,
+        postgresql_where=sa.text("status IN ('pending_verification','pending_review')"),
+    )
     op.create_table(
         "account_memberships",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -114,6 +121,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("account_memberships")
+    op.drop_index("uq_account_request_open_email", table_name="account_requests")
     op.drop_index("ix_account_requests_created_at", table_name="account_requests")
     op.drop_index("ix_account_requests_status", table_name="account_requests")
     op.drop_index("ix_account_requests_email", table_name="account_requests")
