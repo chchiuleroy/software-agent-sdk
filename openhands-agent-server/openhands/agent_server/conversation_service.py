@@ -1874,6 +1874,7 @@ class ConversationService:
                     f"Failed to close event service for conversation "
                     f"{conversation_id}: {e}"
                 )
+            await event_service.cancel_unclaimed_governance_approval()
             event_services.pop(conversation_id, None)
             # Children are orphaned, not cascaded: parent_conversation_id is
             # left dangling, like forked_from_conversation_id on source delete.
