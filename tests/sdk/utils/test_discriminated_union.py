@@ -1,3 +1,4 @@
+import gc
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
@@ -11,6 +12,7 @@ from pydantic import (
     model_validator,
 )
 
+import openhands.sdk.utils.models as models_module
 from openhands.sdk.utils.models import (
     DiscriminatedUnionMixin,
     OpenHandsModel,
@@ -266,7 +268,35 @@ def test_enhanced_error_message_with_validation():
     assert expected in error_message
 
 
-def test_dynamic_field_error():
+@pytest.fixture
+def drop_local_subclasses():
+    """Make sure a test's function-local subclasses do not outlive it.
+
+    ``test_dynamic_field_error`` defines ``Tiger(Cat)`` inside the test on purpose:
+    it asserts the "Local classes not supported" error. But subclasses are tracked
+    through ``__subclasses__()`` and the two subclass caches in ``models_module``
+    keep a strong reference to them, so ``Tiger`` stayed in ``Animal``'s subclasses
+    after the test. Every later test in the same process that uses ``Animal``
+    (``tests/agent_server/test_env_parser.py`` imports it from this module) then
+    failed with the same "Local classes not supported" error.
+    """
+    yield
+    models_module._concrete_cache.clear()
+    models_module._checked_cache.clear()
+    gc.collect()
+
+    def all_subclasses(cls):
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from all_subclasses(sub)
+
+    leaked = [
+        c.__qualname__ for c in all_subclasses(Animal) if "<locals>" in c.__qualname__
+    ]
+    assert leaked == []
+
+
+def test_dynamic_field_error(drop_local_subclasses):
     class Tiger(Cat):
         pass
 
