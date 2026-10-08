@@ -35,7 +35,10 @@ from central_governance_api.accounts.errors import (
     EmailDomainNotAllowedError,
     InvalidVerificationCodeError,
     MailUnavailableError,
+    PrincipalAlreadyAssignedError,
+    PrincipalAssignmentNotFoundError,
     SelfApprovalNotAllowedError,
+    ToolNotPermittedError,
 )
 from central_governance_api.approvals.authorize import AuthorizationDeniedError
 from central_governance_api.approvals.errors import (
@@ -74,6 +77,12 @@ from central_governance_api.routers.devices import router as devices_router
 from central_governance_api.routers.health import router as health_router
 from central_governance_api.routers.inbox import router as inbox_router
 from central_governance_api.routers.me import router as me_router
+from central_governance_api.routers.tool_permissions import (
+    admin_router as tool_permissions_admin_router,
+)
+from central_governance_api.routers.tool_permissions import (
+    me_router as tool_permissions_me_router,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -112,6 +121,9 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     AccountRequestNotFoundError: (404, "account_request_not_found"),
     AccountRequestNotPendingError: (409, "account_request_not_pending"),
     SelfApprovalNotAllowedError: (403, "cannot_decide_own_request"),
+    PrincipalAlreadyAssignedError: (409, "principal_already_assigned"),
+    PrincipalAssignmentNotFoundError: (404, "department_assignment_not_found"),
+    ToolNotPermittedError: (403, "tool_not_permitted"),
 }
 
 
@@ -175,6 +187,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(account_requests_router)
     app.include_router(admin_accounts_router)
     app.include_router(me_router)
+    app.include_router(tool_permissions_admin_router)
+    app.include_router(tool_permissions_me_router)
     _install_exception_handlers(app)
     return app
 

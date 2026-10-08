@@ -65,6 +65,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from central_governance_api.accounts.tool_permissions import ensure_tool_permitted
 from central_governance_api.approvals.authorize import (
     ApprovalAction,
     ApprovalOwnership,
@@ -193,6 +194,14 @@ async def create_approval(
         request_fingerprint=fingerprint,
     )
     if replayed is not None:
+        # A replay must not outlive a revocation: the stored answer is what a
+        # device would act on.
+        await ensure_tool_permitted(
+            session,
+            principal,
+            body.tool_name,
+            enforced=settings.enforce_tool_permissions,
+        )
         return ApprovalSummary.model_validate(replayed)
 
     authorize_create(principal)
@@ -201,6 +210,9 @@ async def create_approval(
         principal,
         body.origin_device_id,
         enforced=settings.device_binding_enforced,
+    )
+    await ensure_tool_permitted(
+        session, principal, body.tool_name, enforced=settings.enforce_tool_permissions
     )
 
     if settings.require_execution_commitment and body.execution_commitment is None:
@@ -465,6 +477,17 @@ async def claim_approval(
         request_fingerprint=fingerprint,
     )
     if replayed is not None:
+        # Same reason as at create, and more so: the stored ClaimResponse is
+        # the execution lease. If the response to the first claim was lost
+        # and the permission has been revoked since, the retry must not hand
+        # the lease back.
+        replayed_record = await _load_record(session, approval_id)
+        await ensure_tool_permitted(
+            session,
+            principal,
+            replayed_record.tool_name,
+            enforced=settings.enforce_tool_permissions,
+        )
         return ClaimResponse.model_validate(replayed)
 
     record = await _load_record(session, approval_id)
@@ -477,6 +500,11 @@ async def claim_approval(
         principal,
         record.origin_device_id,
         enforced=settings.device_binding_enforced,
+    )
+    # Also at claim: a permission revoked while the request waited for a
+    # decision must stop the action from executing.
+    await ensure_tool_permitted(
+        session, principal, record.tool_name, enforced=settings.enforce_tool_permissions
     )
 
     current = ApprovalStatus(record.status)

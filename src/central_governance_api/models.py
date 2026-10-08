@@ -509,3 +509,48 @@ class AccountMembership(Base):
             "bound_issuer", "bound_sub", name="uq_membership_bound_identity"
         ),
     )
+
+
+# --- Department tool permissions (docs/department-tool-permissions-design-v1.md) ---
+
+
+class DepartmentToolPermission(Base):
+    """One tool a department may use. Absence of a row means "not permitted":
+    the set is an allow-list, so a tool nobody listed is refused."""
+
+    __tablename__ = "department_tool_permissions"
+
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id"), primary_key=True
+    )
+    tool_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    granted_by_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    granted_by_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class DepartmentPrincipal(Base):
+    """Assigns a service-account identity (an agent-server's own client) to
+    one department. central sees the agent-server's token, not the human's,
+    so this is how a tool permission is looked up for a device. A principal
+    belongs to exactly one department."""
+
+    __tablename__ = "department_principals"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id"), index=True
+    )
+    issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    sub: Mapped[str] = mapped_column(String(_SUB_LEN))
+    assigned_by_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    assigned_by_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("issuer", "sub", name="uq_department_principal_identity"),
+    )

@@ -239,6 +239,26 @@ class Settings(BaseSettings):
     smtp_from: str | None = Field(default=None)
     smtp_starttls: bool = Field(default=True)
 
+    # --- Department tool permissions (see docs/department-tool-permissions-*) ---
+    enforce_tool_permissions: bool = Field(
+        default=False,
+        description="When True, CREATE and CLAIM on an approval require the "
+        "caller's department to be permitted to use the approval's tool_name "
+        "(403 tool_not_permitted otherwise). A caller with no department has "
+        "no permitted tools. Default False so a freshly deployed central keeps "
+        "accepting agent-servers whose service accounts have not been assigned "
+        "a department yet.",
+    )
+    tool_permission_max_age_seconds: int = Field(
+        default=600,
+        gt=0,
+        description="How long an agent-server may rely on a fetched tool "
+        "permission list before it must treat every tool as not permitted. "
+        "Returned by GET /api/v1/me/tool-permissions. A judgement value, not "
+        "a measured one: it bounds how late a revocation can take effect on a "
+        "device that cannot reach central.",
+    )
+
     @model_validator(mode="after")
     def _check_account_requests(self) -> Self:
         if self.account_requests_enabled:
