@@ -45,3 +45,11 @@
 ## 5. 實作順序
 
 1. Principal／KNOWN_ROLES　2. models＋migration　3. config＋mailer　4. 公開端點　5. superadmin 端點　6. `/me` 首次綁定　7. 端到端（真 Keycloak 的 role／mapper 須 Roy 以管理員建立）　8. 小o 審查、ruff、pyright、draft PR。
+
+## 6. 實作時偏離設計之處（Deviations）
+
+- **驗證端點改為 `POST /account-requests/verify`，body 為 `{email, code}`**，不再用路徑上的 request id。原因：不必向未登入者回傳 id；有 id 的話，知道某個 EMAIL 的第三者可以替它耗盡 5 次嘗試。
+- **每次送出都新建一筆申請**，同 EMAIL 較舊的未驗證申請改為 `expired`；以 partial unique index（同一 EMAIL 最多一筆 `pending_verification` 或 `pending_review`）保證併發安全。因此「每 EMAIL 每日上限」直接數資料列。
+- **寄信失敗時刪除該列**並回 503，避免我們的 SMTP 故障耗掉申請人的每日額度。
+- **superadmin 的決定動作不使用 Idempotency-Key**，改靠條件式狀態轉換；重送得 409 `account_request_not_pending`。
+- **未涵蓋**：第三者可用已知 EMAIL 耗盡該 EMAIL 的每日 3 次額度（造成暫時性拒絕服務）；速率限制不含來源 IP；對 `email_verified` 的信任取決於 Keycloak realm 設定（是否允許使用者自改 EMAIL、是否要求驗證）——尚未核實。
