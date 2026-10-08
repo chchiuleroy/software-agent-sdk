@@ -126,6 +126,7 @@ _PERMANENT_ERROR_CODES = frozenset(
         "device_revoked",
         "device_quota_exceeded",
         "device_already_revoked",
+        "tool_not_permitted",
     }
 )
 

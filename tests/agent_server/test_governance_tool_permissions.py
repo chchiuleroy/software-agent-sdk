@@ -207,3 +207,18 @@ async def test_the_service_starts_the_refresher_only_in_team_mode_with_the_flag(
     async with service:
         assert bool(started) is expected_started
     assert bool(stopped) is expected_started
+
+
+def test_central_refusing_a_tool_is_a_permanent_error_not_a_retry():
+    # Why: a tool the department may not use will not become permitted by
+    # asking again; it must land in needs_attention, not a retry loop.
+    import httpx
+
+    from openhands.agent_server.governance_client import _classify_response
+
+    response = httpx.Response(
+        403, json={"error_code": "tool_not_permitted", "detail": "no"}
+    )
+    with pytest.raises(GovernancePermanentError) as info:
+        _classify_response(response)
+    assert info.value.error_code == "tool_not_permitted"
