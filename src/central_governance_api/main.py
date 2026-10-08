@@ -25,6 +25,18 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from central_governance_api.accounts.errors import (
+    AccountRequestNotFoundError,
+    AccountRequestNotPendingError,
+    AccountRequestRateLimitedError,
+    DepartmentDisabledError,
+    DepartmentExistsError,
+    DepartmentNotFoundError,
+    EmailDomainNotAllowedError,
+    InvalidVerificationCodeError,
+    MailUnavailableError,
+    SelfApprovalNotAllowedError,
+)
 from central_governance_api.approvals.authorize import AuthorizationDeniedError
 from central_governance_api.approvals.errors import (
     ConcurrentModificationError,
@@ -41,6 +53,13 @@ from central_governance_api.approvals.sweep import run_expiry_sweep_forever
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.config import Settings, get_settings
 from central_governance_api.db import create_engine, create_session_factory
+from central_governance_api.mailer import build_mailer
+from central_governance_api.routers.account_requests import (
+    router as account_requests_router,
+)
+from central_governance_api.routers.admin_accounts import (
+    router as admin_accounts_router,
+)
 from central_governance_api.routers.approvals import router as approvals_router
 from central_governance_api.routers.audit import router as audit_router
 from central_governance_api.routers.devices import (
@@ -54,6 +73,7 @@ from central_governance_api.routers.devices import (
 from central_governance_api.routers.devices import router as devices_router
 from central_governance_api.routers.health import router as health_router
 from central_governance_api.routers.inbox import router as inbox_router
+from central_governance_api.routers.me import router as me_router
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +102,16 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     DeviceRevokedError: (409, "device_revoked"),
     DeviceQuotaExceededError: (429, "device_quota_exceeded"),
     DeviceAlreadyRevokedError: (409, "device_already_revoked"),
+    EmailDomainNotAllowedError: (422, "email_domain_not_allowed"),
+    AccountRequestRateLimitedError: (429, "rate_limited"),
+    InvalidVerificationCodeError: (400, "invalid_code"),
+    MailUnavailableError: (503, "mail_unavailable"),
+    DepartmentNotFoundError: (404, "department_not_found"),
+    DepartmentExistsError: (409, "department_exists"),
+    DepartmentDisabledError: (409, "department_disabled"),
+    AccountRequestNotFoundError: (404, "account_request_not_found"),
+    AccountRequestNotPendingError: (409, "account_request_not_pending"),
+    SelfApprovalNotAllowedError: (403, "cannot_decide_own_request"),
 }
 
 
@@ -107,6 +137,7 @@ def _install_exception_handlers(app: FastAPI) -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings: Settings = app.state.settings
     app.state.oidc_resolver = OIDCPrincipalResolver(settings)
+    app.state.mailer = build_mailer(settings)
 
     engine = create_engine(settings)
     app.state.db_engine = engine
@@ -141,6 +172,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(devices_router)
     app.include_router(audit_router)
     app.include_router(inbox_router)
+    app.include_router(account_requests_router)
+    app.include_router(admin_accounts_router)
+    app.include_router(me_router)
     _install_exception_handlers(app)
     return app
 

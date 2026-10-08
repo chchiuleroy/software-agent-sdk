@@ -37,6 +37,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -377,5 +378,134 @@ class IdempotencyRecord(Base):
             "scope_resource_id",
             "idempotency_key",
             name="uq_idempotency_scope",
+        ),
+    )
+
+
+# --- Account requests / departments ---
+# See docs/account-requests-departments-design-v1.md.
+
+ACCOUNT_REQUEST_STATUSES = (
+    "pending_verification",
+    "pending_review",
+    "approved",
+    "rejected",
+    "expired",
+)
+
+
+class Department(Base):
+    """A department a superadmin can assign an approved account to.
+
+    Created and disabled only by ``governance.superadmin``. Disabling keeps
+    existing memberships intact; it only stops new approvals picking it.
+    """
+
+    __tablename__ = "departments"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    disabled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class AccountRequest(Base):
+    """A publicly submitted request for an account.
+
+    The submitter has no account yet, so there is no verified identity on
+    create/verify and no ``AdminAuditEvent`` (its actor columns are
+    required) — this row is the record. ``email`` is stored lower-cased and
+    is unproven until ``email_verified_at`` is set. ``code_hmac`` is an
+    HMAC of the emailed verification code, never the code itself.
+    """
+
+    __tablename__ = "account_requests"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    email: Mapped[str] = mapped_column(String(320), index=True)
+    display_name: Mapped[str] = mapped_column(String(128))
+    requested_department: Mapped[str] = mapped_column(String(128))
+    reason: Mapped[str] = mapped_column(String(1000), default="")
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    code_hmac: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    code_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    code_attempts: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    decided_by_issuer: Mapped[str | None] = mapped_column(
+        String(_ISSUER_LEN), nullable=True
+    )
+    decided_by_sub: Mapped[str | None] = mapped_column(String(_SUB_LEN), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    decision_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    approved_department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id"), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending_verification','pending_review','approved',"
+            "'rejected','expired')",
+            name="ck_account_request_status",
+        ),
+        # At most one open application per e-mail: makes "supersede the old
+        # one, then insert" race-safe instead of relying on a prior SELECT.
+        Index(
+            "uq_account_request_open_email",
+            "email",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending_verification','pending_review')"
+            ),
+        ),
+    )
+
+
+class AccountMembership(Base):
+    """An approved account. Created at approval time with the identity
+    columns empty; the first login whose token carries this verified EMAIL
+    binds ``(bound_issuer, bound_sub)`` exactly once. After that the identity
+    key is ``(issuer, sub)`` and the EMAIL no longer grants anything.
+    """
+
+    __tablename__ = "account_memberships"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    email: Mapped[str] = mapped_column(String(320), unique=True)
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id")
+    )
+    account_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("account_requests.id"), unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    bound_issuer: Mapped[str | None] = mapped_column(String(_ISSUER_LEN), nullable=True)
+    bound_sub: Mapped[str | None] = mapped_column(String(_SUB_LEN), nullable=True)
+    bound_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(bound_issuer IS NULL) = (bound_sub IS NULL) "
+            "AND (bound_sub IS NULL) = (bound_at IS NULL)",
+            name="ck_membership_binding_all_or_none",
+        ),
+        UniqueConstraint(
+            "bound_issuer", "bound_sub", name="uq_membership_bound_identity"
         ),
     )

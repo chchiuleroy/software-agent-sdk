@@ -257,3 +257,41 @@ def test_settings_reject_http_urls_by_default():
             for k in env_vars:
                 os.environ.pop(k, None)
             os.environ.update(env_backup)
+
+
+async def test_email_claim_is_normalized_and_verified_flag_read(resolver, signing_key):
+    token = _sign(
+        signing_key,
+        _valid_claims(email="  Alice@Corp.Example ", email_verified=True),
+    )
+    principal = await resolver.resolve(token)
+    assert principal.email == "alice@corp.example"
+    assert principal.email_verified is True
+
+
+@pytest.mark.parametrize("claim", ["true", 1, "yes", None])
+async def test_email_verified_only_trusted_as_json_boolean_true(
+    resolver, signing_key, claim
+):
+    # Why: first-login binding grants a department from the EMAIL claim, so a
+    # truthy-looking non-boolean must never count as a verified address.
+    token = _sign(
+        signing_key, _valid_claims(email="a@corp.example", email_verified=claim)
+    )
+    principal = await resolver.resolve(token)
+    assert principal.email_verified is False
+
+
+async def test_missing_or_non_string_email_is_none(resolver, signing_key):
+    for claims in (_valid_claims(), _valid_claims(email=["a@corp.example"])):
+        principal = await resolver.resolve(_sign(signing_key, claims))
+        assert principal.email is None
+        assert principal.email_verified is False
+
+
+async def test_superadmin_role_is_known_and_distinct_from_admin(resolver, signing_key):
+    principal = await resolver.resolve(
+        _sign(signing_key, _valid_claims(roles=["governance.superadmin"]))
+    )
+    assert principal.roles == frozenset({"governance.superadmin"})
+    assert "governance.admin" not in principal.roles
