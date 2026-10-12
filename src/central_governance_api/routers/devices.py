@@ -1,4 +1,4 @@
-"""Device inventory endpoints — register and revoke.
+"""Device inventory endpoints — register, list and revoke.
 
 v11 §2/§4: `DeviceRegistration`/`DeviceDenylistEntry` are explicitly NOT a
 security control (see `models.py`'s docstrings on both tables) — this
@@ -49,7 +49,7 @@ import hashlib
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -220,6 +220,20 @@ class DeviceRevokeResponse(BaseModel):
     device_id: str
     revoked_at: datetime
     revoked_by_subject: str
+
+
+class DeviceListItem(BaseModel):
+    id: uuid.UUID
+    device_id: str
+    owner_subject: str
+    registered_at: datetime
+    revoked_at: datetime | None
+    revoked_by_subject: str | None
+
+
+class DeviceListResponse(BaseModel):
+    items: list[DeviceListItem]
+    next_offset: int | None
 
 
 # --- Device binding (used by the approvals router) ---------------------------
@@ -435,6 +449,72 @@ async def register_device(
     if replayed is not None:
         return DeviceRegisterResponse.model_validate(replayed)
     return response
+
+
+# --- LIST --------------------------------------------------------------------
+
+_LIST_MAX_LIMIT = 200
+_LIST_DEFAULT_LIMIT = 50
+
+
+@router.get("", response_model=DeviceListResponse)
+async def list_devices(
+    include_revoked: bool = Query(default=True),
+    limit: int = Query(default=_LIST_DEFAULT_LIMIT, ge=1, le=_LIST_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(get_current_principal),
+    session: AsyncSession = Depends(get_db_session),
+) -> DeviceListResponse:
+    """The caller's own registrations; ``governance.admin`` sees everyone's.
+
+    Same audience as revoke (owner or ``governance.admin``): a principal
+    that is not an admin only ever gets rows it owns, so there is nothing
+    to enumerate (revoke masks a non-owner as 404 for the same reason).
+    Ownership is the ``(issuer, sub)`` pair, never ``sub`` alone. A GET has
+    no side effects, so no idempotency handling.
+
+    ``include_revoked`` defaults to True: a revoked device still counts
+    against ``device_registration_quota`` and stays in the table forever
+    (see ``DeviceRegistration``), so an inventory that hid it would not
+    explain why the quota is used up. Pagination is plain offset/limit,
+    newest first, with the same shifting-page caveat as the audit endpoint
+    (see ``routers/audit.py``); a principal's own list is bounded by that
+    quota, only the admin view can grow large.
+    """
+    stmt = select(DeviceRegistration).order_by(
+        DeviceRegistration.registered_at.desc(), DeviceRegistration.id.desc()
+    )
+    if "governance.admin" not in principal.roles:
+        stmt = stmt.where(
+            DeviceRegistration.owner_issuer == principal.issuer,
+            DeviceRegistration.owner_sub == principal.sub,
+        )
+    if not include_revoked:
+        stmt = stmt.where(DeviceRegistration.revoked_at.is_(None))
+
+    # One extra row tells whether a next page exists without a COUNT(*).
+    rows = list((await session.execute(stmt.offset(offset).limit(limit + 1))).scalars())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    items = [
+        DeviceListItem(
+            id=row.id,
+            device_id=row.device_id,
+            owner_subject=_display_subject(row.owner_issuer, row.owner_sub),
+            registered_at=row.registered_at,
+            revoked_at=row.revoked_at,
+            revoked_by_subject=(
+                _display_subject(row.revoked_by_issuer, row.revoked_by_sub)
+                if row.revoked_by_issuer is not None and row.revoked_by_sub is not None
+                else None
+            ),
+        )
+        for row in rows
+    ]
+    return DeviceListResponse(
+        items=items, next_offset=offset + limit if has_more else None
+    )
 
 
 # --- REVOKE ------------------------------------------------------------------
