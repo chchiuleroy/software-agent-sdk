@@ -47,6 +47,7 @@ from central_governance_api.approvals.errors import (
     ExecutionAttemptMismatchError,
     ExecutionCommitmentMismatchError,
     ExecutionCommitmentRequiredError,
+    LateReportNotApplicableError,
     RecordNotFoundError,
     RecordNotTerminalError,
 )
@@ -102,6 +103,7 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     ExecutionCommitmentMismatchError: (409, "execution_commitment_mismatch"),
     ExecutionCommitmentRequiredError: (400, "execution_commitment_required"),
     RecordNotTerminalError: (409, "record_not_terminal"),
+    LateReportNotApplicableError: (409, "late_report_not_applicable"),
     RecordNotFoundError: (404, "record_not_found"),
     DigestMismatchError: (400, "digest_mismatch"),
     IdempotencyKeyReusedError: (422, "idempotency_key_reused"),

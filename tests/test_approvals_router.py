@@ -32,6 +32,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update
 
 from central_governance_api.approvals.digest import compute_display_digest
+from central_governance_api.approvals.sweep import sweep_expired_approvals
 from central_governance_api.auth.dependencies import get_oidc_resolver
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.db import get_db_session
@@ -40,6 +41,7 @@ from central_governance_api.models import (
     AdminAuditEvent,
     IdempotencyRecord,
     PendingApprovalRecord,
+    ReconciliationFinding,
 )
 
 from .conftest import ISSUER
@@ -422,8 +424,219 @@ async def test_reconciliation_late_report_denied_for_admin(client, signing_key):
     admin_token = _sign(signing_key, sub="dave", roles=["governance.admin"])
     resp = await client.post(
         f"/api/v1/approvals/{approval_id}/reconciliation-findings",
-        json={"finding_type": "late_report", "note": "admin trying to file one"},
+        json={
+            "finding_type": "late_report",
+            "note": "admin trying to file one",
+            # Required for late_report; supplied so this test still reaches
+            # (and keeps pinning) the authorization check rather than
+            # stopping at request validation.
+            "execution_attempt_id": str(uuid.uuid4()),
+        },
         headers=_auth(admin_token, "finding-late-1"),
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error_code"] == "authorization_denied"
+
+
+async def _approval_failed_unknown(client, signing_key, db_session):
+    """Drive a real approval to ``failed_unknown`` through the actual
+    transitions (create -> accept -> claim -> lease lapses -> sweep), not by
+    writing the status column, so the tests below exercise the state a
+    device really ends up in. Returns ``(approval_id, execution_attempt_id)``."""
+    created = await _create_approval(client, signing_key, sub="alice")
+    approval_id = created["id"]
+    approver_token = _sign(signing_key, sub="carol", roles=["agent.approver"])
+    await client.post(
+        f"/api/v1/approvals/{approval_id}/decide",
+        json={"decision": "accept"},
+        headers=_auth(approver_token, f"decide-{approval_id}"),
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    claim = await client.post(
+        f"/api/v1/approvals/{approval_id}/claim",
+        headers=_auth(requester_token, f"claim-{approval_id}"),
+    )
+    assert claim.status_code == 200, claim.text
+    attempt_id = claim.json()["execution_attempt_id"]
+    await db_session.execute(
+        update(PendingApprovalRecord)
+        .where(PendingApprovalRecord.id == uuid.UUID(approval_id))
+        .values(executing_lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    await db_session.flush()
+    await sweep_expired_approvals(db_session)
+    row = await db_session.get(PendingApprovalRecord, uuid.UUID(approval_id))
+    await db_session.refresh(row)
+    assert row.status == "failed_unknown"
+    return approval_id, attempt_id
+
+
+async def _findings_for(db_session, approval_id: str) -> list[ReconciliationFinding]:
+    result = await db_session.execute(
+        select(ReconciliationFinding).where(
+            ReconciliationFinding.approval_request_id == uuid.UUID(approval_id)
+        )
+    )
+    return list(result.scalars())
+
+
+async def test_late_report_accepted_on_failed_unknown_with_matching_attempt(
+    client, signing_key, db_session
+):
+    approval_id, attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={
+            "finding_type": "late_report",
+            "conclusion": "inconclusive",
+            "note": "device finished after the lease lapsed",
+            "execution_attempt_id": attempt_id,
+            # A caller-supplied key with the reserved name must not be able
+            # to misattribute the finding; the other keys must survive.
+            "evidence": {
+                "device_log": "kept",
+                "execution_attempt_id": "forged-by-caller",
+            },
+        },
+        headers=_auth(requester_token, "late-ok-1"),
+    )
+    assert resp.status_code == 201, resp.text
+    rows = await _findings_for(db_session, approval_id)
+    assert len(rows) == 1
+    # The attempt the finding speaks about is stored with it, so the audit
+    # trail says which attempt this evidence is about — the server's value,
+    # not whatever the caller put under that name.
+    evidence = rows[0].evidence or {}
+    assert evidence.get("execution_attempt_id") == attempt_id
+    assert evidence.get("device_log") == "kept"
+
+
+async def test_late_report_rejected_when_record_is_not_failed_unknown(
+    client, signing_key, db_session
+):
+    """``late_report`` exists for exactly one situation: the record failed
+    closed to ``failed_unknown`` while the device still holds the real
+    outcome. Filing one against an ``applied`` record (the device already
+    reported fine) would plant misleading evidence, even with the correct
+    attempt id — so the status, not just the attempt id, must gate it."""
+    created = await _create_approval(client, signing_key, sub="alice")
+    approval_id = created["id"]
+    approver_token = _sign(signing_key, sub="carol", roles=["agent.approver"])
+    await client.post(
+        f"/api/v1/approvals/{approval_id}/decide",
+        json={"decision": "accept"},
+        headers=_auth(approver_token, "decide-late-applied"),
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    claim = await client.post(
+        f"/api/v1/approvals/{approval_id}/claim",
+        headers=_auth(requester_token, "claim-late-applied"),
+    )
+    attempt_id = claim.json()["execution_attempt_id"]
+    reported = await client.post(
+        f"/api/v1/approvals/{approval_id}/report-result",
+        json={"execution_attempt_id": attempt_id, "outcome": "success"},
+        headers=_auth(requester_token, "report-late-applied"),
+    )
+    assert reported.json()["status"] == "applied"
+
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={
+            "finding_type": "late_report",
+            "execution_attempt_id": attempt_id,
+        },
+        headers=_auth(requester_token, "late-applied-1"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "late_report_not_applicable"
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_late_report_rejected_with_wrong_attempt_id(
+    client, signing_key, db_session
+):
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={
+            "finding_type": "late_report",
+            "execution_attempt_id": str(uuid.uuid4()),
+        },
+        headers=_auth(requester_token, "late-wrong-attempt-1"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "execution_attempt_mismatch"
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_late_report_requires_attempt_id(client, signing_key, db_session):
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "late_report", "note": "no attempt id"},
+        headers=_auth(requester_token, "late-no-attempt-1"),
+    )
+    assert resp.status_code == 422
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_attempt_id_only_belongs_to_late_report(client, signing_key, db_session):
+    """An attempt id on any other finding type would be accepted and then
+    silently ignored; reject it instead so a client that thinks it is
+    attributing evidence to an attempt finds out it is not."""
+    approval_id, attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={
+            "finding_type": "requester_assertion",
+            "execution_attempt_id": attempt_id,
+        },
+        headers=_auth(requester_token, "assert-with-attempt-1"),
+    )
+    assert resp.status_code == 422
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_requester_assertion_unchanged_on_failed_unknown(
+    client, signing_key, db_session
+):
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    requester_token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "requester_assertion", "note": "I never ran it"},
+        headers=_auth(requester_token, "assert-unchanged-1"),
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_late_report_by_another_principal_denied(client, signing_key, db_session):
+    """The status and attempt checks run after authorization, so someone
+    who does not own the record learns nothing about its state from the
+    error they get."""
+    approval_id, attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    other_token = _sign(signing_key, sub="mallory", roles=["agent.operator"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "late_report", "execution_attempt_id": attempt_id},
+        headers=_auth(other_token, "late-other-1"),
     )
     assert resp.status_code == 403
     assert resp.json()["error_code"] == "authorization_denied"

@@ -80,6 +80,7 @@ from central_governance_api.approvals.errors import (
     ExecutionAttemptMismatchError,
     ExecutionCommitmentMismatchError,
     ExecutionCommitmentRequiredError,
+    LateReportNotApplicableError,
     RecordNotFoundError,
     RecordNotTerminalError,
 )
@@ -873,6 +874,27 @@ async def create_reconciliation_finding(
             approval_id=approval_id, current_status=current.value
         )
 
+    evidence = body.evidence
+    if body.finding_type == "late_report":
+        # The schema guarantees the attempt id is present for a late_report.
+        assert body.execution_attempt_id is not None
+        if current is not ApprovalStatus.FAILED_UNKNOWN:
+            raise LateReportNotApplicableError(
+                approval_id=approval_id, current_status=current.value
+            )
+        if record.execution_attempt_id != body.execution_attempt_id:
+            raise ExecutionAttemptMismatchError(
+                approval_id=approval_id,
+                submitted=body.execution_attempt_id,
+                expected=record.execution_attempt_id,
+            )
+        # Reserved key: stored with the finding so the audit trail says which
+        # attempt this evidence is about; overrides a caller-supplied value.
+        evidence = {
+            **(body.evidence or {}),
+            "execution_attempt_id": str(body.execution_attempt_id),
+        }
+
     finding = ReconciliationFinding(
         approval_request_id=approval_id,
         finding_type=body.finding_type,
@@ -880,7 +902,7 @@ async def create_reconciliation_finding(
         note=body.note,
         verifier_issuer=principal.issuer,
         verifier_sub=principal.sub,
-        evidence=body.evidence,
+        evidence=evidence,
     )
     session.add(finding)
     await session.flush()  # populate finding.id/created_at
