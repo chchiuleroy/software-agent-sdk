@@ -200,6 +200,24 @@ class ReconciliationFindingRequest(RequestModel):
     ) = None
     note: str = ""
     evidence: dict[str, Any] | None = None
+    execution_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        description="late_report only, and required there: the execution "
+        "attempt this late report is about. Must match the record's own "
+        "attempt, and is stored with the finding.",
+    )
+
+    @model_validator(mode="after")
+    def _attempt_id_only_for_late_report(self) -> ReconciliationFindingRequest:
+        is_late_report = self.finding_type == "late_report"
+        if is_late_report and self.execution_attempt_id is None:
+            raise ValueError("a late_report must carry execution_attempt_id")
+        if not is_late_report and self.execution_attempt_id is not None:
+            raise ValueError(
+                "execution_attempt_id only belongs to a late_report, not to "
+                f"a {self.finding_type} finding"
+            )
+        return self
 
 
 class ReconciliationFindingResponse(BaseModel):

@@ -114,13 +114,8 @@ class RecordNotTerminalError(Exception):
     — a record still mid-flight (PENDING/ACCEPTED/EXECUTING) has no
     resolved outcome yet to reconcile. Maps to HTTP 409.
 
-    Narrower than one of code-review's suggestions: ``late_report``
-    findings arguably should be restricted further still, to records that
-    specifically reached ``failed_unknown`` (the whole reason that finding
-    type exists), and arguably should have to reference the record's
-    actual ``execution_attempt_id``. Neither extra constraint is enforced
-    here — this error only checks "is the record terminal at all",
-    flagged as a known gap rather than silently narrowed without a trace.
+    This only checks "is the record terminal at all". ``late_report`` is
+    narrower still — see :class:`LateReportNotApplicableError`.
     """
 
     def __init__(self, *, approval_id: uuid.UUID, current_status: str) -> None:
@@ -129,4 +124,22 @@ class RecordNotTerminalError(Exception):
         super().__init__(
             f"approval {approval_id} is not yet resolved "
             f"(status={current_status!r}) — no outcome to reconcile"
+        )
+
+
+class LateReportNotApplicableError(Exception):
+    """RECONCILIATION-FINDINGS only: a ``late_report`` is the requester's
+    own device reporting the real outcome of an attempt after central
+    already failed it closed, so it is only meaningful on a record that
+    reached ``failed_unknown``. On any other terminal status (``applied``,
+    ``failed_definite``, ``rejected`` ...) the device either already
+    reported or never ran anything, and a late report would plant
+    misleading evidence in the audit trail. Maps to HTTP 409."""
+
+    def __init__(self, *, approval_id: uuid.UUID, current_status: str) -> None:
+        self.approval_id = approval_id
+        self.current_status = current_status
+        super().__init__(
+            f"approval {approval_id} has status {current_status!r}; a "
+            "late_report only applies to a failed_unknown record"
         )
