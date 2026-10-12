@@ -16,6 +16,7 @@ import {
   renderItem,
   renderNav,
   resolveSection,
+  sanitizeHash,
   SECTIONS,
   truncate,
   visibleSections,
@@ -377,4 +378,25 @@ test("live entries navigate, planned ones are labelled and inert", () => {
   assert.doesNotMatch(profile.className, /active/);
   assert.equal(devices.listeners.click, undefined, "a planned entry must not be clickable");
   assert.match(allText(devices), /coming soon/i);
+});
+
+test("only a plain section hash is carried through the sign-in round trip", () => {
+  // The hash survives sessionStorage and goes back into the address bar, so it
+  // must never be able to carry anything but a section name.
+  assert.equal(sanitizeHash("#approvals"), "#approvals");
+  assert.equal(sanitizeHash("#tool-permissions"), "#tool-permissions");
+  for (const hostile of [
+    "",
+    "#",
+    "approvals",
+    "#a b",
+    "#<script>",
+    "#a?code=1",
+    "#../x",
+    `#${"a".repeat(41)}`,
+    null,
+    undefined,
+  ]) {
+    assert.equal(sanitizeHash(hostile), "", String(hostile));
+  }
 });

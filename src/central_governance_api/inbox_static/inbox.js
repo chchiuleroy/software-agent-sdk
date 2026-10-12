@@ -16,6 +16,7 @@ const REFRESH_MS = 15000;
 const MAX_VALUE_CHARS = 2000;
 const STORAGE_STATE = "inbox_state";
 const STORAGE_VERIFIER = "inbox_verifier";
+const STORAGE_HASH = "inbox_hash";
 
 // ---------------------------------------------------------------- pure helpers
 // (exported so tests/js/inbox.test.mjs can run them under Node)
@@ -182,6 +183,15 @@ export function visibleSections(roles) {
       section.requiredRoles.length === 0 ||
       section.requiredRoles.some((role) => held.includes(role)),
   );
+}
+
+// The section link a visitor arrived with is kept across the sign-in round trip
+// (the token lives in memory only, so every fresh visit signs in first). It goes
+// through sessionStorage and back into the address bar, so only a plain section
+// name is ever kept.
+export function sanitizeHash(hash) {
+  const text = String(hash ?? "");
+  return /^#[a-z0-9-]{1,40}$/.test(text) ? text : "";
 }
 
 // Which section to open for a location hash. A link to a section the account
@@ -387,6 +397,7 @@ async function main() {
     const verifier = randomString(48);
     sessionStorage.setItem(STORAGE_STATE, state);
     sessionStorage.setItem(STORAGE_VERIFIER, verifier);
+    sessionStorage.setItem(STORAGE_HASH, sanitizeHash(location.hash));
     location.assign(
       buildAuthUrl({
         authorizationEndpoint: discovery.authorization_endpoint,
@@ -549,8 +560,11 @@ async function main() {
     sessionStorage.getItem(STORAGE_STATE),
   );
   if (callback) {
-    // Drop ?code=&state= from the address bar before doing anything else.
-    history.replaceState(null, "", "/inbox");
+    // Drop ?code=&state= from the address bar before doing anything else, and
+    // put back the section link the visitor arrived with.
+    const savedHash = sanitizeHash(sessionStorage.getItem(STORAGE_HASH));
+    sessionStorage.removeItem(STORAGE_HASH);
+    history.replaceState(null, "", `/inbox${savedHash}`);
     if (callback.error) {
       sessionStorage.removeItem(STORAGE_STATE);
       sessionStorage.removeItem(STORAGE_VERIFIER);
