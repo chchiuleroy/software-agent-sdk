@@ -2,7 +2,7 @@
 body { font: 15px/1.45 system-ui, sans-serif; margin: 0 auto; max-width: 52rem; padding: 1rem; }
 header { display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
 header h1 { margin: 0; font-size: 1.3rem; flex: 1; }
-#list { list-style: none; padding: 0; display: grid; gap: 1rem; }
+#list, #devices-list { list-style: none; padding: 0; display: grid; gap: 1rem; }
 .item { border: 1px solid #8886; border-radius: 8px; padding: 0.8rem 1rem; }
 .item h2 { font-size: 1.05rem; margin: 0 0 0.5rem; overflow-wrap: anywhere; }
 .item h3 { font-size: 0.85rem; margin: 0.6rem 0 0.2rem; opacity: 0.8; }
@@ -22,3 +22,6 @@ nav { margin: 0.6rem 0; }
 .nav .planned { display: inline-block; padding: 0.35rem 0.9rem; opacity: 0.55; border: 1px dashed #8886; border-radius: 6px; }
 .identity { border: 1px solid #8886; border-radius: 8px; padding: 0.8rem 1rem; }
 .identity h2 { font-size: 1.05rem; margin: 0 0 0.5rem; overflow-wrap: anywhere; }
+.toolbar { margin: 0.5rem 0; }
+.device.revoked { opacity: 0.6; }
+#devices-more { margin-top: 1rem; }

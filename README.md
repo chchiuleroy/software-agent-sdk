@@ -561,14 +561,23 @@ email 登入時這個呼叫就是把帳號綁定到部門的那一步**），再
 |---|---|---|
 | 所有登入者 | Profile | 已有 |
 | `agent.approver` | Approvals（原核准收件匣） | 已有 |
-| `governance.superadmin` | Account requests、Departments、Tool permissions、Awaiting first sign-in、Devices | 只有灰色標示（coming soon），畫面尚未做 |
+| `governance.superadmin` | Devices | 已有（2026-10-12，見下） |
+| `governance.superadmin` | Account requests、Departments、Tool permissions、Awaiting first sign-in | 只有灰色標示（coming soon），畫面尚未做 |
 
 角色**互不包含**：superadmin 看不到 Approvals，`governance.admin` 不會解鎖超管區。
 前端藏區塊只是體驗，**不是授權**；授權永遠是各 API 對 Bearer token 的檢查。角色一律取自
 `/me`（伺服器驗過），前端不自己解 token 判斷。指向看不到的區塊（例如 `#approvals`）的
 連結會退回 Profile 並顯示提示；剛被授予角色的人要登出再登入才拿得到新 token。
 
-驗證：`tests/js/inbox.test.mjs`（區塊可見性、深連結、身分卡、導覽；突變測試確認改錯
+**Devices（superadmin 專屬）**：列出所有人的裝置註冊（`GET /api/v1/devices`，每頁 50 筆、
+「Load more」以 `id` 去重；重新載入會保留已載入的筆數，上限為 API 的 200），已撤銷的顯示
+撤銷者與時間，自己的標「(you)」（issuer 與 sub 都相符才算，與伺服器的擁有者規則一致）。
+每筆未撤銷的可撤銷（`POST /api/v1/devices/{id}/revoke`），確認對話框寫明 device_id 與擁有者，
+並如實說明：撤銷是永久的（列入 denylist、不能重新註冊），**只有在這台伺服器開啟
+`CGA_DEVICE_BINDING_ENFORCED` 時才會擋住該裝置建立或認領核准**，已發出的執行租約仍可回報
+結果。預設該旗標是關的，所以預設情況下撤銷只是標記。沒有自動輪詢（只在開啟與按 Refresh 時載入）。
+
+驗證：`tests/js/inbox.test.mjs`（區塊可見性、深連結、身分卡、導覽、裝置清單；突變測試確認改錯
 角色會失敗）；瀏覽器端用測試用假 IdP（驗證 PKCE verifier 與 redirect_uri）逐一以五種
 身分登入檢查過。**尚未對真的 Keycloak 登入驗證**（需要先註冊 public client 並建立真人帳號）。
 
