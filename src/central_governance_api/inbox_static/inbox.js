@@ -17,6 +17,8 @@ const MAX_VALUE_CHARS = 2000;
 const STORAGE_STATE = "inbox_state";
 const STORAGE_VERIFIER = "inbox_verifier";
 const STORAGE_HASH = "inbox_hash";
+const DEVICES_PAGE = 50;
+const DEVICES_MAX = 200; // GET /api/v1/devices rejects a larger limit
 
 // ---------------------------------------------------------------- pure helpers
 // (exported so tests/js/inbox.test.mjs can run them under Node)
@@ -162,17 +164,17 @@ export const SECTIONS = [
     status: "live",
   },
   ...[
-    ["accounts", "Account requests"],
-    ["departments", "Departments"],
-    ["tool-permissions", "Tool permissions"],
-    ["awaiting-signin", "Awaiting first sign-in"],
-    ["devices", "Devices"],
-  ].map(([id, title]) => ({
+    ["accounts", "Account requests", "planned"],
+    ["departments", "Departments", "planned"],
+    ["tool-permissions", "Tool permissions", "planned"],
+    ["awaiting-signin", "Awaiting first sign-in", "planned"],
+    ["devices", "Devices", "live"],
+  ].map(([id, title, status]) => ({
     id,
     title,
     audience: "superadmin",
     requiredRoles: ["governance.superadmin"],
-    status: "planned",
+    status,
   })),
 ];
 
@@ -230,6 +232,78 @@ export function describeIdentity(me) {
       ? truncate(me.membership.department_name)
       : "No department yet. An administrator has to approve your application, then sign in with the approved e-mail.",
   };
+}
+
+// ---------------------------------------------------------------- device list
+// Rows of GET /api/v1/devices for the superadmin Devices screen. Every value is
+// untrusted text (device ids are chosen by the registering client).
+
+// Fixed format and zone so the screen does not depend on the browser's locale.
+export function formatUtc(iso) {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return "unknown";
+  return `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+// `ownerSubject` is "issuer#sub". A Keycloak sub is a long UUID, so show the
+// start of it and keep the whole text for a tooltip. "Mine" needs the issuer
+// AND the sub to match, like the server's ownership rule: the same sub under
+// another issuer is another person.
+export function ownerLabel(ownerSubject, me) {
+  const full = truncate(ownerSubject ?? "");
+  const cut = full.lastIndexOf("#");
+  const sub = cut === -1 ? full : full.slice(cut + 1);
+  return {
+    short: sub.length > 16 ? `${sub.slice(0, 8)}…` : sub,
+    full,
+    mine: Boolean(me) && String(ownerSubject) === `${me.issuer}#${me.sub}`,
+  };
+}
+
+export function describeDevice(item, me) {
+  const revokedAt = item.revoked_at ?? null;
+  return {
+    id: String(item.id),
+    deviceId: truncate(item.device_id ?? ""),
+    owner: ownerLabel(item.owner_subject, me),
+    registered: formatUtc(item.registered_at),
+    revoked: revokedAt !== null,
+    revokedAt: revokedAt !== null ? formatUtc(revokedAt) : null,
+    revokedBy: item.revoked_by_subject
+      ? ownerLabel(item.revoked_by_subject, me)
+      : null,
+  };
+}
+
+// Offset paging shifts when rows arrive between two requests, so a page can
+// repeat rows already shown. Append only the ones not seen yet.
+export function mergeDevices(existing, incoming) {
+  const seen = new Set(existing.map((item) => item.id));
+  const added = [];
+  for (const item of incoming) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    added.push(item);
+  }
+  return [...existing, ...added];
+}
+
+// How many rows to ask for when the list is reloaded from the start: at least a
+// page, and as many as are already on screen (so a reload after a revoke does
+// not collapse a list the user had paged through), up to what the API allows.
+export function pageLimit(loaded) {
+  return Math.min(Math.max(loaded, DEVICES_PAGE), DEVICES_MAX);
+}
+
+// Revocation is permanent, so the prompt names the device and its owner and
+// says what it does NOT do: it only blocks a device when this server enforces
+// device binding, and a lease already issued can still report its result.
+export function revokeConfirmText(view) {
+  return [
+    `Revoke device "${view.deviceId}" owned by ${view.owner.full}?`,
+    "",
+    "It goes on the denylist and can never be registered again. It stops the device from creating or claiming approvals only when device binding is enforced on this server (CGA_DEVICE_BINDING_ENFORCED); execution leases already issued can still report their result.",
+  ].join("\n");
 }
 
 // ------------------------------------------------------------------- rendering
@@ -310,6 +384,52 @@ export function renderIdentity(doc, view) {
   return card;
 }
 
+export function renderDevice(doc, view, onRevoke) {
+  const li = el(
+    doc,
+    "li",
+    undefined,
+    view.revoked ? "item device revoked" : "item device",
+  );
+  li.appendChild(el(doc, "h2", view.deviceId));
+  const facts = el(doc, "dl");
+  const owner = el(
+    doc,
+    "dd",
+    view.owner.mine ? `${view.owner.short} (you)` : view.owner.short,
+  );
+  owner.title = view.owner.full;
+  facts.appendChild(el(doc, "dt", "Owner"));
+  facts.appendChild(owner);
+  facts.appendChild(el(doc, "dt", "Registered"));
+  facts.appendChild(el(doc, "dd", view.registered));
+  facts.appendChild(el(doc, "dt", "Status"));
+  if (view.revoked) {
+    const by = view.revokedBy;
+    const status = el(
+      doc,
+      "dd",
+      by
+        ? `Revoked ${view.revokedAt} by ${by.short}${by.mine ? " (you)" : ""}`
+        : `Revoked ${view.revokedAt}`,
+    );
+    if (by) status.title = by.full;
+    facts.appendChild(status);
+  } else {
+    facts.appendChild(el(doc, "dd", "Active"));
+  }
+  li.appendChild(facts);
+  if (!view.revoked) {
+    const actions = el(doc, "div", undefined, "actions");
+    const button = el(doc, "button", "Revoke", "reject");
+    button.type = "button";
+    button.addEventListener("click", () => onRevoke(view));
+    actions.appendChild(button);
+    li.appendChild(actions);
+  }
+  return li;
+}
+
 export function renderNav(doc, sections, activeId, onSelect) {
   const list = el(doc, "ul", undefined, "nav");
   for (const section of sections) {
@@ -341,6 +461,10 @@ async function main() {
   const navEl = document.getElementById("nav");
   const profileEl = document.getElementById("profile");
   const approvalsEl = document.getElementById("approvals");
+  const devicesEl = document.getElementById("devices");
+  const devicesListEl = document.getElementById("devices-list");
+  const devicesMoreEl = document.getElementById("devices-more");
+  const devicesRefreshEl = document.getElementById("devices-refresh");
   const whoEl = document.getElementById("who");
   const signoutEl = document.getElementById("signout");
   const say = (message) => {
@@ -376,10 +500,24 @@ async function main() {
   // a guess from the token) and the section currently open.
   let roles = [];
   let active = "profile";
+  // Who is signed in (issuer + sub), to mark "(you)" on the Devices screen.
+  let meInfo = null;
+  // The Devices screen: rows shown, where the next page starts, and a counter
+  // so a slow response from an earlier request is dropped, not drawn.
+  let devices = [];
+  let devicesNextOffset = null;
+  let devicesSeq = 0;
 
   function signOut(message) {
     token = null;
     roles = [];
+    meInfo = null;
+    devices = [];
+    devicesNextOffset = null;
+    devicesSeq += 1;
+    devicesListEl.replaceChildren();
+    devicesMoreEl.hidden = true;
+    devicesEl.hidden = true;
     listEl.replaceChildren();
     navEl.replaceChildren();
     navEl.hidden = true;
@@ -458,9 +596,100 @@ async function main() {
     }
     const me = await response.json();
     roles = Array.isArray(me.roles) ? me.roles.map(String) : [];
+    meInfo = { issuer: me.issuer, sub: me.sub };
     profileEl.replaceChildren(renderIdentity(document, describeIdentity(me)));
     return true;
   }
+
+  function renderDevices() {
+    devicesListEl.replaceChildren(
+      ...devices.map((item) =>
+        renderDevice(document, describeDevice(item, meInfo), revokeDevice),
+      ),
+    );
+    devicesMoreEl.hidden = devicesNextOffset === null;
+  }
+
+  // reset: start again from the first page; otherwise append the next one.
+  // `notice` is put in front of the usual count line (e.g. after a revoke).
+  async function loadDevices(reset, notice = "") {
+    if (!token) return;
+    if (!reset && devicesNextOffset === null) return;
+    if (Date.now() >= expiresAtMs) {
+      signOut("Your session expired. Sign in again.");
+      return;
+    }
+    const seq = (devicesSeq += 1);
+    const offset = reset ? 0 : devicesNextOffset;
+    const limit = reset ? pageLimit(devices.length) : DEVICES_PAGE;
+    let response;
+    try {
+      response = await api(`/api/v1/devices?limit=${limit}&offset=${offset}`);
+    } catch {
+      if (token && seq === devicesSeq && active === "devices") {
+        say("Could not reach the server.");
+      }
+      return;
+    }
+    // A newer request, or another section, now owns the status line.
+    if (seq !== devicesSeq || active !== "devices") return;
+    if (!response.ok) {
+      say(`Could not load devices (HTTP ${response.status}).`);
+      return;
+    }
+    const body = await response.json();
+    if (seq !== devicesSeq) return;
+    devices = reset ? body.items : mergeDevices(devices, body.items);
+    devicesNextOffset = body.next_offset ?? null;
+    renderDevices();
+    const count =
+      devices.length === 0
+        ? "No devices registered."
+        : `${devices.length} device(s)${devicesNextOffset === null ? "" : " (more available)"}.`;
+    say(`${notice}${count}`);
+  }
+
+  async function revokeDevice(view) {
+    if (!window.confirm(revokeConfirmText(view))) return;
+    const keyId = `revoke:${view.id}`;
+    // Same key for a retry of the same click, so a lost response is safe.
+    if (!idempotencyKeys.has(keyId)) {
+      idempotencyKeys.set(keyId, crypto.randomUUID());
+    }
+    let response;
+    try {
+      response = await api(
+        `/api/v1/devices/${encodeURIComponent(view.id)}/revoke`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKeys.get(keyId) },
+        },
+      );
+    } catch {
+      if (token) say("Could not reach the server.");
+      return;
+    }
+    if (response.ok) {
+      idempotencyKeys.delete(keyId);
+      await loadDevices(true, `Revoked ${truncate(view.deviceId, 80)}. `);
+    } else if (response.status === 409) {
+      idempotencyKeys.delete(keyId);
+      await loadDevices(true, "That device was already revoked. ");
+    } else if (response.status === 404) {
+      // The server answers 404 both for "no such device" and "not yours".
+      say("Not found: the device does not exist, or you may not revoke it.");
+    } else {
+      say(`The revoke was not accepted (HTTP ${response.status}).`);
+    }
+  }
+
+  // What each live section shows and what it does when opened. A section in
+  // SECTIONS only works if it has an entry here.
+  const PANELS = {
+    profile: { el: profileEl },
+    approvals: { el: approvalsEl, open: refresh },
+    devices: { el: devicesEl, open: () => loadDevices(true) },
+  };
 
   function showSection() {
     if (!token) return;
@@ -471,10 +700,11 @@ async function main() {
         location.hash = target;
       }),
     );
-    profileEl.hidden = id !== "profile";
-    approvalsEl.hidden = id !== "approvals";
+    for (const [panelId, panel] of Object.entries(PANELS)) {
+      panel.el.hidden = panelId !== id;
+    }
     say(denied ? "That page is not available for your account." : "");
-    if (id === "approvals") refresh();
+    PANELS[id]?.open?.();
   }
 
   async function refresh() {
@@ -552,6 +782,8 @@ async function main() {
     await refresh();
   }
 
+  devicesRefreshEl.addEventListener("click", () => loadDevices(true));
+  devicesMoreEl.addEventListener("click", () => loadDevices(false));
   document.getElementById("signin").addEventListener("click", signIn);
   signoutEl.addEventListener("click", () => signOut());
 

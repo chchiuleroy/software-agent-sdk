@@ -6,16 +6,22 @@ import {
   base64url,
   buildAuthUrl,
   decodeJwtPayload,
+  describeDevice,
   describeIdentity,
   describeItem,
   formatRemaining,
+  mergeDevices,
+  ownerLabel,
+  pageLimit,
   parseCallback,
   pkceChallenge,
   randomString,
+  renderDevice,
   renderIdentity,
   renderItem,
   renderNav,
   resolveSection,
+  revokeConfirmText,
   sanitizeHash,
   SECTIONS,
   truncate,
@@ -239,11 +245,15 @@ test("superadmin gets the admin area but NOT approvals: the roles are separate",
   const sections = visibleSections(["governance.superadmin"]);
   assert.deepEqual(ids(sections), ["profile", ...SUPERADMIN_IDS]);
   assert.ok(sections.filter((s) => s.audience === "superadmin").length > 0);
+  const live = sections
+    .filter((s) => s.audience === "superadmin" && s.status === "live")
+    .map((s) => s.id);
+  assert.deepEqual(live, ["devices"], "only the Devices screen exists so far");
   assert.ok(
     sections
-      .filter((s) => s.audience === "superadmin")
+      .filter((s) => s.audience === "superadmin" && s.id !== "devices")
       .every((s) => s.status === "planned"),
-    "no admin view exists yet; they must be shown as planned, not live",
+    "the other admin views have no page yet; they must stay planned",
   );
 });
 
@@ -277,8 +287,13 @@ test("the section a link points at is only honoured when it is usable", () => {
     id: "profile",
     denied: true,
   });
-  // planned sections have no page yet
+  // the Devices screen exists: a superadmin may open it
   assert.deepEqual(resolveSection("#devices", superadmin), {
+    id: "devices",
+    denied: false,
+  });
+  // planned sections have no page yet
+  assert.deepEqual(resolveSection("#departments", superadmin), {
     id: "profile",
     denied: true,
   });
@@ -371,13 +386,20 @@ test("live entries navigate, planned ones are labelled and inert", () => {
   const profile = byTitle("Profile");
   const approvals = byTitle("Approvals");
   const devices = byTitle("Devices");
+  const departments = byTitle("Departments");
   profile.listeners.click();
   approvals.listeners.click();
   assert.deepEqual(chosen, ["profile", "approvals"]);
   assert.match(approvals.className, /active/);
   assert.doesNotMatch(profile.className, /active/);
-  assert.equal(devices.listeners.click, undefined, "a planned entry must not be clickable");
-  assert.match(allText(devices), /coming soon/i);
+  devices.listeners.click();
+  assert.deepEqual(chosen, ["profile", "approvals", "devices"]);
+  assert.equal(
+    departments.listeners.click,
+    undefined,
+    "a planned entry must not be clickable",
+  );
+  assert.match(allText(departments), /coming soon/i);
 });
 
 test("only a plain section hash is carried through the sign-in round trip", () => {
@@ -399,4 +421,142 @@ test("only a plain section hash is carried through the sign-in round trip", () =
   ]) {
     assert.equal(sanitizeHash(hostile), "", String(hostile));
   }
+});
+
+// ------------------------------------------------------------ devices screen
+
+const DEV_ME = { issuer: "http://kc/realms/x", sub: "root-0000-1111-2222" };
+const deviceItem = (over = {}) => ({
+  id: "reg-1",
+  device_id: "laptop",
+  owner_subject: "http://kc/realms/x#alice-aaaa-bbbb-cccc",
+  registered_at: "2026-10-12T08:05:09.123456+00:00",
+  revoked_at: null,
+  revoked_by_subject: null,
+  ...over,
+});
+
+test("ownerLabel shortens a long sub and keeps the full text", () => {
+  const label = ownerLabel("http://kc/realms/x#alice-aaaa-bbbb-cccc", DEV_ME);
+  assert.equal(label.short, "alice-aa…");
+  assert.equal(label.full, "http://kc/realms/x#alice-aaaa-bbbb-cccc");
+  assert.equal(label.mine, false);
+  assert.equal(ownerLabel("http://kc/realms/x#bob", DEV_ME).short, "bob");
+  assert.equal(ownerLabel("justtext", DEV_ME).short, "justtext");
+});
+
+test("a device is 'mine' only when issuer AND sub both match", () => {
+  // The server matches the (issuer, sub) pair, never the sub alone; so must the
+  // label, or another realm's account with the same sub would be shown as mine.
+  assert.equal(ownerLabel(`${DEV_ME.issuer}#${DEV_ME.sub}`, DEV_ME).mine, true);
+  assert.equal(ownerLabel(`http://other/realms/x#${DEV_ME.sub}`, DEV_ME).mine, false);
+  assert.equal(ownerLabel(`${DEV_ME.issuer}#someone-else`, DEV_ME).mine, false);
+  assert.equal(ownerLabel(`${DEV_ME.issuer}#${DEV_ME.sub}`, null).mine, false);
+});
+
+test("describeDevice reads an active and a revoked registration", () => {
+  const active = describeDevice(deviceItem(), DEV_ME);
+  assert.equal(active.id, "reg-1");
+  assert.equal(active.deviceId, "laptop");
+  assert.equal(active.revoked, false);
+  assert.equal(active.registered, "2026-10-12 08:05 UTC");
+  assert.equal(active.revokedBy, null);
+
+  const revoked = describeDevice(
+    deviceItem({
+      revoked_at: "2026-10-12T09:00:00+00:00",
+      revoked_by_subject: `${DEV_ME.issuer}#${DEV_ME.sub}`,
+    }),
+    DEV_ME,
+  );
+  assert.equal(revoked.revoked, true);
+  assert.equal(revoked.revokedAt, "2026-10-12 09:00 UTC");
+  assert.equal(revoked.revokedBy.mine, true);
+});
+
+test("describeDevice tolerates a bad date and bounds huge values", () => {
+  assert.equal(describeDevice(deviceItem({ registered_at: "nope" }), DEV_ME).registered, "unknown");
+  const huge = "x".repeat(5000);
+  const view = describeDevice(
+    deviceItem({ device_id: huge, owner_subject: `i#${huge}` }),
+    DEV_ME,
+  );
+  assert.ok(view.deviceId.length <= 2001);
+  assert.ok(view.owner.full.length <= 2001);
+  assert.ok(view.owner.short.length <= 9);
+});
+
+test("mergeDevices appends only rows not already shown", () => {
+  const a = deviceItem({ id: "a" });
+  const b = deviceItem({ id: "b" });
+  const c = deviceItem({ id: "c" });
+  const existing = [a, b];
+  const merged = mergeDevices(existing, [b, c]);
+  assert.deepEqual(merged.map((d) => d.id), ["a", "b", "c"]);
+  assert.equal(existing.length, 2, "the input list must not be modified");
+  assert.deepEqual(mergeDevices([], [a, a]).map((d) => d.id), ["a"]);
+});
+
+test("the revoke prompt names the device and owner and does not overstate the effect", () => {
+  const view = describeDevice(deviceItem(), DEV_ME);
+  const text = revokeConfirmText(view);
+  assert.ok(text.includes('"laptop"'));
+  assert.ok(text.includes("http://kc/realms/x#alice-aaaa-bbbb-cccc"));
+  assert.match(text, /only when device binding is enforced/);
+  assert.match(text, /CGA_DEVICE_BINDING_ENFORCED/);
+  assert.match(text, /already issued/);
+  assert.doesNotMatch(text, /immediately/i);
+});
+
+const buttonsIn = (node) => [
+  ...(node.tag === "button" ? [node] : []),
+  ...node.children.flatMap(buttonsIn),
+];
+
+test("a device card renders hostile values as text and offers Revoke only while active", () => {
+  const hostile = '<img src=x onerror="alert(1)">';
+  const calls = [];
+  const activeView = describeDevice(
+    deviceItem({ device_id: hostile, owner_subject: `i#${hostile}` }),
+    DEV_ME,
+  );
+  const card = renderDevice(fakeDocument(), activeView, (view) => calls.push(view.id));
+  assert.ok(allText(card).includes(hostile));
+  const buttons = buttonsIn(card);
+  assert.equal(buttons.length, 1);
+  buttons[0].listeners.click();
+  assert.deepEqual(calls, ["reg-1"]);
+
+  const revokedView = describeDevice(
+    deviceItem({
+      revoked_at: "2026-10-12T09:00:00+00:00",
+      revoked_by_subject: "http://kc/realms/x#root-0000-1111-2222",
+    }),
+    DEV_ME,
+  );
+  const gone = renderDevice(fakeDocument(), revokedView, () => calls.push("never"));
+  assert.equal(buttonsIn(gone).length, 0, "a revoked device cannot be revoked again");
+  assert.match(gone.className, /revoked/);
+  assert.match(allText(gone), /Revoked/);
+});
+
+test("my own device is marked (you)", () => {
+  const mine = describeDevice(
+    deviceItem({ owner_subject: `${DEV_ME.issuer}#${DEV_ME.sub}` }),
+    DEV_ME,
+  );
+  assert.match(allText(renderDevice(fakeDocument(), mine, () => {})), /\(you\)/);
+  const theirs = describeDevice(deviceItem(), DEV_ME);
+  assert.doesNotMatch(allText(renderDevice(fakeDocument(), theirs, () => {})), /\(you\)/);
+});
+
+test("a reload keeps what was already loaded, within the server's page limit", () => {
+  // Revoking a row on page 2 reloads the list; if it fell back to page 1 the
+  // row just revoked would vanish from view.
+  assert.equal(pageLimit(0), 50);
+  assert.equal(pageLimit(20), 50);
+  assert.equal(pageLimit(60), 60);
+  assert.equal(pageLimit(150), 150);
+  assert.equal(pageLimit(200), 200);
+  assert.equal(pageLimit(999), 200, "the API accepts at most 200 per request");
 });

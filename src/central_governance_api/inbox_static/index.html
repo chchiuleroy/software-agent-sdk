@@ -22,6 +22,19 @@
       <section id="approvals" aria-label="Approvals" hidden>
         <ul id="list" aria-live="polite"></ul>
       </section>
+      <section id="devices" aria-label="Devices" hidden>
+        <p class="note">
+          Registered devices of every account. Revoking one is permanent: it
+          blocks that device from creating or claiming approvals only when this
+          server enforces device binding (CGA_DEVICE_BINDING_ENFORCED);
+          execution leases already issued can still report their result.
+        </p>
+        <div class="toolbar">
+          <button id="devices-refresh" type="button">Refresh</button>
+        </div>
+        <ul id="devices-list" aria-live="polite"></ul>
+        <button id="devices-more" type="button" hidden>Load more</button>
+      </section>
     </main>
     <script type="module" src="/inbox/inbox.js"></script>
   </body>
