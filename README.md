@@ -549,6 +549,28 @@ Keycloak 側需要：
 - 尚未在真實瀏覽器+真實 Keycloak 上跑過完整流程：目前驗證的是 Python 側的標頭/
   開關測試、Node 單元測試（含 RFC 7636 向量）與突變檢查，**登入往返與決定按鈕沒有端到端驗證**。
 
+## 登入殼與依角色分區（OHS console，2026-10-12）
+
+`/inbox` 現在是一個有導覽列的單頁殼，不只是核准收件匣：登入後先呼叫
+`GET /api/v1/me`（顯示姓名、email 與驗證狀態、角色、所屬部門；**首次以已批准
+email 登入時這個呼叫就是把帳號綁定到部門的那一步**），再依「區塊→所需角色」宣告表
+（`inbox.js` 的 `SECTIONS`）只開放該帳號能用的區塊：
+
+| 對象 | 區塊 | 狀態 |
+|---|---|---|
+| 所有登入者 | Profile | 已有 |
+| `agent.approver` | Approvals（原核准收件匣） | 已有 |
+| `governance.superadmin` | Account requests、Departments、Tool permissions、Awaiting first sign-in、Devices | 只有灰色標示（coming soon），畫面尚未做 |
+
+角色**互不包含**：superadmin 看不到 Approvals，`governance.admin` 不會解鎖超管區。
+前端藏區塊只是體驗，**不是授權**；授權永遠是各 API 對 Bearer token 的檢查。角色一律取自
+`/me`（伺服器驗過），前端不自己解 token 判斷。指向看不到的區塊（例如 `#approvals`）的
+連結會退回 Profile 並顯示提示；剛被授予角色的人要登出再登入才拿得到新 token。
+
+驗證：`tests/js/inbox.test.mjs`（區塊可見性、深連結、身分卡、導覽；突變測試確認改錯
+角色會失敗）；瀏覽器端用測試用假 IdP（驗證 PKCE verifier 與 redirect_uri）逐一以五種
+身分登入檢查過。**尚未對真的 Keycloak 登入驗證**（需要先註冊 public client 並建立真人帳號）。
+
 ## 裝置綁定 `CGA_DEVICE_BINDING_ENFORCED`（2026-10-02，gap #6）
 
 身份模型 B（2026-10-02 定案）下，每台桌面的 agent-server 是一個**裝置身份**

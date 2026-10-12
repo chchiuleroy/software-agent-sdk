@@ -16,3 +16,9 @@ pre { margin: 0; padding: 0.5rem; background: #8882; border-radius: 6px; overflo
 button { font: inherit; padding: 0.35rem 0.9rem; border-radius: 6px; border: 1px solid #8888; cursor: pointer; }
 button.accept { background: #1a7f37; color: #fff; border-color: #1a7f37; }
 button.reject { background: #cf222e; color: #fff; border-color: #cf222e; }
+nav { margin: 0.6rem 0; }
+.nav { list-style: none; padding: 0; margin: 0; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.nav button.active { background: #8883; font-weight: 600; }
+.nav .planned { display: inline-block; padding: 0.35rem 0.9rem; opacity: 0.55; border: 1px dashed #8886; border-radius: 6px; }
+.identity { border: 1px solid #8886; border-radius: 8px; padding: 0.8rem 1rem; }
+.identity h2 { font-size: 1.05rem; margin: 0 0 0.5rem; overflow-wrap: anywhere; }

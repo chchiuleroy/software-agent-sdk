@@ -1,8 +1,10 @@
-// Approvals inbox (served by central-governance-api at GET /inbox).
+// OHS console (served by central-governance-api at GET /inbox).
 //
 // Logs in with Authorization Code + PKCE against the Keycloak realm, keeps the
-// access token in memory only, lists the requests this approver may decide
-// (GET /api/v1/approvals/pending) and sends the decision
+// access token in memory only, shows who is signed in (GET /api/v1/me) and
+// opens only the sections that account's roles allow (see SECTIONS). The first
+// live section is the approvals inbox: it lists the requests this approver may
+// decide (GET /api/v1/approvals/pending) and sends the decision
 // (POST /api/v1/approvals/{id}/decide).
 //
 // The content of a request (commands, paths, the agent's own summary) is
@@ -139,6 +141,87 @@ export function describeItem(item) {
   };
 }
 
+// ------------------------------------------------------------ console sections
+// One declarative table says which part of the page each kind of account may
+// see. It only decides what is SHOWN: authorization is the bearer token on the
+// API calls behind each section, so hiding a section here is a convenience,
+// never a security control.
+//
+// The roles are deliberately separate, not a hierarchy: governance.superadmin
+// is not a superset of agent.approver, and governance.admin unlocks nothing
+// here. "planned" sections have no page yet and are shown inert.
+
+export const SECTIONS = [
+  { id: "profile", title: "Profile", audience: "user", requiredRoles: [], status: "live" },
+  {
+    id: "approvals",
+    title: "Approvals",
+    audience: "approver",
+    requiredRoles: ["agent.approver"],
+    status: "live",
+  },
+  ...[
+    ["accounts", "Account requests"],
+    ["departments", "Departments"],
+    ["tool-permissions", "Tool permissions"],
+    ["awaiting-signin", "Awaiting first sign-in"],
+    ["devices", "Devices"],
+  ].map(([id, title]) => ({
+    id,
+    title,
+    audience: "superadmin",
+    requiredRoles: ["governance.superadmin"],
+    status: "planned",
+  })),
+];
+
+export function visibleSections(roles) {
+  const held = Array.isArray(roles) ? roles : [];
+  return SECTIONS.filter(
+    (section) =>
+      section.requiredRoles.length === 0 ||
+      section.requiredRoles.some((role) => held.includes(role)),
+  );
+}
+
+// Which section to open for a location hash. A link to a section the account
+// may not use (or that has no page yet) lands on the profile and says so; a
+// hash that names nothing falls back to the account's natural home.
+export function resolveSection(hash, roles) {
+  const wanted = String(hash ?? "").replace(/^#/, "");
+  const usable = visibleSections(roles).find(
+    (section) => section.id === wanted && section.status === "live",
+  );
+  if (usable) return { id: usable.id, denied: false };
+  if (wanted && SECTIONS.some((section) => section.id === wanted)) {
+    return { id: "profile", denied: true };
+  }
+  const home = (Array.isArray(roles) ? roles : []).includes("agent.approver")
+    ? "approvals"
+    : "profile";
+  return { id: home, denied: false };
+}
+
+// What the profile card shows, from GET /api/v1/me. Says what is missing
+// instead of leaving a blank.
+export function describeIdentity(me) {
+  const email = me.email ? truncate(me.email) : "(no e-mail on this account)";
+  return {
+    name: truncate(me.display_name ?? ""),
+    email,
+    emailNote:
+      me.email && !me.email_verified
+        ? "Not verified by the identity provider."
+        : null,
+    roles: (Array.isArray(me.roles) ? me.roles : [])
+      .map((role) => truncate(role, 80))
+      .sort(),
+    department: me.membership
+      ? truncate(me.membership.department_name)
+      : "No department yet. An administrator has to approve your application, then sign in with the approved e-mail.",
+  };
+}
+
 // ------------------------------------------------------------------- rendering
 // `doc` is a Document (or a test double): no innerHTML, only text nodes.
 
@@ -195,12 +278,59 @@ export function renderItem(doc, item, nowMs, onDecide) {
   return li;
 }
 
+export function renderIdentity(doc, view) {
+  const card = el(doc, "div", undefined, "identity");
+  card.appendChild(el(doc, "h2", view.name));
+  const facts = el(doc, "dl");
+  const rows = [
+    ["E-mail", view.emailNote ? `${view.email} (${view.emailNote})` : view.email],
+    [
+      "Roles",
+      view.roles.length > 0
+        ? view.roles.join(", ")
+        : "(none) If you were just given a role, sign out and sign in again.",
+    ],
+    ["Department", view.department],
+  ];
+  for (const [label, value] of rows) {
+    facts.appendChild(el(doc, "dt", label));
+    facts.appendChild(el(doc, "dd", value));
+  }
+  card.appendChild(facts);
+  return card;
+}
+
+export function renderNav(doc, sections, activeId, onSelect) {
+  const list = el(doc, "ul", undefined, "nav");
+  for (const section of sections) {
+    const item = el(doc, "li");
+    if (section.status === "live") {
+      const button = el(
+        doc,
+        "button",
+        section.title,
+        section.id === activeId ? "active" : "",
+      );
+      button.type = "button";
+      button.addEventListener("click", () => onSelect(section.id));
+      item.appendChild(button);
+    } else {
+      item.appendChild(el(doc, "span", `${section.title} (coming soon)`, "planned"));
+    }
+    list.appendChild(item);
+  }
+  return list;
+}
+
 // --------------------------------------------------------------------- browser
 
 async function main() {
   const statusEl = document.getElementById("status");
   const loginEl = document.getElementById("login");
   const listEl = document.getElementById("list");
+  const navEl = document.getElementById("nav");
+  const profileEl = document.getElementById("profile");
+  const approvalsEl = document.getElementById("approvals");
   const whoEl = document.getElementById("who");
   const signoutEl = document.getElementById("signout");
   const say = (message) => {
@@ -232,9 +362,20 @@ async function main() {
   let expiresAtMs = 0;
   const idempotencyKeys = new Map();
 
+  // The roles GET /api/v1/me reported for this session (the server's view, not
+  // a guess from the token) and the section currently open.
+  let roles = [];
+  let active = "profile";
+
   function signOut(message) {
     token = null;
+    roles = [];
     listEl.replaceChildren();
+    navEl.replaceChildren();
+    navEl.hidden = true;
+    profileEl.replaceChildren();
+    profileEl.hidden = true;
+    approvalsEl.hidden = true;
     whoEl.textContent = "";
     signoutEl.hidden = true;
     loginEl.hidden = false;
@@ -288,6 +429,41 @@ async function main() {
       throw new Error("unauthorized");
     }
     return response;
+  }
+
+  // False when the profile could not be loaded; the page then shows only the
+  // reason and the sign-out button.
+  async function loadMe() {
+    let response;
+    try {
+      response = await api("/api/v1/me");
+    } catch {
+      if (token) say("Could not reach the server.");
+      return false;
+    }
+    if (!response.ok) {
+      say(`Could not load your profile (HTTP ${response.status}).`);
+      return false;
+    }
+    const me = await response.json();
+    roles = Array.isArray(me.roles) ? me.roles.map(String) : [];
+    profileEl.replaceChildren(renderIdentity(document, describeIdentity(me)));
+    return true;
+  }
+
+  function showSection() {
+    if (!token) return;
+    const { id, denied } = resolveSection(location.hash, roles);
+    active = id;
+    navEl.replaceChildren(
+      renderNav(document, visibleSections(roles), active, (target) => {
+        location.hash = target;
+      }),
+    );
+    profileEl.hidden = id !== "profile";
+    approvalsEl.hidden = id !== "approvals";
+    say(denied ? "That page is not available for your account." : "");
+    if (id === "approvals") refresh();
   }
 
   async function refresh() {
@@ -396,13 +572,17 @@ async function main() {
     );
     signoutEl.hidden = false;
     loginEl.hidden = true;
-    await refresh();
-    setInterval(() => {
-      if (!document.hidden) refresh();
-    }, REFRESH_MS);
+    if (await loadMe()) {
+      navEl.hidden = false;
+      showSection();
+      globalThis.addEventListener("hashchange", showSection);
+      setInterval(() => {
+        if (!document.hidden && active === "approvals") refresh();
+      }, REFRESH_MS);
+    }
   } else {
     loginEl.hidden = false;
-    if (!statusEl.textContent) say("Sign in to see the requests waiting for you.");
+    if (!statusEl.textContent) say("Sign in to continue.");
   }
 }
 

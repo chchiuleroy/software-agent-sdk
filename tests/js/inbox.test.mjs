@@ -6,13 +6,19 @@ import {
   base64url,
   buildAuthUrl,
   decodeJwtPayload,
+  describeIdentity,
   describeItem,
   formatRemaining,
   parseCallback,
   pkceChallenge,
   randomString,
+  renderIdentity,
   renderItem,
+  renderNav,
+  resolveSection,
+  SECTIONS,
   truncate,
+  visibleSections,
 } from "../../src/central_governance_api/inbox_static/inbox.js";
 
 test("PKCE challenge matches the RFC 7636 appendix B vector", async () => {
@@ -204,4 +210,171 @@ test("the buttons report the decision for that item", () => {
     [terminalItem.id, "accept"],
     [terminalItem.id, "reject"],
   ]);
+});
+
+// ------------------------------------------------------------- console shell
+
+const ids = (sections) => sections.map((section) => section.id);
+const SUPERADMIN_IDS = [
+  "accounts",
+  "departments",
+  "tool-permissions",
+  "awaiting-signin",
+  "devices",
+];
+
+test("a signed-in account with no role only sees its own profile", () => {
+  assert.deepEqual(ids(visibleSections([])), ["profile"]);
+});
+
+test("an approver sees the approvals inbox, nothing of the admin area", () => {
+  assert.deepEqual(ids(visibleSections(["agent.approver"])), [
+    "profile",
+    "approvals",
+  ]);
+});
+
+test("superadmin gets the admin area but NOT approvals: the roles are separate", () => {
+  const sections = visibleSections(["governance.superadmin"]);
+  assert.deepEqual(ids(sections), ["profile", ...SUPERADMIN_IDS]);
+  assert.ok(sections.filter((s) => s.audience === "superadmin").length > 0);
+  assert.ok(
+    sections
+      .filter((s) => s.audience === "superadmin")
+      .every((s) => s.status === "planned"),
+    "no admin view exists yet; they must be shown as planned, not live",
+  );
+});
+
+test("governance.admin and agent.operator do not unlock the admin area", () => {
+  assert.deepEqual(
+    ids(visibleSections(["governance.admin", "agent.operator"])),
+    ["profile"],
+  );
+});
+
+test("every admin-area section needs exactly governance.superadmin", () => {
+  const admin = SECTIONS.filter((section) => section.audience === "superadmin");
+  assert.deepEqual(ids(admin), SUPERADMIN_IDS);
+  for (const section of admin) {
+    assert.deepEqual(section.requiredRoles, ["governance.superadmin"]);
+  }
+});
+
+test("the section a link points at is only honoured when it is usable", () => {
+  const approver = ["agent.approver"];
+  const superadmin = ["governance.superadmin"];
+  assert.deepEqual(resolveSection("", approver), { id: "approvals", denied: false });
+  assert.deepEqual(resolveSection("", []), { id: "profile", denied: false });
+  assert.deepEqual(resolveSection("#profile", approver), {
+    id: "profile",
+    denied: false,
+  });
+  // a deep link to something the account may not see must not reveal or open it
+  assert.deepEqual(resolveSection("#approvals", []), { id: "profile", denied: true });
+  assert.deepEqual(resolveSection("#devices", ["agent.approver"]), {
+    id: "profile",
+    denied: true,
+  });
+  // planned sections have no page yet
+  assert.deepEqual(resolveSection("#devices", superadmin), {
+    id: "profile",
+    denied: true,
+  });
+  // not a section at all
+  assert.deepEqual(resolveSection("#nonsense", approver), {
+    id: "approvals",
+    denied: false,
+  });
+});
+
+const ME = {
+  issuer: "http://kc/realms/x",
+  sub: "u1",
+  display_name: "Ada Lovelace",
+  roles: ["agent.approver", "agent.operator"],
+  email: "ada@example.com",
+  email_verified: true,
+  membership: { department_id: "d1", department_name: "Finance" },
+};
+
+test("describeIdentity says what is missing instead of leaving blanks", () => {
+  const view = describeIdentity(ME);
+  assert.equal(view.name, "Ada Lovelace");
+  assert.equal(view.email, "ada@example.com");
+  assert.equal(view.emailNote, null);
+  assert.deepEqual(view.roles, ["agent.approver", "agent.operator"]);
+  assert.equal(view.department, "Finance");
+
+  const bare = describeIdentity({
+    ...ME,
+    roles: [],
+    email: null,
+    email_verified: false,
+    membership: null,
+  });
+  assert.match(bare.department, /No department/);
+  assert.match(bare.email, /no e-mail/i);
+  assert.deepEqual(bare.roles, []);
+
+  const unverified = describeIdentity({ ...ME, email_verified: false });
+  assert.match(unverified.emailNote, /not verified/i);
+});
+
+test("describeIdentity bounds hostile or huge values", () => {
+  const huge = "x".repeat(5000);
+  const view = describeIdentity({
+    ...ME,
+    display_name: huge,
+    email: huge,
+    roles: [huge, "agent.approver"],
+    membership: { department_id: "d", department_name: huge },
+  });
+  for (const value of [view.name, view.email, view.department, view.roles[0]]) {
+    assert.ok(value.length <= 2001, `value too long: ${value.length}`);
+  }
+});
+
+test("identity and navigation render hostile values as text only", () => {
+  const hostile = '<img src=x onerror="alert(1)">';
+  const card = renderIdentity(
+    fakeDocument(),
+    describeIdentity({
+      ...ME,
+      display_name: hostile,
+      roles: [hostile],
+      membership: { department_id: "d", department_name: hostile },
+    }),
+  );
+  assert.ok(allText(card).includes(hostile));
+  const nav = renderNav(
+    fakeDocument(),
+    [{ id: "x", title: hostile, status: "live" }],
+    "x",
+    () => {},
+  );
+  assert.ok(allText(nav).includes(hostile));
+});
+
+test("live entries navigate, planned ones are labelled and inert", () => {
+  const chosen = [];
+  const nav = renderNav(
+    fakeDocument(),
+    visibleSections(["agent.approver", "governance.superadmin"]),
+    "approvals",
+    (id) => chosen.push(id),
+  );
+  const items = nav.children;
+  const byTitle = (title) =>
+    items.find((item) => allText(item).includes(title)).children[0];
+  const profile = byTitle("Profile");
+  const approvals = byTitle("Approvals");
+  const devices = byTitle("Devices");
+  profile.listeners.click();
+  approvals.listeners.click();
+  assert.deepEqual(chosen, ["profile", "approvals"]);
+  assert.match(approvals.className, /active/);
+  assert.doesNotMatch(profile.className, /active/);
+  assert.equal(devices.listeners.click, undefined, "a planned entry must not be clickable");
+  assert.match(allText(devices), /coming soon/i);
 });
