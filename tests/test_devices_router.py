@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest import mock
 
@@ -737,3 +738,188 @@ async def test_register_rejects_malformed_device_id(client, signing_key, device_
         headers=_auth(token, f"malformed-{uuid.uuid4()}"),
     )
     assert resp.status_code == 422
+
+
+# --- LIST ------------------------------------------------------------------
+
+
+async def _list(client, token: str, **params):
+    return await client.get(
+        "/api/v1/devices", params=params, headers={"Authorization": f"Bearer {token}"}
+    )
+
+
+async def test_list_returns_only_the_callers_own_devices(client, signing_key):
+    """A principal sees its own registrations and nobody else's — the same
+    "no enumeration of other owners' devices" stance revoke takes by masking
+    a non-owner as 404."""
+    alice = f"alice-{uuid.uuid4()}"
+    bob = f"bob-{uuid.uuid4()}"
+    mine = await _register(client, signing_key, sub=alice)
+    await _register(client, signing_key, sub=bob)
+
+    token = _sign(signing_key, sub=alice, roles=["agent.operator"])
+    resp = await _list(client, token)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [item["id"] for item in body["items"]] == [mine["id"]]
+    assert body["items"][0]["owner_subject"].endswith(f"#{alice}")
+    assert body["next_offset"] is None
+
+
+async def test_list_is_empty_for_a_principal_with_no_devices(client, signing_key):
+    token = _sign(signing_key, sub=f"nobody-{uuid.uuid4()}", roles=[])
+    resp = await _list(client, token)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"items": [], "next_offset": None}
+
+
+async def test_list_does_not_show_the_same_sub_from_another_issuer(
+    client, signing_key, db_session
+):
+    """Ownership is the ``(issuer, sub)`` pair, never ``sub`` alone (same rule
+    as revoke). A row owned by another issuer must stay invisible to a
+    same-``sub`` principal from the trusted issuer."""
+    sub = f"carol-{uuid.uuid4()}"
+    db_session.add(
+        DeviceRegistration(
+            owner_issuer="https://keycloak.example.invalid/realms/other-tenant",
+            owner_sub=sub,
+            device_id=f"foreign-{uuid.uuid4()}",
+        )
+    )
+    await db_session.flush()
+
+    token = _sign(signing_key, sub=sub, roles=["agent.operator"])
+    resp = await _list(client, token)
+
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+
+
+async def test_admin_lists_every_owners_devices(client, signing_key):
+    first = await _register(client, signing_key, sub=f"u1-{uuid.uuid4()}")
+    second = await _register(client, signing_key, sub=f"u2-{uuid.uuid4()}")
+
+    admin_token = _sign(signing_key, sub="dave", roles=["governance.admin"])
+    resp = await _list(client, admin_token, limit=200)
+
+    assert resp.status_code == 200, resp.text
+    ids = {item["id"] for item in resp.json()["items"]}
+    assert {first["id"], second["id"]} <= ids
+
+
+async def test_list_reports_who_revoked_a_device_and_can_hide_revoked_ones(
+    client, signing_key
+):
+    owner = f"erin-{uuid.uuid4()}"
+    kept = await _register(client, signing_key, sub=owner)
+    gone = await _register(client, signing_key, sub=owner)
+    owner_token = _sign(signing_key, sub=owner, roles=["agent.operator"])
+    admin_token = _sign(signing_key, sub="dave", roles=["governance.admin"])
+    assert (
+        await _revoke(client, admin_token, gone["id"], "revoke-list-1")
+    ).status_code == 200
+
+    everything = {
+        item["id"]: item for item in (await _list(client, owner_token)).json()["items"]
+    }
+    assert set(everything) == {kept["id"], gone["id"]}
+    assert everything[kept["id"]]["revoked_at"] is None
+    assert everything[kept["id"]]["revoked_by_subject"] is None
+    assert everything[gone["id"]]["revoked_at"] is not None
+    # Revoked by the admin, not by the owner who is looking.
+    assert everything[gone["id"]]["revoked_by_subject"].endswith("#dave")
+
+    active_only = (await _list(client, owner_token, include_revoked=False)).json()
+    assert [item["id"] for item in active_only["items"]] == [kept["id"]]
+
+
+async def test_list_is_newest_first_and_pages_without_overlap(
+    client, signing_key, db_session
+):
+    """Rows are inserted with explicit registration times: inside one test
+    transaction the database clock does not advance, so registering through
+    the API could not tell a real ordering from an arbitrary one."""
+    owner = f"frank-{uuid.uuid4()}"
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    oldest, middle, newest = (
+        DeviceRegistration(
+            owner_issuer=ISSUER,
+            owner_sub=owner,
+            device_id=f"dev-{i}",
+            registered_at=base + timedelta(days=i),
+        )
+        for i in range(3)
+    )
+    db_session.add_all([middle, oldest, newest])
+    await db_session.flush()
+
+    token = _sign(signing_key, sub=owner, roles=["agent.operator"])
+    # One row per page, so each page's next_offset is checked at a non-zero
+    # offset too (``offset + limit``, not just ``limit``).
+    page1 = (await _list(client, token, limit=1)).json()
+    page2 = (await _list(client, token, limit=1, offset=page1["next_offset"])).json()
+    page3 = (await _list(client, token, limit=1, offset=page2["next_offset"])).json()
+
+    assert [i["id"] for i in page1["items"]] == [str(newest.id)]
+    assert page1["next_offset"] == 1
+    assert [i["id"] for i in page2["items"]] == [str(middle.id)]
+    assert page2["next_offset"] == 2
+    assert [i["id"] for i in page3["items"]] == [str(oldest.id)]
+    assert page3["next_offset"] is None
+
+
+async def test_list_orders_rows_with_the_same_registration_time_by_id(
+    client, signing_key, db_session
+):
+    """Same ``registered_at`` happens in practice (a batch of registrations in
+    one transaction). Without the ``id`` tie-break the order, and so the pages,
+    would be arbitrary and could repeat or skip a row between pages."""
+    owner = f"gina-{uuid.uuid4()}"
+    stamp = datetime(2026, 2, 1, tzinfo=UTC)
+    rows = [
+        DeviceRegistration(
+            owner_issuer=ISSUER,
+            owner_sub=owner,
+            device_id=f"tie-{i}",
+            registered_at=stamp,
+        )
+        for i in range(4)
+    ]
+    db_session.add_all(rows)
+    await db_session.flush()
+
+    token = _sign(signing_key, sub=owner, roles=["agent.operator"])
+    body = (await _list(client, token)).json()
+
+    assert [i["id"] for i in body["items"]] == sorted(
+        (str(r.id) for r in rows), reverse=True
+    )
+
+
+async def test_list_offset_past_the_end_is_an_empty_last_page(client, signing_key):
+    await _register(client, signing_key, sub=(owner := f"hank-{uuid.uuid4()}"))
+    token = _sign(signing_key, sub=owner, roles=["agent.operator"])
+
+    resp = await _list(client, token, offset=50)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"items": [], "next_offset": None}
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{"limit": 0}, {"limit": 201}, {"offset": -1}],
+    ids=["limit-zero", "limit-too-large", "negative-offset"],
+)
+async def test_list_rejects_out_of_range_paging(client, signing_key, params):
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    resp = await _list(client, token, **params)
+    assert resp.status_code == 422
+
+
+async def test_list_requires_authentication(client):
+    resp = await client.get("/api/v1/devices")
+    assert resp.status_code == 401

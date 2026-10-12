@@ -124,6 +124,12 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
   代替誰執行任何動作）。成功後同一交易內寫入 `DeviceDenylistEntry`（防止
   同一 `(owner, device_id)` 之後偷偷用 register 復活）+ `AdminAuditEvent`
   （`event_type="device_revoked"`）
+- `GET /api/v1/devices`（裝置清冊列表，2026-10-12）：任何已驗證身份只看到自己
+  擁有的註冊（擁有者以 `(issuer, sub)` 成對比對，不只看 `sub`），
+  `governance.admin` 看全部。`include_revoked`（預設 true，因為已撤銷的裝置
+  仍計入註冊配額）、`limit` 1–200（預設 50）、`offset`，新到舊排序，多取
+  1 筆判斷 `next_offset`；offset 分頁的「新資料進來時頁面會位移」限制與稽核
+  端點相同。回傳含 `revoked_at`／`revoked_by_subject`
 - `GET /api/v1/audit-events`：`governance.admin` 限定，支援
   `event_type`／`approval_request_id` 篩選 + offset/limit 分頁（多取 1
   筆判斷 `next_offset`，不用額外 `COUNT(*)`）
