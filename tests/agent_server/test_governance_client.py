@@ -136,6 +136,57 @@ async def test_record_not_terminal_is_its_own_type():
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_finding_sends_the_attempt_id_only_when_given():
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        bodies.append(json.loads(request.content))
+        return httpx.Response(201, json={"id": "f1"})
+
+    client = _make_client(handler)
+    await client.reconciliation_finding(
+        "a1",
+        idempotency_key="k1",
+        finding_type="late_report",
+        conclusion="inconclusive",
+        note="n",
+        execution_attempt_id="attempt-1",
+    )
+    await client.reconciliation_finding(
+        "a1", idempotency_key="k2", finding_type="requester_assertion"
+    )
+
+    # central rejects an attempt id on any finding type but late_report, so
+    # it must be absent (not null) when the caller has none.
+    assert bodies[0]["execution_attempt_id"] == "attempt-1"
+    assert "execution_attempt_id" not in bodies[1]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_late_report_not_applicable_is_permanent():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        return httpx.Response(
+            409, json={"error_code": "late_report_not_applicable", "detail": "x"}
+        )
+
+    client = _make_client(handler)
+    with pytest.raises(GovernancePermanentError) as exc_info:
+        await client.reconciliation_finding(
+            "a1",
+            idempotency_key="k1",
+            finding_type="late_report",
+            execution_attempt_id="attempt-1",
+        )
+    assert exc_info.value.error_code == "late_report_not_applicable"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_authorization_denied_is_permanent():
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == "http://keycloak.example/token":

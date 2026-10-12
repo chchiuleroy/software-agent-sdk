@@ -276,6 +276,31 @@ def _with_pending_report_outcome(record: OutboxRecord, outcome: str) -> OutboxRe
     return record
 
 
+def _advance_only_from(
+    expected: OutboxState, new_state: OutboxState
+) -> Callable[[OutboxRecord], OutboxRecord]:
+    """A ``GovernanceOutbox.mutate`` function that moves the record to
+    ``new_state`` only if it is still in ``expected``; otherwise it only bumps
+    the retry bookkeeping. The outbox lock serialises single mutations, not a
+    whole read-status-then-send workflow, so a slower caller must not drag a
+    record that another caller already advanced back to an earlier state."""
+
+    def _apply(record: OutboxRecord) -> OutboxRecord:
+        return record_attempt(
+            record, new_state=new_state if record.state == expected else None
+        )
+
+    return _apply
+
+
+def _late_report_conclusion(outcome: str) -> str:
+    """The ``conclusion`` a late_report carries for a device outcome. Only a
+    success confirms that the action ran. A definite failure does not prove
+    nothing happened (it may have had partial side effects), so it is
+    inconclusive, like an unknown outcome."""
+    return "confirmed_executed" if outcome == "success" else "inconclusive"
+
+
 def _classify_governed_action_outcome(
     action_event_id: str, tool_call_id: str | None, events: Sequence[Event]
 ) -> str | None:
@@ -820,7 +845,9 @@ class EventService:
                 await self.governance_outbox.mutate(
                     lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
                 )
-            except GovernancePermanentError:
+            except GovernancePermanentError as exc:
+                if await self._fall_back_to_late_report(record, exc):
+                    return
                 logger.exception(
                     "outbox relay: report-result permanently failed for "
                     "approval %s",
@@ -839,12 +866,111 @@ class EventService:
                 await self.governance_outbox.mutate(record_attempt)
             return
 
-        # RECONCILIATION_PENDING: no code path writes this state yet (the
-        # reconciliation-findings flow is not wired up in this MVP slice —
-        # see the wiki's "Phase E" gap list), so there is nothing to relay
-        # for it. Included in RETRIABLE_STATES for forward-compatibility
-        # with that future work, not because this branch is reachable
-        # today.
+        if record.state == OutboxState.RECONCILIATION_PENDING:
+            # Entered by _fall_back_to_late_report() when central had already
+            # failed the attempt closed; only the late_report finding is
+            # still outstanding.
+            await self._send_late_report(record)
+            return
+
+    async def _fall_back_to_late_report(
+        self, record: OutboxRecord, exc: GovernancePermanentError
+    ) -> bool:
+        """Called when report-result for an execution result was refused.
+
+        Central refuses with ``illegal_transition`` when the approval is no
+        longer EXECUTING. If it is ``failed_unknown`` (the execution lease
+        lapsed and the sweep failed the attempt closed) this device still
+        holds the real outcome, which would otherwise be left behind in
+        NEEDS_ATTENTION: file it as a ``late_report`` finding instead. Any
+        other refusal, or any other central status (cancelled, expired ...),
+        is not this case.
+
+        Returns True when this method has decided what happens to the record
+        next (late report filed or pending, or left retriable because
+        central's status could not be read); False when the caller should
+        treat the refusal as before (NEEDS_ATTENTION).
+        """
+        if exc.error_code != "illegal_transition":
+            return False
+        client = self.governance_client
+        if client is None or record.central_approval_id is None:
+            return False
+        try:
+            # known_status is what the device last knew: a record that has
+            # since moved on (to failed_unknown) answers immediately.
+            answer = await client.wait(
+                record.central_approval_id, known_status="executing", timeout_seconds=1
+            )
+        except Exception:
+            logger.warning(
+                "could not read central status for approval %s after a "
+                "refused report-result; will retry via outbox relay",
+                record.central_approval_id,
+                exc_info=True,
+            )
+            await self.governance_outbox.mutate(record_attempt)
+            return True
+        if answer.get("status") != "failed_unknown":
+            return False
+        updated = await self.governance_outbox.mutate(
+            _advance_only_from(
+                OutboxState.RESULT_PENDING, OutboxState.RECONCILIATION_PENDING
+            )
+        )
+        if updated.state != OutboxState.RECONCILIATION_PENDING:
+            # Another fallback already finished (or otherwise settled) this
+            # record while this one was reading central's status.
+            return True
+        await self._send_late_report(updated)
+        return True
+
+    async def _send_late_report(self, record: OutboxRecord) -> None:
+        """Files the outcome persisted in ``pending_report_outcome`` as a
+        ``late_report`` finding. Same idempotency key on every retry; the
+        finding is evidence only and never changes the approval's status."""
+        client = self.governance_client
+        if client is None:
+            return
+        assert record.central_approval_id is not None
+        assert record.execution_attempt_id is not None
+        assert record.pending_report_outcome is not None
+        outcome = record.pending_report_outcome
+        try:
+            await client.reconciliation_finding(
+                record.central_approval_id,
+                idempotency_key=f"late-{record.execution_attempt_id}",
+                finding_type="late_report",
+                conclusion=_late_report_conclusion(outcome),
+                note=(
+                    f"device outcome: {outcome}; central had already failed "
+                    "this attempt closed (failed_unknown)"
+                ),
+                execution_attempt_id=record.execution_attempt_id,
+            )
+            await self.governance_outbox.mutate(
+                _advance_only_from(
+                    OutboxState.RECONCILIATION_PENDING,
+                    OutboxState.RECONCILIATION_REPORTED,
+                )
+            )
+        except GovernancePermanentError:
+            logger.exception(
+                "late_report permanently refused for approval %s",
+                record.central_approval_id,
+            )
+            await self.governance_outbox.mutate(
+                _advance_only_from(
+                    OutboxState.RECONCILIATION_PENDING, OutboxState.NEEDS_ATTENTION
+                )
+            )
+        except Exception:
+            logger.warning(
+                "late_report for approval %s failed, will retry via outbox relay",
+                record.central_approval_id,
+                exc_info=True,
+            )
+            await self.governance_outbox.mutate(record_attempt)
 
     def _ensure_wait_for_decision_task(self, central_approval_id: str) -> None:
         """Starts _wait_for_decision_loop() if one isn't already running
@@ -2515,7 +2641,9 @@ class EventService:
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
             )
-        except GovernancePermanentError:
+        except GovernancePermanentError as exc:
+            if await self._fall_back_to_late_report(pending, exc):
+                return
             logger.exception(
                 "failed to report governed execution result for approval %s",
                 record.central_approval_id,

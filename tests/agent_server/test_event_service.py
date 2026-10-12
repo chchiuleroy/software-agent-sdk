@@ -28,10 +28,15 @@ from openhands.agent_server.event_service import (
 )
 from openhands.agent_server.governance_client import (
     GovernancePermanentError,
+    GovernanceTransientError,
     compute_display_digest,
 )
 from openhands.agent_server.governance_display import POLICY_REVISION, build_display
-from openhands.agent_server.governance_outbox import OutboxRecord, OutboxState
+from openhands.agent_server.governance_outbox import (
+    OutboxRecord,
+    OutboxState,
+    record_attempt,
+)
 from openhands.agent_server.models import (
     ConfirmationResponseRequest,
     EventPage,
@@ -6965,6 +6970,318 @@ class TestEventServiceGovernanceOrchestration:
 
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.NEEDS_ATTENTION
+
+    # ---------------- late report after central failed the attempt ----------------
+    # When the device holds the real outcome but central already moved the
+    # approval to failed_unknown (execution lease lapsed), report-result is
+    # refused with illegal_transition. That outcome must not be dropped into
+    # NEEDS_ATTENTION: it is filed as a late_report finding instead.
+
+    @staticmethod
+    def _illegal_transition() -> GovernancePermanentError:
+        return GovernancePermanentError(
+            "approval is failed_unknown",
+            error_code="illegal_transition",
+            status_code=409,
+        )
+
+    async def _result_pending(self, governed_service, outcome: str) -> None:
+        await self._create_outbox_record(
+            governed_service, state=OutboxState.RESULT_PENDING
+        )
+
+        def _set(r: OutboxRecord) -> OutboxRecord:
+            r.execution_attempt_id = "attempt-1"
+            return _with_pending_report_outcome(r, outcome)
+
+        await governed_service.governance_outbox.mutate(_set)
+
+    @staticmethod
+    def _late_client(*, status: str | Exception = "failed_unknown", finding=None):
+        client = MagicMock()
+        client.report_result = AsyncMock()  # each test sets the refusal it needs
+        if isinstance(status, Exception):
+            client.wait = AsyncMock(side_effect=status)
+        else:
+            client.wait = AsyncMock(
+                return_value={"id": "approval-1", "status": status, "changed": True}
+            )
+        client.reconciliation_finding = AsyncMock(
+            return_value={"id": "finding-1"} if finding is None else None,
+            side_effect=finding,
+        )
+        return client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "conclusion"),
+        [
+            ("success", "confirmed_executed"),
+            # Conservative: a definite failure does not prove nothing ran
+            # (partial side effects), so only a success is "confirmed".
+            ("failure_definite", "inconclusive"),
+            ("failure_unknown", "inconclusive"),
+        ],
+    )
+    async def test_relay_files_a_late_report_when_central_already_failed_the_attempt(
+        self, governed_service, outcome, conclusion
+    ):
+        await self._result_pending(governed_service, outcome)
+        client = self._late_client()
+        client.report_result = AsyncMock(side_effect=self._illegal_transition())
+        governed_service.governance_client = client
+
+        await governed_service._relay_outbox_once()
+
+        # Central's status is read with the status the device last knew, so
+        # a record that already moved on answers immediately.
+        _, wait_kwargs = client.wait.call_args
+        assert wait_kwargs["known_status"] == "executing"
+        client.reconciliation_finding.assert_awaited_once()
+        args, kwargs = client.reconciliation_finding.call_args
+        assert args == ("approval-1",)
+        assert kwargs["finding_type"] == "late_report"
+        assert kwargs["conclusion"] == conclusion
+        assert kwargs["execution_attempt_id"] == "attempt-1"
+        assert kwargs["idempotency_key"] == "late-attempt-1"
+        assert outcome in kwargs["note"]
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RECONCILIATION_REPORTED
+        )
+
+    @pytest.mark.asyncio
+    async def test_relay_does_not_late_report_when_central_status_is_not_failed_unknown(
+        self, governed_service
+    ):
+        """illegal_transition also happens for cancelled/expired records; a
+        late_report would be refused there, and the outcome would be filed
+        as evidence about the wrong thing. Those stay NEEDS_ATTENTION."""
+        await self._result_pending(governed_service, "success")
+        client = self._late_client(status="cancelled")
+        client.report_result = AsyncMock(side_effect=self._illegal_transition())
+        governed_service.governance_client = client
+
+        await governed_service._relay_outbox_once()
+
+        client.reconciliation_finding.assert_not_awaited()
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.NEEDS_ATTENTION
+        )
+
+    @pytest.mark.asyncio
+    async def test_relay_keeps_retrying_when_central_status_cannot_be_read(
+        self, governed_service
+    ):
+        """If /wait fails we do not know whether this is failed_unknown, so
+        the record must stay retriable rather than be given up on."""
+        await self._result_pending(governed_service, "success")
+        client = self._late_client(
+            status=GovernanceTransientError(
+                "network", error_code=None, status_code=None
+            )
+        )
+        client.report_result = AsyncMock(side_effect=self._illegal_transition())
+        governed_service.governance_client = client
+
+        await governed_service._relay_outbox_once()
+
+        client.reconciliation_finding.assert_not_awaited()
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RESULT_PENDING
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_permanent_report_errors_do_not_go_through_late_report(
+        self, governed_service
+    ):
+        await self._result_pending(governed_service, "success")
+        client = self._late_client()
+        client.report_result = AsyncMock(
+            side_effect=GovernancePermanentError(
+                "bad", error_code="execution_attempt_mismatch", status_code=409
+            )
+        )
+        governed_service.governance_client = client
+
+        await governed_service._relay_outbox_once()
+
+        client.wait.assert_not_awaited()
+        client.reconciliation_finding.assert_not_awaited()
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.NEEDS_ATTENTION
+        )
+
+    @pytest.mark.asyncio
+    async def test_late_report_is_retried_from_reconciliation_pending(
+        self, governed_service
+    ):
+        """The first send fails transiently: the record must sit in
+        RECONCILIATION_PENDING (so the relay retries it) and the next cycle
+        must send the same finding without re-reporting or re-reading status."""
+        await self._result_pending(governed_service, "success")
+        client = self._late_client(finding=RuntimeError("network down"))
+        client.report_result = AsyncMock(side_effect=self._illegal_transition())
+        governed_service.governance_client = client
+
+        await governed_service._relay_outbox_once()
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RECONCILIATION_PENDING
+        )
+
+        client.reconciliation_finding = AsyncMock(return_value={"id": "finding-1"})
+        await governed_service._relay_outbox_once()
+
+        assert client.report_result.await_count == 1
+        assert client.wait.await_count == 1
+        client.reconciliation_finding.assert_awaited_once()
+        _, kwargs = client.reconciliation_finding.call_args
+        assert kwargs["conclusion"] == "confirmed_executed"
+        assert kwargs["idempotency_key"] == "late-attempt-1"
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RECONCILIATION_REPORTED
+        )
+
+    @pytest.mark.asyncio
+    async def test_late_report_permanent_refusal_marks_needs_attention(
+        self, governed_service
+    ):
+        await self._result_pending(governed_service, "success")
+        client = self._late_client(
+            finding=GovernancePermanentError(
+                "no", error_code="late_report_not_applicable", status_code=409
+            )
+        )
+        client.report_result = AsyncMock(side_effect=self._illegal_transition())
+        governed_service.governance_client = client
+
+        await governed_service._relay_outbox_once()
+
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.NEEDS_ATTENTION
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fallbacks_do_not_move_a_finished_record_backwards(
+        self, governed_service
+    ):
+        """The inline path and the relay can both get a refused report for
+        the same attempt and both fall back. The outbox lock only serialises
+        each single mutate(), not the whole fallback, so the slower call must
+        not write the record back to RECONCILIATION_PENDING after the faster
+        one already finished it (found by review)."""
+        await self._result_pending(governed_service, "success")
+        record = governed_service.governance_outbox.load()
+        client = self._late_client()
+        governed_service.governance_client = client
+
+        slower_may_continue = asyncio.Event()
+        wait_calls = 0
+
+        async def _wait(*_args, **_kwargs):
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 2:
+                await slower_may_continue.wait()
+            return {"id": "approval-1", "status": "failed_unknown", "changed": True}
+
+        client.wait = AsyncMock(side_effect=_wait)
+
+        seen: list[OutboxState] = []
+        real_mutate = governed_service.governance_outbox.mutate
+
+        async def _recording_mutate(fn):
+            updated = await real_mutate(fn)
+            seen.append(updated.state)
+            return updated
+
+        governed_service.governance_outbox.mutate = _recording_mutate
+
+        refusal = self._illegal_transition()
+        first = asyncio.create_task(
+            governed_service._fall_back_to_late_report(record, refusal)
+        )
+        second = asyncio.create_task(
+            governed_service._fall_back_to_late_report(record, refusal)
+        )
+        # Let whichever gets to the finish first complete end to end while the
+        # other is still parked reading central's status, then release it.
+        while not (first.done() or second.done()):
+            await asyncio.sleep(0)
+        slower_may_continue.set()
+        assert await asyncio.gather(first, second) == [True, True]
+
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RECONCILIATION_REPORTED
+        )
+        finished_at = seen.index(OutboxState.RECONCILIATION_REPORTED)
+        assert OutboxState.RECONCILIATION_PENDING not in seen[finished_at + 1 :]
+        client.reconciliation_finding.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_stale_late_report_does_not_overwrite_a_finished_record(
+        self, governed_service
+    ):
+        """A relay cycle that loaded RECONCILIATION_PENDING before another
+        call finished the record must not turn it into NEEDS_ATTENTION when
+        its own (now redundant) send is refused."""
+        await self._result_pending(governed_service, "success")
+        stale = await governed_service.governance_outbox.mutate(
+            lambda r: record_attempt(r, new_state=OutboxState.RECONCILIATION_PENDING)
+        )
+        await governed_service.governance_outbox.mutate(
+            lambda r: record_attempt(r, new_state=OutboxState.RECONCILIATION_REPORTED)
+        )
+        client = self._late_client(
+            finding=GovernancePermanentError(
+                "no", error_code="late_report_not_applicable", status_code=409
+            )
+        )
+        governed_service.governance_client = client
+
+        await governed_service._send_late_report(stale)
+
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RECONCILIATION_REPORTED
+        )
+
+    @pytest.mark.asyncio
+    async def test_inline_report_also_files_a_late_report(self, governed_service):
+        """The same refusal can arrive on the first (inline) report, not only
+        on a relay retry."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=False),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+        client = self._late_client()
+        client.report_result = AsyncMock(side_effect=self._illegal_transition())
+        governed_service.governance_client = client
+
+
+        await governed_service.maybe_report_governance_result()
+
+        client.reconciliation_finding.assert_awaited_once()
+        _, kwargs = client.reconciliation_finding.call_args
+        assert kwargs["conclusion"] == "confirmed_executed"
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RECONCILIATION_REPORTED
+        )
 
     @pytest.mark.asyncio
     async def test_start_creates_outbox_relay_task_in_team_mode(
