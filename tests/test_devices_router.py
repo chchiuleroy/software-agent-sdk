@@ -617,6 +617,36 @@ async def test_revoke_by_admin_on_someone_elses_device_succeeds(client, signing_
     assert resp.json()["revoked_by_subject"].endswith("#dave")
 
 
+async def test_revoke_by_superadmin_on_someone_elses_device_succeeds_and_is_audited(
+    client, signing_key, db_session
+):
+    """governance.superadmin got the device screen in the console, so it may
+    revoke any registration like governance.admin; the audit event must name
+    the actor, or the kill switch would be anonymous."""
+    body = await _register(client, signing_key, sub="alice")
+    token = _sign(signing_key, sub="root", roles=["governance.superadmin"])
+    resp = await _revoke(client, token, body["id"], "revoke-superadmin")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["revoked_by_subject"].endswith("#root")
+    audit = await db_session.scalar(
+        select(AdminAuditEvent).where(
+            AdminAuditEvent.origin_device_id == body["device_id"],
+            AdminAuditEvent.event_type == "device_revoked",
+        )
+    )
+    assert audit is not None and audit.actor_sub == "root"
+
+
+async def test_revoke_by_approver_is_still_masked_as_404(client, signing_key):
+    """Only the two admin roles widen revoke; agent.approver (the role that
+    decides approvals) must not become a device kill switch by accident."""
+    body = await _register(client, signing_key, sub="alice")
+    token = _sign(signing_key, sub="bob", roles=["agent.approver"])
+    resp = await _revoke(client, token, body["id"], "revoke-approver")
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "device_not_found"
+
+
 async def test_revoke_by_non_owner_non_admin_is_masked_as_404(client, signing_key):
     """Code-review Low: a non-owner, non-admin caller must not be able to
     tell "this registration doesn't exist" apart from "it exists but
@@ -808,6 +838,31 @@ async def test_admin_lists_every_owners_devices(client, signing_key):
     assert resp.status_code == 200, resp.text
     ids = {item["id"] for item in resp.json()["items"]}
     assert {first["id"], second["id"]} <= ids
+
+
+async def test_superadmin_lists_every_owners_devices(client, signing_key):
+    first = await _register(client, signing_key, sub=f"u1-{uuid.uuid4()}")
+    second = await _register(client, signing_key, sub=f"u2-{uuid.uuid4()}")
+
+    token = _sign(signing_key, sub="root", roles=["governance.superadmin"])
+    resp = await _list(client, token, limit=200)
+
+    assert resp.status_code == 200, resp.text
+    ids = {item["id"] for item in resp.json()["items"]}
+    assert {first["id"], second["id"]} <= ids
+
+
+async def test_approver_lists_only_its_own_devices(client, signing_key):
+    """Same reason as the revoke case: agent.approver does not widen the list."""
+    other = await _register(client, signing_key, sub=f"u1-{uuid.uuid4()}")
+    mine = await _register(client, signing_key, sub="bob-approver")
+
+    token = _sign(signing_key, sub="bob-approver", roles=["agent.approver"])
+    resp = await _list(client, token, limit=200)
+
+    assert resp.status_code == 200, resp.text
+    ids = {item["id"] for item in resp.json()["items"]}
+    assert mine["id"] in ids and other["id"] not in ids
 
 
 async def test_list_reports_who_revoked_a_device_and_can_hide_revoked_ones(

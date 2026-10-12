@@ -112,13 +112,24 @@ def _quota_lock_key(issuer: str, sub: str) -> int:
     return int.from_bytes(digest, byteorder="big", signed=True)
 
 
+# Roles that may list every owner's registrations and revoke any of them, in
+# addition to the owner. ``governance.superadmin`` was added (2026-10-12) for
+# the console's Devices screen; it is NOT a superset of ``governance.admin``
+# anywhere else (see ``auth/oidc.py``) and gains nothing else from this.
+_DEVICE_ADMIN_ROLES = frozenset({"governance.admin", "governance.superadmin"})
+
+
+def _is_device_admin(principal: Principal) -> bool:
+    return not _DEVICE_ADMIN_ROLES.isdisjoint(principal.roles)
+
+
 # --- Errors (see module docstring on why these live here, not a shared module) --
 
 
 class DeviceNotFoundError(Exception):
     """Maps to HTTP 404. REVOKE also raises this — deliberately, not just
     when the registration truly doesn't exist — for a caller who is
-    neither the device's owner nor ``governance.admin``: see
+    neither the device's owner nor an admin role: see
     ``revoke_device``'s own comment on why that case is folded into "not
     found" rather than a distinguishable 403 (code-review Low: existence-
     enumeration risk).
@@ -465,9 +476,10 @@ async def list_devices(
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
 ) -> DeviceListResponse:
-    """The caller's own registrations; ``governance.admin`` sees everyone's.
+    """The caller's own registrations; ``governance.admin`` and
+    ``governance.superadmin`` see everyone's.
 
-    Same audience as revoke (owner or ``governance.admin``): a principal
+    Same audience as revoke (owner or either admin role): a principal
     that is not an admin only ever gets rows it owns, so there is nothing
     to enumerate (revoke masks a non-owner as 404 for the same reason).
     Ownership is the ``(issuer, sub)`` pair, never ``sub`` alone. A GET has
@@ -484,7 +496,7 @@ async def list_devices(
     stmt = select(DeviceRegistration).order_by(
         DeviceRegistration.registered_at.desc(), DeviceRegistration.id.desc()
     )
-    if "governance.admin" not in principal.roles:
+    if not _is_device_admin(principal):
         stmt = stmt.where(
             DeviceRegistration.owner_issuer == principal.issuer,
             DeviceRegistration.owner_sub == principal.sub,
@@ -529,9 +541,10 @@ async def revoke_device(
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_db_session),
 ) -> DeviceRevokeResponse:
-    """Owner or ``governance.admin`` may revoke — cancel's admin bypass
-    reasoning applies here too (see ``approvals/authorize.py``'s module
-    docstring, design decision 2): revoking doesn't require executing
+    """Owner, ``governance.admin`` or ``governance.superadmin`` may revoke —
+    cancel's admin bypass reasoning applies here too (see
+    ``approvals/authorize.py``'s module docstring, design decision 2):
+    revoking doesn't require executing
     anything on anyone's behalf, so admin-as-kill-switch is safe to allow.
 
     Addressed by the registration's own server-issued ``id``, not the
@@ -553,7 +566,7 @@ async def revoke_device(
         return DeviceRevokeResponse.model_validate(replayed)
 
     device = await session.get(DeviceRegistration, registration_id)
-    is_admin = "governance.admin" in principal.roles
+    is_admin = _is_device_admin(principal)
     is_owner = device is not None and (principal.issuer, principal.sub) == (
         device.owner_issuer,
         device.owner_sub,
@@ -563,7 +576,7 @@ async def revoke_device(
         # for "doesn't exist" and "exists but you're not the owner" —
         # distinguishing them would let any authenticated principal
         # enumerate the device inventory by probing IDs and reading which
-        # error comes back (403 vs 404). Only `governance.admin` or the
+        # error comes back (403 vs 404). Only an admin role or the
         # true owner ever learns whether a given registration is real.
         raise DeviceNotFoundError(identifier=resource_id)
 

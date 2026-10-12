@@ -116,17 +116,18 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
 已完成（第 2 步剩餘部分，`routers/devices.py` + `routers/audit.py`）：
 - `POST /api/v1/devices/register`：任何已驗證身份皆可自行註冊（裝置清冊
   本身不是安全控制，見 `models.DeviceRegistration` docstring，不需要角色
-  門檻），`owner_subject` 一律伺服器端塞入。`device_id` 全域唯一（非
-  per-owner），撞到既有 row（不論是否已撤銷，撤銷只是 soft-revoke，行永
-  遠佔著這個 `device_id`）回 409 `device_already_registered`
-- `POST /api/v1/devices/{registration_id}/revoke`：owner 本人或 `governance.admin`
+  門檻），`owner_subject` 一律伺服器端塞入。`device_id` 在同一個擁有者
+  名下唯一（2026-09-15 起 per-owner，見下方「devices 配額與範圍」；不同擁有者可
+  用相同字串），撞到同一擁有者的既有 row（不論是否已撤銷，撤銷只是 soft-revoke，
+  行永遠佔著這個 `device_id`）回 409 `device_already_registered`
+- `POST /api/v1/devices/{registration_id}/revoke`：owner 本人、`governance.admin` 或 `governance.superadmin`（2026-10-12 加，給 console 的 Devices 畫面）
   皆可撤銷（跟 `approvals` 的 CANCEL 同款 admin bypass 理由：撤銷不需要
   代替誰執行任何動作）。成功後同一交易內寫入 `DeviceDenylistEntry`（防止
   同一 `(owner, device_id)` 之後偷偷用 register 復活）+ `AdminAuditEvent`
   （`event_type="device_revoked"`）
 - `GET /api/v1/devices`（裝置清冊列表，2026-10-12）：任何已驗證身份只看到自己
   擁有的註冊（擁有者以 `(issuer, sub)` 成對比對，不只看 `sub`），
-  `governance.admin` 看全部。`include_revoked`（預設 true，因為已撤銷的裝置
+  `governance.admin` 與 `governance.superadmin` 看全部。`include_revoked`（預設 true，因為已撤銷的裝置
   仍計入註冊配額）、`limit` 1–200（預設 50）、`offset`，新到舊排序，多取
   1 筆判斷 `next_offset`；offset 分頁的「新資料進來時頁面會位移」限制與稽核
   端點相同。回傳含 `revoked_at`／`revoked_by_subject`
