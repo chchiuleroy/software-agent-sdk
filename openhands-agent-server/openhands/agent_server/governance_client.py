@@ -127,6 +127,7 @@ _PERMANENT_ERROR_CODES = frozenset(
         "device_quota_exceeded",
         "device_already_revoked",
         "tool_not_permitted",
+        "late_report_not_applicable",
     }
 )
 
@@ -454,15 +455,21 @@ class GovernanceClient:
         finding_type: str,
         conclusion: str | None = None,
         note: str = "",
+        execution_attempt_id: str | None = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "finding_type": finding_type,
+            "conclusion": conclusion,
+            "note": note,
+        }
+        # Central requires this for a late_report and rejects it on any other
+        # finding type, so it is left out entirely (not null) when absent.
+        if execution_attempt_id is not None:
+            body["execution_attempt_id"] = execution_attempt_id
         response = await self._request(
             "POST",
             f"/api/v1/approvals/{approval_id}/reconciliation-findings",
-            json_body={
-                "finding_type": finding_type,
-                "conclusion": conclusion,
-                "note": note,
-            },
+            json_body=body,
             idempotency_key=idempotency_key,
         )
         return response.json()
