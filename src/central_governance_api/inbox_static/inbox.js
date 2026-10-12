@@ -500,6 +500,12 @@ async function main() {
   // a guess from the token) and the section currently open.
   let roles = [];
   let active = "profile";
+  // A status line written by a request that finishes later: only if that
+  // section is still the open one and the session is still signed in, so a slow
+  // answer cannot overwrite the message of whatever the user moved on to.
+  function sayIn(sectionId, message) {
+    if (token && active === sectionId) say(message);
+  }
   // Who is signed in (issuer + sub), to mark "(you)" on the Devices screen.
   let meInfo = null;
   // The Devices screen: rows shown, where the next page starts, and a counter
@@ -666,7 +672,7 @@ async function main() {
         },
       );
     } catch {
-      if (token) say("Could not reach the server.");
+      sayIn("devices", "Could not reach the server.");
       return;
     }
     if (response.ok) {
@@ -677,9 +683,9 @@ async function main() {
       await loadDevices(true, "That device was already revoked. ");
     } else if (response.status === 404) {
       // The server answers 404 both for "no such device" and "not yours".
-      say("Not found: the device does not exist, or you may not revoke it.");
+      sayIn("devices", "Not found: the device does not exist, or you may not revoke it.");
     } else {
-      say(`The revoke was not accepted (HTTP ${response.status}).`);
+      sayIn("devices", `The revoke was not accepted (HTTP ${response.status}).`);
     }
   }
 
@@ -720,19 +726,20 @@ async function main() {
       return;
     }
     if (response.status === 403) {
-      say("This account is not allowed to decide approvals (needs the agent.approver role).");
+      sayIn("approvals", "This account is not allowed to decide approvals (needs the agent.approver role).");
       listEl.replaceChildren();
       return;
     }
     if (!response.ok) {
-      say(`Could not load requests (HTTP ${response.status}).`);
+      sayIn("approvals", `Could not load requests (HTTP ${response.status}).`);
       return;
     }
     const body = await response.json();
     listEl.replaceChildren(
       ...body.items.map((item) => renderItem(document, item, Date.now(), decide)),
     );
-    say(
+    sayIn(
+      "approvals",
       body.items.length === 0
         ? "Nothing is waiting for you."
         : `${body.items.length} request(s) waiting${body.has_more ? " (showing the oldest)" : ""}.`,
@@ -771,13 +778,13 @@ async function main() {
     }
     if (response.ok) {
       idempotencyKeys.delete(keyId);
-      say(decision === "accept" ? "Approved." : "Rejected.");
+      sayIn("approvals", decision === "accept" ? "Approved." : "Rejected.");
     } else if (response.status === 403) {
-      say("Not allowed: you cannot decide your own request, or lack the approver role.");
+      sayIn("approvals", "Not allowed: you cannot decide your own request, or lack the approver role.");
     } else if (response.status === 409) {
-      say("That request was already decided or has expired.");
+      sayIn("approvals", "That request was already decided or has expired.");
     } else {
-      say(`The decision was not accepted (HTTP ${response.status}).`);
+      sayIn("approvals", `The decision was not accepted (HTTP ${response.status}).`);
     }
     await refresh();
   }
