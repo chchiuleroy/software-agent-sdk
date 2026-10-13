@@ -4297,7 +4297,7 @@ class TestEventServiceGovernanceOrchestration:
         [
             # What the SDK auto-generates when the LLM leaves `summary` empty:
             # the tool name plus ALL raw arguments.
-            "terminal: {\"command\": \"curl -H 'Authorization: Bearer sk-FAKE-1' x\"}",
+            'terminal: {"command": "curl -H \'Authorization: Bearer sk-FAKE-1\' x"}',
             # What an LLM (or an injected prompt) may claim instead.
             "running unit tests to verify the fix",
             None,
@@ -4608,7 +4608,11 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service.governance_outbox.create_record(record)
 
         fake_client = MagicMock()
-        fake_client.claim = AsyncMock(side_effect=RuntimeError("network down"))
+        fake_client.claim = AsyncMock(
+            side_effect=GovernancePermanentError(
+                "device not bound", error_code="device_not_bound", status_code=403
+            )
+        )
         future: asyncio.Future = asyncio.get_running_loop().create_future()
 
         governed_service.governance_client = fake_client
@@ -4621,8 +4625,100 @@ class TestEventServiceGovernanceOrchestration:
         updated = governed_service.governance_outbox.load()
         assert updated is not None
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        # central refused: no point in a retry, and no attempt can exist
         assert updated.needs_attention_reason == NeedsAttentionReason.CLAIM_FAILED
-        assert updated.last_error_code == "RuntimeError"
+        assert updated.last_error_code == "device_not_bound"
+        assert updated.claim_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_a_claim_that_fails_temporarily_is_parked_for_an_operator_retry(
+        self, governed_service
+    ):
+        """Anything that is not a refusal by central (a network error, a 5xx)
+        may pass, and central may even have claimed with only the reply lost. So
+        it is parked as claim_transient, which offers retry but not abandon."""
+        record = await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
+        fake_client = MagicMock()
+        fake_client.claim = AsyncMock(side_effect=ConnectionError("network down"))
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        governed_service.governance_client = fake_client
+
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+        await asyncio.sleep(0)
+
+        assert future.result() == GovernanceStartOutcome.REJECTED_CLAIM_FAILED
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.CLAIM_TRANSIENT
+        assert updated.last_error_code == "ConnectionError"
+        assert updated.claim_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_a_temporary_claim_failure_gets_one_retry_then_a_superadmin(
+        self, governed_service
+    ):
+        """The whole rule end to end: first failure parks; the operator's retry
+        is repeated by the relay with the same key; if that fails again the
+        record is parked for a superadmin, with no retry offered any more."""
+        record = await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
+        client = self._central(claim=AsyncMock(side_effect=ConnectionError("down")))
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+
+        retried = await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None
+        )
+        assert retried.new_state == "claim_inflight"
+        await governed_service._relay_outbox_once()
+
+        assert client.claim.await_count == 2
+        keys = {c.kwargs["idempotency_key"] for c in client.claim.call_args_list}
+        assert keys == {"claim-req-1"}
+        parked = governed_service.governance_outbox.load()
+        assert parked.state == OutboxState.NEEDS_ATTENTION
+        assert parked.needs_attention_reason == NeedsAttentionReason.CLAIM_RETRY_FAILED
+        assert parked.claim_failures == 2
+        with pytest.raises(ResolveError):
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+        # and it is not retried behind anyone's back
+        await governed_service._relay_outbox_once()
+        assert client.claim.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_retry_of_a_temporary_claim_failure_can_succeed(
+        self, governed_service
+    ):
+        record = await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
+        client = self._central(claim=AsyncMock(side_effect=ConnectionError("down")))
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+        await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None
+        )
+        client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-2",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+
+        await governed_service._relay_outbox_once()
+
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.CLAIMED
+        assert updated.execution_attempt_id == "attempt-2"
 
     @pytest.mark.asyncio
     async def test_claim_and_run_governed_reports_binding_mismatch_to_central(
@@ -5731,9 +5827,7 @@ class TestEventServiceGovernanceOrchestration:
     async def test_run_blocks_bindingless_call_when_governed_action_claimed(
         self, governed_service
     ):
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CLAIMED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CLAIMED)
         governed_service._conversation = self._governed_conversation()
 
         with pytest.raises(ActionBindingMismatchError):
@@ -6175,9 +6269,7 @@ class TestEventServiceGovernanceOrchestration:
     # inclusion in RETRIABLE_STATES.
 
     @pytest.mark.asyncio
-    async def test_dispatch_claimed_run_calls_run_with_binding(
-        self, governed_service
-    ):
+    async def test_dispatch_claimed_run_calls_run_with_binding(self, governed_service):
         record = await self._create_outbox_record(
             governed_service, state=OutboxState.CLAIMED
         )
@@ -6267,9 +6359,7 @@ class TestEventServiceGovernanceOrchestration:
         )
 
         governed_service._ensure_claim_redispatch_task(record)
-        first_task = cast(
-            "asyncio.Task[None]", governed_service._claim_redispatch_task
-        )
+        first_task = cast("asyncio.Task[None]", governed_service._claim_redispatch_task)
         governed_service._ensure_claim_redispatch_task(record)
 
         assert governed_service._claim_redispatch_task is first_task
@@ -6358,9 +6448,7 @@ class TestEventServiceGovernanceOrchestration:
         GOVERNANCE_OUTBOX_RELAY_INTERVAL_SECONDS for the next relay
         cycle to notice (mirrors the existing CREATED/wait-for-decision
         crash-recovery just above)."""
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CLAIMED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CLAIMED)
         governed_service._external_lease_renewal = True
         conversation = self._governed_conversation()
         conversation._state.set_write_guard = MagicMock()
@@ -7288,7 +7376,6 @@ class TestEventServiceGovernanceOrchestration:
         client.report_result = AsyncMock(side_effect=self._illegal_transition())
         governed_service.governance_client = client
 
-
         await governed_service.maybe_report_governance_result()
 
         client.reconciliation_finding.assert_awaited_once()
@@ -8145,9 +8232,7 @@ class TestEventServiceGovernanceOrchestration:
         assert governed_service._reject_if_only_sync("any", "r") is False
 
     @pytest.mark.asyncio
-    async def test_start_creates_outbox_relay_task_in_team_mode(
-        self, governed_service
-    ):
+    async def test_start_creates_outbox_relay_task_in_team_mode(self, governed_service):
         assert governed_service.governance_deployment_mode == "team"
         assert governed_service._outbox_relay_task is None
         governed_service._external_lease_renewal = True  # skip lease task setup
@@ -8203,9 +8288,7 @@ class TestEventServiceGovernanceOrchestration:
     async def test_wait_for_decision_calls_run_and_wait_for_start_on_accept(
         self, governed_service
     ):
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CREATED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             return_value={"id": "approval-1", "status": "accepted", "changed": True}
@@ -8228,9 +8311,7 @@ class TestEventServiceGovernanceOrchestration:
     async def test_wait_for_decision_calls_reject_pending_actions_on_reject(
         self, governed_service
     ):
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CREATED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             return_value={"id": "approval-1", "status": "rejected", "changed": True}
@@ -8249,9 +8330,7 @@ class TestEventServiceGovernanceOrchestration:
         """cancelled/expired, or any status this MVP slice's own event
         handling doesn't expect to observe here — nothing this device can
         safely automate a response to."""
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CREATED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             return_value={"id": "approval-1", "status": "cancelled", "changed": True}
@@ -8350,9 +8429,7 @@ class TestEventServiceGovernanceOrchestration:
         """changed=False is a server-side long-poll timeout with no
         decision yet — the correct response is to call /wait again
         immediately, not treat it as an error or give up."""
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CREATED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
         fake_client = MagicMock()
         fake_client.wait = AsyncMock(
             side_effect=[
@@ -8371,9 +8448,7 @@ class TestEventServiceGovernanceOrchestration:
         governed_service.run_and_wait_for_start.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_wait_for_decision_stops_when_outbox_moved_on(
-        self, governed_service
-    ):
+    async def test_wait_for_decision_stops_when_outbox_moved_on(self, governed_service):
         """The outbox advancing past CREATED for a reason this loop didn't
         cause (archived for a new action, or a relay cycle got there
         first) means there is nothing left for this loop to wait for —
@@ -8389,16 +8464,12 @@ class TestEventServiceGovernanceOrchestration:
     async def test_wait_for_decision_noop_without_client_configured(
         self, governed_service
     ):
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CREATED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
         governed_service.governance_client = None
         await governed_service._wait_for_decision_loop("approval-1")  # must not raise
 
     @pytest.mark.asyncio
-    async def test_ensure_wait_for_decision_task_is_idempotent(
-        self, governed_service
-    ):
+    async def test_ensure_wait_for_decision_task_is_idempotent(self, governed_service):
         """_send_create_approval calls this on every CREATE success,
         including a relay retry of a stuck PENDING_CREATE for the same
         action — must not spawn a second concurrent long-poll for the same
@@ -8428,17 +8499,13 @@ class TestEventServiceGovernanceOrchestration:
             await first_task
 
     @pytest.mark.asyncio
-    async def test_start_resumes_wait_for_decision_after_crash(
-        self, governed_service
-    ):
+    async def test_start_resumes_wait_for_decision_after_crash(self, governed_service):
         """A record already at CREATED when start() runs means a prior
         process instance sent create and was waiting on decide when it
         stopped — resume watching it rather than leaving it to sit until
         some other trigger notices (the relay loop's own state-by-state
         handling doesn't touch CREATED at all; see _relay_outbox_once)."""
-        await self._create_outbox_record(
-            governed_service, state=OutboxState.CREATED
-        )
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
         governed_service._external_lease_renewal = True  # skip lease task setup
         conversation = self._governed_conversation()
         conversation._state.set_write_guard = MagicMock()
@@ -8529,4 +8596,3 @@ async def test_update_secrets_resolves_new_sources_before_a_loop_thread_mask(
     assert registry.mask_secrets_in_output(f"leak: {_UPDATE_SECRETS_VALUE}") == (
         "leak: <secret-hidden>"
     )
-

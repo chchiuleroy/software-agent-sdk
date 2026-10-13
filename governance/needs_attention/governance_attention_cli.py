@@ -202,8 +202,21 @@ def fetch_items(url: str, key: str | None) -> list[dict]:
     return body
 
 
+# What to do next, for the reasons where it is not just "pick an action".
+_NEXT_STEP = {
+    "claim_transient": (
+        "the claim failed, maybe only for a moment: run `resolve retry` once"
+    ),
+    "claim_retry_failed": (
+        "the claim was retried and failed again: ask a superadmin to find out "
+        "what happened (do not retry again)"
+    ),
+}
+
+
 def _describe(item: dict) -> str:
     code = f" ({item['last_error_code']})" if item.get("last_error_code") else ""
+    step = _NEXT_STEP.get(item.get("reason"))
     return "\n".join(
         [
             f"  conversation  {item['conversation_id']}",
@@ -212,6 +225,7 @@ def _describe(item: dict) -> str:
             f"last {item.get('last_attempt_at')}",
             f"  request_id    {item.get('request_id')}",
             f"  allowed       {', '.join(item.get('allowed_actions') or []) or 'none'}",
+            *([f"  next          {step}"] if step else []),
         ]
     )
 

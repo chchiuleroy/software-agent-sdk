@@ -38,6 +38,17 @@ python governance_attention_cli.py resolve <對話id> retry|abandon|dismiss [--r
 
 abandon 只對 `claim_failed`、`approval_cancelled_or_expired` 開放，因為其他原因的動作**可能已經執行過**。
 
+### 暫時性的 claim 錯誤：重試一次，再失敗就找 superadmin
+
+核准後的 claim 若因**可能只是暫時的原因**失敗（網路、5xx，任何不是 central 明確拒絕的錯誤），紀錄會停在：
+
+| `reason` | 意思 | 你該做的 |
+|---|---|---|
+| `claim_transient` | 第一次失敗。**central 可能其實已 claim，只是回應掉了**，所以**沒有 abandon** | `resolve retry` **一次**（relay 約 30 秒內用同一個 idempotency key 重送，若 central 已 claim 會回同一個執行嘗試） |
+| `claim_retry_failed` | 重試後又失敗（暫時性或永久皆算） | **不要再 retry**（清單也不再提供）。找 superadmin 查清楚發生什麼事；查清後可 `dismiss`（需 `--note`） |
+
+central **明確拒絕**（例如 `device_not_bound`）仍是 `claim_failed`：不是暫時性，retry／abandon／dismiss 都可用。`list` 會在這兩個原因下多印一行 `next`。呼叫端（確認動作的 API）收到 502 `governance_claim_failed` 時，**動作有沒有執行以 outbox 為準**，不要以那個回應為準。
+
 ## 它不會讓你誤動別人的紀錄
 
 `resolve` 一定引用你看過的 `request_id`：

@@ -706,6 +706,13 @@ def _add_exception_handlers(api: FastAPI) -> None:
             "central governance has not yet confirmed this action started; "
             "retry or poll for status"
             if exc.outcome == GovernanceStartOutcome.PENDING_UNKNOWN
+            else (
+                "the claim to central governance failed; it may be temporary. "
+                "An operator can retry it once from the attention list; if that "
+                "fails again, ask a superadmin. The outbox, not this answer, "
+                "says whether the action ran"
+            )
+            if exc.outcome == GovernanceStartOutcome.REJECTED_CLAIM_FAILED
             else "central governance did not allow this confirmation to start"
         )
         return JSONResponse(
