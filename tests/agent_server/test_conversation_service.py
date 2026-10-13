@@ -2825,6 +2825,58 @@ class TestConversationServiceDeleteConversation:
         assert order == ["resolve-start", "resolve-end", "close", "rmtree"]
 
     @pytest.mark.asyncio
+    async def test_cancelled_resolve_keeps_the_lock_until_its_work_is_done(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """An abandon's local reject runs in a thread, and cancelling the request
+        does not stop that thread. If the lifecycle lock went with the request, a
+        delete could close and remove the conversation while the reject still
+        runs on it."""
+        conversation_id = sample_stored_conversation.id
+        order: list[str] = []
+        in_work = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _resolve(*_a, **_k):
+            order.append("resolve-start")
+            in_work.set()
+            await release.wait()  # stands in for the shielded executor reject
+            order.append("resolve-end")
+            return "resolved"
+
+        conversation_service._event_services[conversation_id] = (
+            self._resolvable_service(
+                sample_stored_conversation, order, resolve=_resolve
+            )
+        )
+
+        with patch(
+            "openhands.agent_server.conversation_service.safe_rmtree",
+            side_effect=lambda *_a, **_k: order.append("rmtree"),
+        ):
+            resolving = asyncio.create_task(
+                conversation_service.resolve_needs_attention(
+                    conversation_id,
+                    AttentionAction.ABANDON,
+                    expected_request_id="req-1",
+                    note=None,
+                )
+            )
+            await in_work.wait()
+            resolving.cancel()
+            deleting = asyncio.create_task(
+                conversation_service.delete_conversation(conversation_id)
+            )
+            await asyncio.sleep(0.05)
+            assert order == ["resolve-start"]  # delete still held back
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await resolving
+            assert await deleting is True
+
+        assert order == ["resolve-start", "resolve-end", "close", "rmtree"]
+
+    @pytest.mark.asyncio
     async def test_resolve_waits_for_a_delete_that_is_already_running(
         self, conversation_service, sample_stored_conversation
     ):

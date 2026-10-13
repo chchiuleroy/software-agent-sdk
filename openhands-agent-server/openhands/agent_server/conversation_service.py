@@ -1993,9 +1993,22 @@ class ConversationService:
             )
             if event_service is None:
                 return None
-            return await event_service.resolve_needs_attention(
-                action, expected_request_id=expected_request_id, note=note
+            resolving = asyncio.ensure_future(
+                event_service.resolve_needs_attention(
+                    action, expected_request_id=expected_request_id, note=note
+                )
             )
+            try:
+                return await asyncio.shield(resolving)
+            except asyncio.CancelledError:
+                # The caller went away, but an abandon may be in its off-loop
+                # local reject (a thread that cancelling the wait does not stop).
+                # Finish it before the lifecycle lock is released, or a delete
+                # could start while it still runs on the conversation.
+                await asyncio.wait({resolving})
+                if not resolving.cancelled():
+                    resolving.exception()  # retrieved: it is not reported twice
+                raise
 
     async def generate_conversation_title(
         self, conversation_id: UUID, max_length: int = 50, llm: LLM | None = None
