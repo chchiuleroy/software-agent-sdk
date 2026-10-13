@@ -129,6 +129,10 @@ TERMINAL_STATES = frozenset(
 )
 
 
+# OutboxRecord fields added after the first release of the file format (see to_json).
+_OMITTED_WHEN_UNSET = ("resolution_note", "resolved_at")
+
+
 @dataclass
 class OutboxRecord:
     """One conversation's in-flight (or resolved) governance workflow."""
@@ -191,7 +195,14 @@ class OutboxRecord:
         return None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=True, default=str)
+        data = asdict(self)
+        # Left out while unset so that a record nobody resolved is written exactly as
+        # before these fields existed: from_json() rejects keys it does not know, so
+        # an older server could otherwise not read ANY outbox written by this one.
+        for name in _OMITTED_WHEN_UNSET:
+            if data.get(name) is None:
+                data.pop(name, None)
+        return json.dumps(data, indent=2, sort_keys=True, default=str)
 
     @classmethod
     def from_json(cls, text: str) -> OutboxRecord:

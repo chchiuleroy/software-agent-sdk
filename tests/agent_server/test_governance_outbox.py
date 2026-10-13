@@ -4,6 +4,7 @@ transitions.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from typing import Any
 
@@ -204,6 +205,55 @@ async def test_needs_attention_reason_is_persisted_as_its_plain_string(tmp_path)
         reloaded.needs_attention_reason
         == NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
     )
+
+
+def test_a_record_nobody_resolved_is_written_in_the_original_format():
+    """from_json() rejects keys it does not know. If the optional fields added for
+    operator resolution were always written (as null), a server from before them
+    could not read ANY outbox this one writes, healthy conversations included, and
+    reverting the change would strand every one of them."""
+    written = set(json.loads(_record().to_json()))
+
+    assert written == {f.name for f in dataclasses.fields(OutboxRecord)} - {
+        "resolution_note",
+        "resolved_at",
+    }
+
+
+def test_a_resolved_record_carries_the_resolution_and_round_trips():
+    record = _record()
+    record.resolution_note = "looked at central"
+    record.resolved_at = "2026-10-13T00:00:00+00:00"
+
+    raw = json.loads(record.to_json())
+    loaded = OutboxRecord.from_json(record.to_json())
+
+    assert raw["resolution_note"] == "looked at central"
+    assert raw["resolved_at"] == "2026-10-13T00:00:00+00:00"
+    assert loaded.resolution_note == "looked at central"
+    assert loaded.resolved_at == "2026-10-13T00:00:00+00:00"
+
+
+def test_an_outbox_file_in_the_original_format_still_loads():
+    raw = json.loads(_record().to_json())
+    assert "resolution_note" not in raw and "resolved_at" not in raw
+
+    loaded = OutboxRecord.from_json(json.dumps(raw))
+
+    assert loaded.resolution_note is None and loaded.resolved_at is None
+
+
+@pytest.mark.asyncio
+async def test_the_file_on_disk_of_an_unresolved_record_has_no_new_keys(tmp_path):
+    outbox = GovernanceOutbox(tmp_path)
+    await outbox.create_record(_record())
+    await outbox.mutate(
+        lambda r: mark_needs_attention(r, NeedsAttentionReason.CLAIM_FAILED)
+    )
+
+    on_disk = json.loads((tmp_path / "governance_outbox.json").read_text("utf-8"))
+
+    assert "resolution_note" not in on_disk and "resolved_at" not in on_disk
 
 
 def test_needs_attention_is_neither_retriable_nor_terminal():
