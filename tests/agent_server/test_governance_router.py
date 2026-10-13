@@ -238,15 +238,23 @@ CONVERSATION_ID = uuid.uuid4()
 
 
 def _resolve_client(config: Config, event_service) -> tuple[TestClient, list]:
+    """The router must go through ConversationService.resolve_needs_attention (which
+    holds the conversation's lifecycle lock), not get_event_service() and then
+    resolve on it: this stand-in has no get_event_service, so the old two-step
+    flow fails these tests."""
     asked: list = []
 
-    async def _get_event_service(conversation_id):
+    async def _resolve(conversation_id, action, *, expected_request_id, note):
         asked.append(conversation_id)
-        return event_service
+        if event_service is None:
+            return None
+        return await event_service.resolve_needs_attention(
+            action, expected_request_id=expected_request_id, note=note
+        )
 
     app = create_app(config)
     app.dependency_overrides[get_conversation_service] = lambda: SimpleNamespace(
-        get_event_service=_get_event_service
+        resolve_needs_attention=_resolve
     )
     return TestClient(app), asked
 

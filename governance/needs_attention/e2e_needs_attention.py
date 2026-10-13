@@ -900,10 +900,81 @@ async def main():
                 )
                 check("CLI no tool ran", not any(marker(t) for t in ("e1", "e2", "e3")))
 
+            async def scenario_race():
+                """resolve and DELETE of the same conversation sent at the same time.
+                The interleaving is up to the event loop, so several rounds, both
+                actions; whichever way each round falls, nothing may fail with a
+                server error and nothing may be left behind.
+
+                A smoke test, NOT proof of the lifecycle lock: against a real central
+                the call an abandon makes takes milliseconds, so the window is too
+                narrow to open, and this passed on the code without the lock too. The
+                deterministic proof is in
+                tests/agent_server/test_conversation_service.py (a resolve held
+                inside its central call while a delete is started)."""
+                rounds = []
+                for i, action in enumerate(["abandon", "dismiss"] * 3):
+                    cid = await park_by_central_cancel(f"r{i}")
+                    if cid is None:
+                        return check(f"SETUP race round {i}: parked", False)
+                    body = {
+                        "action": action,
+                        "expected_request_id": request_id_of(cid),
+                        "note": "e2e race",
+                    }
+                    resolved, deleted = await asyncio.gather(
+                        ac.post(f"/api/governance/attention/{cid}/resolve", json=body),
+                        ac.delete(f"/api/conversations/{cid}"),
+                        return_exceptions=True,
+                    )
+                    rounds.append((cid, action, resolved, deleted))
+                summary = [
+                    (
+                        action,
+                        getattr(res, "status_code", repr(res)[:40]),
+                        getattr(dele, "status_code", repr(dele)[:40]),
+                    )
+                    for _, action, res, dele in rounds
+                ]
+                info("RACE (action, resolve status, delete status) per round", summary)
+
+                def code(x):
+                    return getattr(x, "status_code", 599)
+
+                check(
+                    "RACE neither request ever ended in a server error",
+                    all(
+                        code(res) < 500 and code(dele) < 500
+                        for _, _, res, dele in rounds
+                    ),
+                    str(summary),
+                )
+                check(
+                    "RACE every delete succeeded",
+                    all(code(dele) in (200, 204) for _, _, _, dele in rounds),
+                )
+                check(
+                    "RACE a resolve either took effect (200) or found nothing (404)",
+                    all(code(res) in (200, 404) for _, _, res, _ in rounds),
+                    str([code(res) for _, _, res, _ in rounds]),
+                )
+                gone = [
+                    (await ac.get(f"/api/conversations/{cid}")).status_code == 404
+                    for cid, *_ in rounds
+                ]
+                check(
+                    "RACE every conversation is gone afterwards", all(gone), str(gone)
+                )
+                check(
+                    "RACE no outbox file is left behind",
+                    all(outbox_path(cid) is None for cid, *_ in rounds),
+                )
+
             await scenario("CONTROL (healthy baseline)", control())
             await scenario("A: central cancels -> abandon", scenario_a())
             await scenario("D: dismiss and refused requests", scenario_d())
             await scenario("CLI against the real agent-server", scenario_cli())
+            await scenario("RACE: resolve and delete at the same time", scenario_race())
 
             # ============================ phase 2 ============================
             async def phase2():

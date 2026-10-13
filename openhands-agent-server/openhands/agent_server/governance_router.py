@@ -156,18 +156,21 @@ async def resolve_needs_attention(
                 "detail": "governance is not in team mode",
             },
         )
-    event_service = await conversation_service.get_event_service(conversation_id)
-    if event_service is None:
-        raise HTTPException(
-            status_code=404,
-            detail={"error_code": "not_found", "detail": "no such conversation"},
-        )
     try:
-        return await event_service.resolve_needs_attention(
+        # Through the service, not get_event_service() + resolve here: the service
+        # holds the conversation's lifecycle lock, which a delete also holds.
+        result = await conversation_service.resolve_needs_attention(
+            conversation_id,
             body.action,
             expected_request_id=body.expected_request_id,
             note=body.note,
         )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "not_found", "detail": "no such conversation"},
+            )
+        return result
     except ResolveError as exc:
         raise HTTPException(
             status_code=_RESOLVE_STATUS.get(exc.error_code, 409),

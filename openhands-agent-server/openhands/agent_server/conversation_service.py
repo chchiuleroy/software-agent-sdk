@@ -26,6 +26,10 @@ from openhands.agent_server.event_service import (
     EventService,
     _without_agent_context_secret,
 )
+from openhands.agent_server.governance_attention import (
+    AttentionAction,
+    ResolveResponse,
+)
 from openhands.agent_server.governance_client import GovernanceClient
 from openhands.agent_server.models import (
     ConversationInfo,
@@ -1952,6 +1956,63 @@ class ConversationService:
 
     async def get_event_service(self, conversation_id: UUID) -> EventService | None:
         return await self._get_or_load_event_service(conversation_id)
+
+    async def resolve_needs_attention(
+        self,
+        conversation_id: UUID,
+        action: AttentionAction,
+        *,
+        expected_request_id: str,
+        note: str | None,
+    ) -> ResolveResponse | None:
+        """Operator action on a conversation's governance outbox (see
+        ``EventService.resolve_needs_attention``); None if there is no such
+        conversation.
+
+        The conversation's lifecycle lock is held from loading the event service
+        to the end of the resolve. ``delete_conversation`` holds the same lock for
+        its whole body, so whichever starts first finishes first: a delete can no
+        longer close the conversation and remove its directory between the central
+        call an abandon makes and the local steps that follow it, and a resolve
+        started after a delete finds nothing. (Taking the event service from
+        ``get_event_service`` and resolving on it outside the lock left exactly
+        that window open.) The price is that other operations on this one
+        conversation wait for it, up to the central client's timeout. Like every
+        other lifecycle operation it also counts toward the server-wide
+        exclusive gate (idle eviction, sandbox pause, shutdown wait for it, and
+        while they wait new lifecycle operations on any conversation queue
+        behind them); that is the existing behaviour of start and delete too.
+        """
+        event_services = self._event_services
+        if event_services is None:
+            raise ValueError("inactive_service")
+        if (
+            conversation_id not in event_services
+            and conversation_id not in self._conversation_records
+        ):
+            return None
+        async with self._conversation_lifecycle(conversation_id):
+            event_service = await self._get_or_load_event_service_locked(
+                conversation_id
+            )
+            if event_service is None:
+                return None
+            resolving = asyncio.ensure_future(
+                event_service.resolve_needs_attention(
+                    action, expected_request_id=expected_request_id, note=note
+                )
+            )
+            try:
+                return await asyncio.shield(resolving)
+            except asyncio.CancelledError:
+                # The caller went away, but an abandon may be in its off-loop
+                # local reject (a thread that cancelling the wait does not stop).
+                # Finish it before the lifecycle lock is released, or a delete
+                # could start while it still runs on the conversation.
+                await asyncio.wait({resolving})
+                if not resolving.cancelled():
+                    resolving.exception()  # retrieved: it is not reported twice
+                raise
 
     async def generate_conversation_title(
         self, conversation_id: UUID, max_length: int = 50, llm: LLM | None = None

@@ -27,6 +27,10 @@ from openhands.agent_server.conversation_service import (
     _get_worktree_start_point,
 )
 from openhands.agent_server.event_service import EventService
+from openhands.agent_server.governance_attention import (
+    AttentionAction,
+    ResolveError,
+)
 from openhands.agent_server.models import (
     ConversationInfo,
     ConversationPage,
@@ -2756,6 +2760,289 @@ class TestConversationServiceDeleteConversation:
         """Test delete_conversation with non-existent conversation ID."""
         result = await conversation_service.delete_conversation(uuid4())
         assert result is False
+
+    # ---- resolve (operator action on the governance outbox) vs delete ----
+
+    def _resolvable_service(self, stored, order, *, resolve=None):
+        """A mock event service that records what happens to it, in order."""
+        service = AsyncMock(spec=EventService)
+        service.conversation_dir = "/tmp/test_conversation"
+        service.stored = stored
+        service.close.side_effect = lambda: order.append("close")
+        if resolve is not None:
+            service.resolve_needs_attention.side_effect = resolve
+        return service
+
+    @pytest.mark.asyncio
+    async def test_delete_waits_for_a_resolve_that_is_already_running(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """An abandon calls central and then rejects the action and writes the
+        record locally. A delete that closed the conversation and removed its
+        directory in between would leave those local steps running against a
+        conversation that is gone."""
+        conversation_id = sample_stored_conversation.id
+        order: list[str] = []
+        in_central = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _resolve(*_a, **_k):
+            order.append("resolve-start")
+            in_central.set()
+            await release.wait()
+            order.append("resolve-end")
+            return "resolved"
+
+        conversation_service._event_services[conversation_id] = (
+            self._resolvable_service(
+                sample_stored_conversation, order, resolve=_resolve
+            )
+        )
+
+        with patch(
+            "openhands.agent_server.conversation_service.safe_rmtree",
+            side_effect=lambda *_a, **_k: order.append("rmtree"),
+        ):
+            resolving = asyncio.create_task(
+                conversation_service.resolve_needs_attention(
+                    conversation_id,
+                    AttentionAction.ABANDON,
+                    expected_request_id="req-1",
+                    note=None,
+                )
+            )
+            await in_central.wait()
+            deleting = asyncio.create_task(
+                conversation_service.delete_conversation(conversation_id)
+            )
+            await asyncio.sleep(0.05)  # a delete with no wait would act right here
+            assert order == ["resolve-start"]
+            release.set()
+            resolved, deleted = await asyncio.gather(resolving, deleting)
+
+        assert resolved == "resolved"
+        assert deleted is True
+        assert order == ["resolve-start", "resolve-end", "close", "rmtree"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_resolve_keeps_the_lock_until_its_work_is_done(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """An abandon's local reject runs in a thread, and cancelling the request
+        does not stop that thread. If the lifecycle lock went with the request, a
+        delete could close and remove the conversation while the reject still
+        runs on it."""
+        conversation_id = sample_stored_conversation.id
+        order: list[str] = []
+        in_work = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _resolve(*_a, **_k):
+            order.append("resolve-start")
+            in_work.set()
+            await release.wait()  # stands in for the shielded executor reject
+            order.append("resolve-end")
+            return "resolved"
+
+        conversation_service._event_services[conversation_id] = (
+            self._resolvable_service(
+                sample_stored_conversation, order, resolve=_resolve
+            )
+        )
+
+        with patch(
+            "openhands.agent_server.conversation_service.safe_rmtree",
+            side_effect=lambda *_a, **_k: order.append("rmtree"),
+        ):
+            resolving = asyncio.create_task(
+                conversation_service.resolve_needs_attention(
+                    conversation_id,
+                    AttentionAction.ABANDON,
+                    expected_request_id="req-1",
+                    note=None,
+                )
+            )
+            await in_work.wait()
+            resolving.cancel()
+            deleting = asyncio.create_task(
+                conversation_service.delete_conversation(conversation_id)
+            )
+            await asyncio.sleep(0.05)
+            assert order == ["resolve-start"]  # delete still held back
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await resolving
+            assert await deleting is True
+
+        assert order == ["resolve-start", "resolve-end", "close", "rmtree"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_waits_for_a_delete_that_is_already_running(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """The other order: once a delete has begun, a resolve must not get hold
+        of the half-closed event service. It waits, then finds no conversation."""
+        conversation_id = sample_stored_conversation.id
+        order: list[str] = []
+        in_close = asyncio.Event()
+        release = asyncio.Event()
+        service = self._resolvable_service(sample_stored_conversation, order)
+
+        async def _slow_close():
+            order.append("close-start")
+            in_close.set()
+            await release.wait()
+            order.append("close-end")
+
+        service.close.side_effect = _slow_close
+        conversation_service._event_services[conversation_id] = service
+
+        with patch(
+            "openhands.agent_server.conversation_service.safe_rmtree",
+            side_effect=lambda *_a, **_k: order.append("rmtree"),
+        ):
+            deleting = asyncio.create_task(
+                conversation_service.delete_conversation(conversation_id)
+            )
+            await in_close.wait()
+            resolving = asyncio.create_task(
+                conversation_service.resolve_needs_attention(
+                    conversation_id,
+                    AttentionAction.DISMISS,
+                    expected_request_id="req-1",
+                    note="why",
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not resolving.done()  # still waiting for the delete
+            release.set()
+            resolved, deleted = await asyncio.gather(resolving, deleting)
+
+        assert deleted is True
+        assert resolved is None  # no such conversation any more
+        service.resolve_needs_attention.assert_not_awaited()
+        assert order == ["close-start", "close-end", "rmtree"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_after_a_delete_finds_no_conversation(
+        self, conversation_service, sample_stored_conversation
+    ):
+        conversation_id = sample_stored_conversation.id
+        order: list[str] = []
+        service = self._resolvable_service(sample_stored_conversation, order)
+        conversation_service._event_services[conversation_id] = service
+
+        with patch("openhands.agent_server.conversation_service.safe_rmtree"):
+            assert await conversation_service.delete_conversation(conversation_id)
+
+        result = await conversation_service.resolve_needs_attention(
+            conversation_id,
+            AttentionAction.RETRY,
+            expected_request_id="req-1",
+            note=None,
+        )
+
+        assert result is None
+        service.resolve_needs_attention.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resolve_of_an_unknown_conversation_is_none(
+        self, conversation_service
+    ):
+        assert (
+            await conversation_service.resolve_needs_attention(
+                uuid4(),
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+            )
+            is None
+        )
+        assert len(conversation_service._conversation_locks) == 0  # no lock leaked
+
+    @pytest.mark.asyncio
+    async def test_resolve_when_the_service_is_inactive_raises(
+        self, conversation_service
+    ):
+        conversation_service._event_services = None
+
+        with pytest.raises(ValueError, match="inactive_service"):
+            await conversation_service.resolve_needs_attention(
+                uuid4(),
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_resolve_does_not_hold_up_another_conversation(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """The wait is per conversation: an abandon stuck on central must not
+        freeze the delete of an unrelated conversation."""
+        slow_id = sample_stored_conversation.id
+        other = sample_stored_conversation.model_copy(update={"id": uuid4()})
+        order: list[str] = []
+        in_central = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _resolve(*_a, **_k):
+            in_central.set()
+            await release.wait()
+
+        conversation_service._event_services[slow_id] = self._resolvable_service(
+            sample_stored_conversation, order, resolve=_resolve
+        )
+        conversation_service._event_services[other.id] = self._resolvable_service(
+            other, order
+        )
+
+        with patch("openhands.agent_server.conversation_service.safe_rmtree"):
+            resolving = asyncio.create_task(
+                conversation_service.resolve_needs_attention(
+                    slow_id,
+                    AttentionAction.ABANDON,
+                    expected_request_id="req-1",
+                    note=None,
+                )
+            )
+            await in_central.wait()
+            deleted = await asyncio.wait_for(
+                conversation_service.delete_conversation(other.id), timeout=2
+            )
+            release.set()
+            await resolving
+
+        assert deleted is True
+
+    @pytest.mark.asyncio
+    async def test_a_resolve_that_fails_releases_the_conversation(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """A refused or failed resolve is an ordinary outcome; it must not leave
+        the conversation locked for the delete that follows."""
+        conversation_id = sample_stored_conversation.id
+        order: list[str] = []
+        service = self._resolvable_service(
+            sample_stored_conversation,
+            order,
+            resolve=ResolveError("central_failed", "central refused"),
+        )
+        conversation_service._event_services[conversation_id] = service
+
+        with pytest.raises(ResolveError):
+            await conversation_service.resolve_needs_attention(
+                conversation_id,
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+            )
+        with patch("openhands.agent_server.conversation_service.safe_rmtree"):
+            deleted = await asyncio.wait_for(
+                conversation_service.delete_conversation(conversation_id), timeout=2
+            )
+
+        assert deleted is True
 
     @pytest.mark.asyncio
     async def test_missing_conversations_do_not_accumulate_locks(
