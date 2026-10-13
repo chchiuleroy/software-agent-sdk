@@ -1,0 +1,6 @@
+# The scripts here are working end-to-end rigs written with long lines, one-letter loop names and unused hook
+# arguments (HTTP handlers); keep them as they are rather than reflow every message.
+extend = "../../pyproject.toml"
+
+[lint]
+extend-ignore = ["E501", "ARG", "E741", "F841"]
