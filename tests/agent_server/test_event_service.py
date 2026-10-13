@@ -4693,6 +4693,42 @@ class TestEventServiceGovernanceOrchestration:
         assert client.claim.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_a_retry_that_central_refuses_is_the_end_of_the_one_retry(
+        self, governed_service
+    ):
+        """If the operator's retry is answered with a refusal (for example a
+        permission revoked since the first, lost, claim), the record must not fall
+        back to claim_failed: that offers retry again, so the "one retry, then a
+        superadmin" rule would not hold and the loop could go on forever."""
+        record = await self._create_outbox_record(
+            governed_service, state=OutboxState.CREATED
+        )
+        client = self._central(claim=AsyncMock(side_effect=ConnectionError("down")))
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        await governed_service._claim_and_run_governed(record, "approval-1", future)
+        await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None
+        )
+        client.claim = AsyncMock(
+            side_effect=GovernancePermanentError(
+                "revoked", error_code="tool_permission_revoked", status_code=403
+            )
+        )
+
+        await governed_service._relay_outbox_once()
+
+        parked = governed_service.governance_outbox.load()
+        assert parked.needs_attention_reason == NeedsAttentionReason.CLAIM_RETRY_FAILED
+        assert parked.last_error_code == "tool_permission_revoked"
+        assert parked.claim_failures == 2
+        with pytest.raises(ResolveError):
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+
+    @pytest.mark.asyncio
     async def test_the_retry_of_a_temporary_claim_failure_can_succeed(
         self, governed_service
     ):

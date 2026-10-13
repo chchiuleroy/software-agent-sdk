@@ -79,6 +79,8 @@ Roy 已拍板（2026-10-13「照建議」）：只做第 1、2 層（單一對�
 
    **步驟 7 實作（2026-10-13，分支 `feat/transient-claim-retry`，Roy 拍板選項 1）**：Roy 的規則：「遇到暫時性錯誤可以告知使用者進行重試；若重試兩次後一樣發生問題，請找 superadmin 釐清」，確認「兩次」＝第一次失敗＋重試一次再失敗；不做系統自動重試、不改 Canvas UI。做法：新原因 `claim_transient`（第一次失敗；動作矩陣 retry／dismiss，**沒有 abandon**——暫時性失敗時 central 可能已 claim、只是回應掉了）與 `claim_retry_failed`（重試後又失敗；只有 dismiss）；新欄位 `claim_failures`（為零時不寫入檔案，維持降版相容）。互動路徑（`_claim_and_run_governed`）只有 `GovernancePermanentError` 仍記 `claim_failed`，其餘例外記 `claim_transient`；relay 的 CLAIM_INFLIGHT 暫時性失敗：`claim_failures` 為 0 時照舊每輪重試（崩潰復原），≥1（操作者已重試過）則停止並記 `claim_retry_failed`。**兩個未決點的處理**：①動作稍後被 relay 執行而呼叫端已被告知 502——維持現狀，API 回應與 README 改為明說「以 outbox 為準」；②handshake 快取對同一 binding 永久重播舊的 `REJECTED_CLAIM_FAILED`——**不放寬**（那是防重放設計），同樣以 outbox 為準。
 
+   **小o 審查（契約 v1.1）**：1 個 `confirmed`（medium）——operator 重試後 central 回**永久**錯誤時，relay 的永久分支先於 `claim_failures` 判斷，把紀錄記回 `claim_failed`（又開放 retry），「只重試一次」不成立、可無限循環；核對成立（讀到分支順序），已修（永久錯誤在 `claim_failures>=1` 時同樣記 `claim_retry_failed`）並補測試（突變被抓到）。其餘 4 項 `rejected`（成功後不歸零無影響、同 key 對 central 冪等〔小o 讀了 central 的 claim／idempotency 實作〕、互動與 relay 競態不誤算、舊紀錄不自動遷移）。**已知限度**：①e2e 的 proxy 在請求抵達 central 前就回 503，**沒有測「central 已提交 claim 但回應掉了」**（冪等性只有小o 靜態查驗＋既有 e2e 的 claim 重送路徑）；②`claim_failed`（永久拒絕）被 operator retry 後再被拒，仍可無限 retry（既有行為，Roy 的規則只談暫時性錯誤，未改）；③`claim_failures` 成功後不歸零（無影響，紀錄之後不再讀它）。
+
 ## 6. 驗證計畫
 
 - 每個進入點一個測試：寫入的 reason／error_code 正確。**突變**：把 `mark_needs_attention` 改成不寫 reason，測試必須失敗。

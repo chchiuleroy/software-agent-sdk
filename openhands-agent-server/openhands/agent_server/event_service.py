@@ -821,6 +821,14 @@ class EventService:
                     record.central_approval_id,
                 )
                 code = _error_code_of(exc)
+                if record.claim_failures >= 1:
+                    # The operator's retry of a temporary failure was refused:
+                    # still the end of the one retry, not a fresh claim_failed
+                    # that would offer retry again.
+                    await self.governance_outbox.mutate(
+                        lambda r: mark_claim_transient(r, error_code=code)
+                    )
+                    return
                 await self.governance_outbox.mutate(
                     lambda r: mark_needs_attention(
                         r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
