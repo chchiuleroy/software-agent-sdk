@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from openhands.sdk.security.roy_action_binding import (
     ActionBinding,
@@ -60,6 +61,39 @@ class OutboxState(StrEnum):
     REJECTED_LOCALLY = "rejected_locally"
     CANCELLED = "cancelled"
     NEEDS_ATTENTION = "needs_attention"
+    # An operator closed a NEEDS_ATTENTION record without any further effect
+    # (see governance_attention.py). Terminal, and deliberately not CANCELLED:
+    # nothing was cancelled, someone decided to stop looking at it.
+    RESOLVED_MANUALLY = "resolved_manually"
+
+
+class NeedsAttentionReason(StrEnum):
+    """Why a record was parked in ``OutboxState.NEEDS_ATTENTION``.
+
+    The state alone says nothing: several unrelated failures end there, and
+    what an operator may safely do about each differs (see
+    ``ops_notes/design_1_11_needs_attention.md``). Persisted as the string
+    value in ``OutboxRecord.needs_attention_reason``.
+    """
+
+    # A claim was refused or failed before any execution attempt existed.
+    CLAIM_FAILED = "claim_failed"
+    # report-result was refused after the action may already have run.
+    REPORT_FAILED = "report_failed"
+    # Central resolved the approval to cancelled/expired while this device
+    # waited for a decision: no execution attempt exists.
+    APPROVAL_CANCELLED_OR_EXPIRED = "approval_cancelled_or_expired"
+    # Central answered the decision wait with any other unexpected status
+    # (executing, applied, failed_*, ...): another request may already have
+    # moved the approval on, so the action may have run.
+    CENTRAL_STATUS_UNEXPECTED = "central_status_unexpected"
+    # The failure_unknown report made while closing the conversation failed.
+    RECONCILE_FAILED = "reconcile_failed"
+    # A binding mismatch was found after claim and reporting it failed; the
+    # tool did not run.
+    BINDING_REPORT_FAILED = "binding_report_failed"
+    # Central permanently refused the late_report finding.
+    LATE_REPORT_REFUSED = "late_report_refused"
 
 
 # States a relay loop should keep retrying from — everything else is either
@@ -90,8 +124,13 @@ TERMINAL_STATES = frozenset(
         OutboxState.RESULT_REPORTED,
         OutboxState.RECONCILIATION_REPORTED,
         OutboxState.CANCELLED,
+        OutboxState.RESOLVED_MANUALLY,
     }
 )
+
+
+# OutboxRecord fields added after the first release of the file format (see to_json).
+_OMITTED_WHEN_UNSET = ("resolution_note", "resolved_at")
 
 
 @dataclass
@@ -139,6 +178,10 @@ class OutboxRecord:
     # central at report-result; a lost marker means "not attested", which
     # central records as unknown rather than as a pass.
     execution_attested: bool = False
+    # Set when an operator closes a NEEDS_ATTENTION record (abandon or dismiss).
+    # needs_attention_reason / last_error_code are kept as the history of why.
+    resolution_note: str | None = None
+    resolved_at: str | None = None
 
     def registered_commitment(self) -> str | None:
         """The commitment central holds for this record, or None if this
@@ -152,7 +195,14 @@ class OutboxRecord:
         return None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=True, default=str)
+        data = asdict(self)
+        # Left out while unset so that a record nobody resolved is written exactly as
+        # before these fields existed: from_json() rejects keys it does not know, so
+        # an older server could otherwise not read ANY outbox written by this one.
+        for name in _OMITTED_WHEN_UNSET:
+            if data.get(name) is None:
+                data.pop(name, None)
+        return json.dumps(data, indent=2, sort_keys=True, default=str)
 
     @classmethod
     def from_json(cls, text: str) -> OutboxRecord:
@@ -161,8 +211,11 @@ class OutboxRecord:
         return cls(**raw)
 
 
+OUTBOX_FILENAME = "governance_outbox.json"
+
+
 def _outbox_path(conversation_dir: Path) -> Path:
-    return conversation_dir / "governance_outbox.json"
+    return conversation_dir / OUTBOX_FILENAME
 
 
 class GovernanceOutbox:
@@ -238,6 +291,37 @@ def record_attempt(
     record.last_attempt_at = datetime.now(UTC).isoformat()
     if new_state is not None:
         record.state = new_state
+    return record
+
+
+_SAFE_ERROR_CODE = re.compile(r"[A-Za-z0-9_.:=-]{1,64}")
+UNRECOGNIZED_ERROR_CODE = "unrecognized"
+
+
+def is_safe_error_code(value: object) -> TypeGuard[str]:
+    """True for a short label made only of identifier-like characters. The
+    codes and statuses we record come from central's response bodies, which
+    this device does not control, so anything else is not written to disk."""
+    return isinstance(value, str) and _SAFE_ERROR_CODE.fullmatch(value) is not None
+
+
+def mark_needs_attention(
+    record: OutboxRecord,
+    reason: NeedsAttentionReason,
+    *,
+    error_code: str | None = None,
+) -> OutboxRecord:
+    """Parks ``record`` in NEEDS_ATTENTION and records why. ``error_code`` is
+    a short label (central's ``error_code``, an exception class name, or the
+    central status that was observed). It is persisted only if
+    ``is_safe_error_code`` accepts it; otherwise ``UNRECOGNIZED_ERROR_CODE`` is
+    stored, so a remote response can never put free text into the outbox file."""
+    record_attempt(record, new_state=OutboxState.NEEDS_ATTENTION)
+    record.needs_attention_reason = reason.value
+    if error_code is None or is_safe_error_code(error_code):
+        record.last_error_code = error_code
+    else:
+        record.last_error_code = UNRECOGNIZED_ERROR_CODE
     return record
 
 

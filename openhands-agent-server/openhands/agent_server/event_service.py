@@ -19,6 +19,14 @@ from openhands.agent_server.conversation_lease import (
     ConversationLease,
     ConversationOwnershipLostError,
 )
+from openhands.agent_server.governance_attention import (
+    AttentionAction,
+    ResolveError,
+    ResolveResponse,
+    apply_close,
+    apply_retry,
+    check_resolvable,
+)
 from openhands.agent_server.governance_client import (
     GovernanceClient,
     GovernancePermanentError,
@@ -34,9 +42,12 @@ from openhands.agent_server.governance_outbox import (
     RETRIABLE_STATES,
     TERMINAL_STATES,
     GovernanceOutbox,
+    NeedsAttentionReason,
     OutboxRecord,
     OutboxState,
     check_governed_binding_required,
+    is_safe_error_code,
+    mark_needs_attention,
     record_attempt,
 )
 from openhands.agent_server.models import (
@@ -293,6 +304,32 @@ def _advance_only_from(
     return _apply
 
 
+def _error_code_of(exc: BaseException) -> str:
+    """A label for ``OutboxRecord.last_error_code``: central's ``error_code``
+    when the exception carries a well-formed one, else the exception class
+    name. Never the message, which can contain request detail. The code comes
+    from a response body this device does not control, hence the shape check
+    (``mark_needs_attention`` enforces the same rule at the point of writing)."""
+    code = getattr(exc, "error_code", None)
+    return code if is_safe_error_code(code) else type(exc).__name__
+
+
+def _needs_attention_only_from(
+    expected: OutboxState,
+    reason: NeedsAttentionReason,
+    error_code: str | None,
+) -> Callable[[OutboxRecord], OutboxRecord]:
+    """Like ``_advance_only_from`` for NEEDS_ATTENTION: parks the record only
+    if it is still in ``expected``, else only bumps the retry bookkeeping."""
+
+    def _apply(record: OutboxRecord) -> OutboxRecord:
+        if record.state != expected:
+            return record_attempt(record)
+        return mark_needs_attention(record, reason, error_code=error_code)
+
+    return _apply
+
+
 def _late_report_conclusion(outcome: str) -> str:
     """The ``conclusion`` a late_report carries for a device outcome. Only a
     success confirms that the action ran. A definite failure does not prove
@@ -404,6 +441,10 @@ class EventService:
     _explicit_interrupt_generation: int = field(default=0, init=False)
     _closing: bool = field(default=False, init=False)
     _run_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # Serialises operator resolves of one conversation's NEEDS_ATTENTION record:
+    # abandon calls central and rejects the action *before* it commits the
+    # record, so two overlapping resolves must not interleave.
+    _resolve_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _callback_wrapper: AsyncCallbackWrapper | None = field(default=None, init=False)
     _lease: ConversationLease | None = field(default=None, init=False)
     _lease_generation: int | None = field(default=None, init=False)
@@ -773,13 +814,16 @@ class EventService:
                     idempotency_key=f"claim-{record.request_id}",
                     execution_commitment=record.registered_commitment(),
                 )
-            except GovernancePermanentError:
+            except GovernancePermanentError as exc:
                 logger.exception(
                     "outbox relay: claim permanently failed for approval %s",
                     record.central_approval_id,
                 )
+                code = _error_code_of(exc)
                 await self.governance_outbox.mutate(
-                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
+                    )
                 )
                 return
             except Exception:
@@ -853,8 +897,11 @@ class EventService:
                     "approval %s",
                     record.central_approval_id,
                 )
+                code = _error_code_of(exc)
                 await self.governance_outbox.mutate(
-                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.REPORT_FAILED, error_code=code
+                    )
                 )
             except Exception:
                 logger.warning(
@@ -954,14 +1001,16 @@ class EventService:
                     OutboxState.RECONCILIATION_REPORTED,
                 )
             )
-        except GovernancePermanentError:
+        except GovernancePermanentError as exc:
             logger.exception(
                 "late_report permanently refused for approval %s",
                 record.central_approval_id,
             )
             await self.governance_outbox.mutate(
-                _advance_only_from(
-                    OutboxState.RECONCILIATION_PENDING, OutboxState.NEEDS_ATTENTION
+                _needs_attention_only_from(
+                    OutboxState.RECONCILIATION_PENDING,
+                    NeedsAttentionReason.LATE_REPORT_REFUSED,
+                    _error_code_of(exc),
                 )
             )
         except Exception:
@@ -1119,9 +1168,17 @@ class EventService:
                         central_approval_id,
                         status,
                     )
+                    # Only cancelled/expired are known to mean "no execution
+                    # attempt exists". Any other status may mean another
+                    # request already moved the approval on (claimed, ran).
+                    reason = (
+                        NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED
+                        if status in ("cancelled", "expired")
+                        else NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
+                    )
                     await self.governance_outbox.mutate(
-                        lambda r: record_attempt(
-                            r, new_state=OutboxState.NEEDS_ATTENTION
+                        lambda r: mark_needs_attention(
+                            r, reason, error_code=f"status={status}"
                         )
                     )
                 return
@@ -2648,8 +2705,11 @@ class EventService:
                 "failed to report governed execution result for approval %s",
                 record.central_approval_id,
             )
+            code = _error_code_of(exc)
             await self.governance_outbox.mutate(
-                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                lambda r: mark_needs_attention(
+                    r, NeedsAttentionReason.REPORT_FAILED, error_code=code
+                )
             )
         except Exception:
             # Transient (network/5xx) or unclassified — leave state as
@@ -2714,13 +2774,16 @@ class EventService:
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "failed to reconcile orphaned governance claim %s during close",
                 record.central_approval_id,
             )
+            code = _error_code_of(exc)
             await self.governance_outbox.mutate(
-                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                lambda r: mark_needs_attention(
+                    r, NeedsAttentionReason.RECONCILE_FAILED, error_code=code
+                )
             )
 
     async def cancel_unclaimed_governance_approval(self) -> None:
@@ -2786,6 +2849,218 @@ class EventService:
                 self.stored.id,
                 exc_info=True,
             )
+
+    async def _action_still_pending(self, action_event_id: str) -> bool | None:
+        """Whether the conversation is waiting for confirmation of exactly this
+        action: waiting, with this action the only one pending. None if there is
+        no live conversation to ask. ``reject_pending_actions()`` rejects *every*
+        pending action and flips a waiting conversation to idle, so anything
+        short of an exact match must not be rejected on a record's behalf."""
+        if self._conversation is None:
+            return None
+        if (
+            await self._get_execution_status()
+            != ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        ):
+            return False
+        loop = asyncio.get_running_loop()
+        pending = await loop.run_in_executor(None, self._snapshot_pending_actions_sync)
+        return [a.id for a in pending] == [action_event_id]
+
+    def _reject_if_only_sync(self, action_event_id: str, reason: str) -> bool:
+        """Rejects the pending action iff the conversation is waiting for
+        confirmation of exactly ``action_event_id`` and nothing else. Off-loop.
+
+        The state lock is held across the check and the reject (it is reentrant
+        per thread, and ``reject_pending_actions()`` takes it again), so what is
+        rejected is what was checked. Checking first and then calling the
+        rejecting method separately would let a confirmation or a new action slip
+        in between, and it rejects *everything* pending."""
+        conversation = self._conversation
+        if conversation is None:  # closed since the caller looked
+            return False
+        with conversation._state as state:
+            if (
+                state.execution_status
+                != ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            ):
+                return False
+            pending = ConversationState.get_unmatched_actions(state.active_branch())
+            if [a.id for a in pending] != [action_event_id]:
+                return False
+            conversation.reject_pending_actions(reason)
+            return True
+
+    def _load_outbox_for_resolve(self) -> OutboxRecord | None:
+        """The current outbox record, with a file that cannot be read reported as
+        the operator-facing ``unreadable_outbox`` instead of a raw parse error.
+        Used for every read of a resolve, including the one made after central has
+        already been told, where a raw error would leave the caller with a generic
+        server error and no hint that central and this device now disagree."""
+        try:
+            return self.governance_outbox.load()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ResolveError(
+                "unreadable_outbox",
+                f"the outbox could not be read ({type(exc).__name__})",
+            ) from exc
+
+    async def _cancel_or_abort_at_central(
+        self, client: GovernanceClient, record: OutboxRecord
+    ) -> Literal["cancelled", "aborted", "already_terminal"]:
+        """Withdraws the approval at central: cancel while it is still pending,
+        the pre-claim abort once someone accepted it, nothing if it is already
+        terminal. Same calls and idempotency keys as
+        ``cancel_unclaimed_governance_approval()``, but fail-closed: an
+        operator asked for this and is told when central did not agree, instead
+        of the failure being logged and swallowed as on conversation delete."""
+        assert record.central_approval_id is not None
+        approval_id = record.central_approval_id
+        try:
+            await client.cancel(
+                approval_id, idempotency_key=f"cancel-{record.request_id}"
+            )
+            return "cancelled"
+        except GovernancePermanentError as exc:
+            if exc.error_code != "illegal_transition":
+                raise ResolveError(
+                    "central_failed",
+                    f"central refused the cancel ({_error_code_of(exc)})",
+                ) from exc
+        except Exception as exc:
+            raise ResolveError(
+                "central_failed",
+                f"central could not be asked to cancel ({type(exc).__name__})",
+            ) from exc
+        # Not pending any more: accepted (abort it) or already terminal.
+        try:
+            await client.report_result(
+                approval_id, idempotency_key=f"abort-{record.request_id}"
+            )
+            return "aborted"
+        except GovernancePermanentError as exc:
+            if exc.error_code == "illegal_transition":
+                return "already_terminal"
+            raise ResolveError(
+                "central_failed", f"central refused the abort ({_error_code_of(exc)})"
+            ) from exc
+        except Exception as exc:
+            raise ResolveError(
+                "central_failed",
+                f"central could not be asked to abort ({type(exc).__name__})",
+            ) from exc
+
+    async def resolve_needs_attention(
+        self,
+        action: AttentionAction,
+        *,
+        expected_request_id: str,
+        note: str | None,
+    ) -> ResolveResponse:
+        """Acts on an outbox record parked in NEEDS_ATTENTION (operator request).
+
+        * ``retry``: puts the record back in the state the relay already knows
+          how to repeat (same idempotency keys); the next relay cycle does it.
+        * ``abandon``: withdraws the approval at central, rejects the pending
+          action locally and ends the record as CANCELLED. Only offered for
+          reasons where no execution attempt can exist.
+        * ``dismiss``: ends the record as RESOLVED_MANUALLY. No other effect.
+
+        Every precondition is checked before any side effect, and checked again
+        inside the locked write, so a request made from a stale view fails
+        instead of acting on a different workflow. Resolves of one conversation
+        run one at a time: a second one is checked against what the first left.
+        """
+        async with self._resolve_lock:
+            return await self._resolve_needs_attention_locked(
+                action, expected_request_id=expected_request_id, note=note
+            )
+
+    async def _resolve_needs_attention_locked(
+        self,
+        action: AttentionAction,
+        *,
+        expected_request_id: str,
+        note: str | None,
+    ) -> ResolveResponse:
+        if self.governance_deployment_mode != "team":
+            raise ResolveError("not_team_mode", "governance is not in team mode")
+        record = check_resolvable(
+            self._load_outbox_for_resolve(), action, expected_request_id
+        )
+
+        central_step: Literal[
+            "not_applicable", "cancelled", "aborted", "already_terminal"
+        ] = "not_applicable"
+        if action is AttentionAction.RETRY:
+            updated = await self.governance_outbox.mutate(
+                lambda r: apply_retry(r, expected_request_id)
+            )
+        elif action is AttentionAction.DISMISS:
+            updated = await self.governance_outbox.mutate(
+                lambda r: apply_close(r, action, expected_request_id, note)
+            )
+        else:
+            client = self.governance_client
+            if client is None:
+                raise ResolveError(
+                    "central_client_unavailable",
+                    "the central governance client is not configured",
+                )
+            if self._conversation is None:
+                raise ResolveError(
+                    "conversation_inactive",
+                    "the conversation is not active, so its pending action "
+                    "cannot be rejected",
+                )
+            central_step = await self._cancel_or_abort_at_central(client, record)
+            # Central has been told; if the record moved meanwhile, stop before
+            # touching the conversation (the final write checks once more).
+            check_resolvable(
+                self._load_outbox_for_resolve(), action, expected_request_id
+            )
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.run_in_executor(
+                    None,
+                    self._reject_if_only_sync,
+                    record.action_event_id,
+                    "the governed approval was abandoned by an operator",
+                )
+            except Exception as exc:
+                # Central already agreed and the record is untouched, so the
+                # same abandon can simply be repeated (central answers it as
+                # already terminal).
+                raise ResolveError(
+                    "reject_failed",
+                    "central was told, but rejecting the pending action here "
+                    f"failed ({type(exc).__name__}); the abandon can be repeated",
+                ) from exc
+            updated = await self.governance_outbox.mutate(
+                lambda r: apply_close(r, action, expected_request_id, note)
+            )
+        logger.info(
+            "operator %s on the governance outbox of conversation %s "
+            "(reason=%s, error_code=%s, request_id=%s) -> %s",
+            action.value,
+            self.stored.id,
+            record.needs_attention_reason,
+            record.last_error_code,
+            record.request_id,
+            updated.state.value,
+        )
+        return ResolveResponse(
+            conversation_id=str(self.stored.id),
+            action=action,
+            request_id=record.request_id,
+            new_state=updated.state.value,
+            central_step=central_step,
+            conversation_still_waiting=(
+                None
+                if action is AttentionAction.RETRY
+                else await self._action_still_pending(record.action_event_id)
+            ),
+        )
 
     async def run_and_wait_for_start(
         self, *, central_approval_id: str, timeout_seconds: float = 20.0
@@ -2924,12 +3199,15 @@ class EventService:
                     idempotency_key=f"claim-{outbox_record.request_id}",
                     execution_commitment=outbox_record.registered_commitment(),
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "claim failed for governance approval %s", central_approval_id
                 )
+                code = _error_code_of(exc)
                 await self.governance_outbox.mutate(
-                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
+                    )
                 )
                 _resolve_handshake_once(
                     future, GovernanceStartOutcome.REJECTED_CLAIM_FAILED
@@ -3161,13 +3439,16 @@ class EventService:
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "failed to report binding-mismatch failure for approval %s",
                 central_approval_id,
             )
+            code = _error_code_of(exc)
             await self.governance_outbox.mutate(
-                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                lambda r: mark_needs_attention(
+                    r, NeedsAttentionReason.BINDING_REPORT_FAILED, error_code=code
+                )
             )
 
     async def start_goal_loop(

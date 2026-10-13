@@ -21,11 +21,13 @@ from openhands.agent_server.event_service import (
     GovernanceApprovalRequiredError,
     GovernanceStartOutcome,
     GovernanceStartRejectedError,
+    _error_code_of,
     _GovernanceHandshake,
     _with_execution_attested,
     _with_execution_started,
     _with_pending_report_outcome,
 )
+from openhands.agent_server.governance_attention import AttentionAction, ResolveError
 from openhands.agent_server.governance_client import (
     GovernancePermanentError,
     GovernanceTransientError,
@@ -33,8 +35,10 @@ from openhands.agent_server.governance_client import (
 )
 from openhands.agent_server.governance_display import POLICY_REVISION, build_display
 from openhands.agent_server.governance_outbox import (
+    NeedsAttentionReason,
     OutboxRecord,
     OutboxState,
+    mark_needs_attention,
     record_attempt,
 )
 from openhands.agent_server.models import (
@@ -4617,6 +4621,8 @@ class TestEventServiceGovernanceOrchestration:
         updated = governed_service.governance_outbox.load()
         assert updated is not None
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.CLAIM_FAILED
+        assert updated.last_error_code == "RuntimeError"
 
     @pytest.mark.asyncio
     async def test_claim_and_run_governed_reports_binding_mismatch_to_central(
@@ -4749,6 +4755,10 @@ class TestEventServiceGovernanceOrchestration:
         updated = governed_service.governance_outbox.load()
         assert updated is not None
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason == NeedsAttentionReason.BINDING_REPORT_FAILED
+        )
+        assert updated.last_error_code == "RuntimeError"
 
     # ---------------- maybe_report_governance_result ----------------
 
@@ -6127,6 +6137,8 @@ class TestEventServiceGovernanceOrchestration:
 
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.CLAIM_FAILED
+        assert updated.last_error_code == "not_found"
 
     @pytest.mark.asyncio
     async def test_relay_claim_inflight_transient_error_keeps_retrying(
@@ -6970,6 +6982,8 @@ class TestEventServiceGovernanceOrchestration:
 
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "validation_error"
 
     # ---------------- late report after central failed the attempt ----------------
     # When the device holds the real outcome but central already moved the
@@ -7065,10 +7079,10 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service._relay_outbox_once()
 
         client.reconciliation_finding.assert_not_awaited()
-        assert (
-            governed_service.governance_outbox.load().state
-            == OutboxState.NEEDS_ATTENTION
-        )
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "illegal_transition"
 
     @pytest.mark.asyncio
     async def test_relay_keeps_retrying_when_central_status_cannot_be_read(
@@ -7110,10 +7124,10 @@ class TestEventServiceGovernanceOrchestration:
 
         client.wait.assert_not_awaited()
         client.reconciliation_finding.assert_not_awaited()
-        assert (
-            governed_service.governance_outbox.load().state
-            == OutboxState.NEEDS_ATTENTION
-        )
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "execution_attempt_mismatch"
 
     @pytest.mark.asyncio
     async def test_late_report_is_retried_from_reconciliation_pending(
@@ -7162,10 +7176,12 @@ class TestEventServiceGovernanceOrchestration:
 
         await governed_service._relay_outbox_once()
 
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
         assert (
-            governed_service.governance_outbox.load().state
-            == OutboxState.NEEDS_ATTENTION
+            updated.needs_attention_reason == NeedsAttentionReason.LATE_REPORT_REFUSED
         )
+        assert updated.last_error_code == "late_report_not_applicable"
 
     @pytest.mark.asyncio
     async def test_concurrent_fallbacks_do_not_move_a_finished_record_backwards(
@@ -7282,6 +7298,851 @@ class TestEventServiceGovernanceOrchestration:
             governed_service.governance_outbox.load().state
             == OutboxState.RECONCILIATION_REPORTED
         )
+
+    @pytest.mark.asyncio
+    async def test_inline_report_permanent_refusal_records_why(self, governed_service):
+        """A permanent refusal of the first (inline) report that is not the
+        failed_unknown case ends in NEEDS_ATTENTION as report_failed."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=False),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+        client = self._late_client()
+        client.report_result = AsyncMock(
+            side_effect=GovernancePermanentError(
+                "bad", error_code="execution_attempt_mismatch", status_code=409
+            )
+        )
+        governed_service.governance_client = client
+
+        await governed_service.maybe_report_governance_result()
+
+        client.reconciliation_finding.assert_not_awaited()
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "execution_attempt_mismatch"
+
+    @pytest.mark.parametrize(
+        "central_code",
+        [
+            "oops token=sk-123 leaked",  # free text with a space
+            "x" * 65,  # too long
+            {"nested": "object"},  # not a string
+            "",  # empty
+            None,  # absent
+        ],
+    )
+    def test_error_code_of_falls_back_to_the_class_name(self, central_code):
+        exc = GovernancePermanentError("m", error_code=central_code, status_code=400)
+        assert _error_code_of(exc) == "GovernancePermanentError"
+
+    def test_error_code_of_keeps_a_well_formed_central_code(self):
+        exc = GovernancePermanentError(
+            "m", error_code="illegal_transition", status_code=409
+        )
+        assert _error_code_of(exc) == "illegal_transition"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_after_close_failure_records_why(self, governed_service):
+        """The failure_unknown report made while closing is the one report
+        nobody retries (the relay is already stopped): it must say why it was
+        parked."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+        client = MagicMock()
+        client.report_result = AsyncMock(side_effect=RuntimeError("network down"))
+        governed_service.governance_client = client
+
+        await governed_service._reconcile_governance_after_close()
+
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.RECONCILE_FAILED
+        assert updated.last_error_code == "RuntimeError"
+
+    # ---------------- resolve_needs_attention (operator actions) ----------------
+
+    async def _park(
+        self,
+        governed_service,
+        reason: NeedsAttentionReason,
+        *,
+        execution_attempt_id: str | None = None,
+        pending_report_outcome: str | None = None,
+        action: ActionEvent | None = None,
+    ) -> OutboxRecord:
+        """A record parked in NEEDS_ATTENTION for ``reason``, as the entry
+        points leave it. ``action`` is the action it governs: pass the same
+        event the conversation is made to wait on, or the record will (rightly)
+        be treated as governing a different one."""
+        record = await self._create_outbox_record(
+            governed_service, state=OutboxState.CLAIM_INFLIGHT
+        )
+
+        def _set(r: OutboxRecord) -> OutboxRecord:
+            r.execution_attempt_id = execution_attempt_id
+            r.pending_report_outcome = pending_report_outcome
+            if action is not None:
+                r.action_event_id = action.id
+            return mark_needs_attention(r, reason, error_code="x_code")
+
+        await governed_service.governance_outbox.mutate(_set)
+        return record
+
+    def _central(self, **overrides) -> MagicMock:
+        client = MagicMock()
+        client.cancel = AsyncMock(return_value={"status": "cancelled"})
+        client.report_result = AsyncMock(return_value={"status": "ok"})
+        client.claim = AsyncMock(
+            return_value={
+                "execution_attempt_id": "attempt-new",
+                "executing_lease_expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        )
+        for name, value in overrides.items():
+            setattr(client, name, value)
+        return client
+
+    def _waiting_on(self, governed_service, *actions) -> None:
+        conversation = self._mock_conversation(list(actions))
+        conversation._state.execution_status = (
+            ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        conversation.reject_pending_actions = MagicMock()
+        governed_service._conversation = conversation
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+
+    def _rejected(self, governed_service) -> MagicMock:
+        """The conversation's own reject_pending_actions (what actually rejects)."""
+        return governed_service._conversation.reject_pending_actions
+
+    def _illegal(self) -> GovernancePermanentError:
+        return GovernancePermanentError(
+            "not pending", error_code="illegal_transition", status_code=409
+        )
+
+    # -- retry: the relay must repeat exactly the step that failed --
+
+    @pytest.mark.asyncio
+    async def test_retry_claim_failed_makes_the_relay_claim_again_with_the_same_key(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None
+        )
+
+        assert result.new_state == "claim_inflight"
+        assert result.central_step == "not_applicable"
+        assert result.conversation_still_waiting is None
+        # Nothing is sent by the resolve itself: the relay does it.
+        client.claim.assert_not_awaited()
+        await governed_service._relay_outbox_once()
+        client.claim.assert_awaited_once()
+        assert client.claim.call_args.kwargs["idempotency_key"] == "claim-req-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("reason", "stored_outcome", "expected_outcome"),
+        [
+            (NeedsAttentionReason.REPORT_FAILED, "success", "success"),
+            (
+                NeedsAttentionReason.RECONCILE_FAILED,
+                "failure_unknown",
+                "failure_unknown",
+            ),
+            # the tool never ran, so the outcome to re-send is not stored
+            (NeedsAttentionReason.BINDING_REPORT_FAILED, None, "failure_definite"),
+        ],
+    )
+    async def test_retry_report_failures_resend_the_same_report(
+        self, governed_service, reason, stored_outcome, expected_outcome
+    ):
+        await self._park(
+            governed_service,
+            reason,
+            execution_attempt_id="attempt-1",
+            pending_report_outcome=stored_outcome,
+        )
+        client = self._central()
+        governed_service.governance_client = client
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None
+        )
+        assert result.new_state == "result_pending"
+        await governed_service._relay_outbox_once()
+
+        client.report_result.assert_awaited_once()
+        kwargs = client.report_result.call_args.kwargs
+        # Same key as the original report, so central replays rather than
+        # applying a second result for the same execution attempt.
+        assert kwargs["idempotency_key"] == "report-attempt-1"
+        assert kwargs["outcome"] == expected_outcome
+        assert kwargs["execution_attempt_id"] == "attempt-1"
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RESULT_REPORTED
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_clears_the_stale_reason_and_leaves_the_counters(
+        self, governed_service
+    ):
+        parked = await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        before = governed_service.governance_outbox.load()
+
+        await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None
+        )
+
+        after = governed_service.governance_outbox.load()
+        assert after.needs_attention_reason is None
+        assert after.last_error_code is None
+        assert after.attempt_count == before.attempt_count
+        assert after.request_id == parked.request_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            NeedsAttentionReason.REPORT_FAILED,
+            NeedsAttentionReason.RECONCILE_FAILED,
+            NeedsAttentionReason.BINDING_REPORT_FAILED,
+        ],
+    )
+    async def test_retry_without_an_execution_attempt_is_refused_untouched(
+        self, governed_service, reason
+    ):
+        """The relay asserts these fields; parking a record without them would
+        crash the relay loop on every cycle."""
+        await self._park(governed_service, reason, execution_attempt_id=None)
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "retry_not_possible"
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_retry_report_without_a_stored_outcome_is_refused_untouched(
+        self, governed_service
+    ):
+        await self._park(
+            governed_service,
+            NeedsAttentionReason.REPORT_FAILED,
+            execution_attempt_id="attempt-1",
+            pending_report_outcome=None,
+        )
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "retry_not_possible"
+        assert governed_service.governance_outbox.load() == before
+
+    # -- preconditions: refused before any side effect --
+
+    @pytest.mark.asyncio
+    async def test_abandon_is_refused_where_the_action_may_have_run(
+        self, governed_service
+    ):
+        await self._park(
+            governed_service,
+            NeedsAttentionReason.REPORT_FAILED,
+            execution_attempt_id="attempt-1",
+            pending_report_outcome="success",
+        )
+        client = self._central()
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, _governance_pending_action())
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "action_not_allowed"
+        assert exc.value.allowed_actions == ["retry", "dismiss"]
+        client.cancel.assert_not_awaited()
+        client.report_result.assert_not_awaited()
+        self._rejected(governed_service).assert_not_called()
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_resolve_for_another_workflow_is_refused_untouched(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central()
+        governed_service.governance_client = client
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-OTHER", note=None
+            )
+
+        assert exc.value.error_code == "request_id_mismatch"
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_resolve_after_the_record_moved_on_is_refused(self, governed_service):
+        await self._create_outbox_record(governed_service, state=OutboxState.CLAIMED)
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "state_changed"
+
+    @pytest.mark.asyncio
+    async def test_resolve_without_an_outbox_is_not_found(self, governed_service):
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_resolve_outside_team_mode_is_refused(self, governed_service):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        governed_service.governance_deployment_mode = "personal"
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "not_team_mode"
+
+    @pytest.mark.asyncio
+    async def test_resolve_with_an_unreadable_outbox_says_so(self, governed_service):
+        governed_service.governance_outbox._path.write_text("{broken", encoding="utf-8")
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.DISMISS, expected_request_id="req-1", note="x"
+            )
+
+        assert exc.value.error_code == "unreadable_outbox"
+
+    # -- dismiss --
+
+    @pytest.mark.asyncio
+    async def test_dismiss_ends_the_record_and_keeps_the_history(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="checked at central, nothing to report",
+        )
+
+        assert result.new_state == "resolved_manually"
+        assert result.conversation_still_waiting is None  # no live conversation
+        stored = governed_service.governance_outbox.load()
+        assert stored.state == OutboxState.RESOLVED_MANUALLY
+        assert stored.resolution_note == "checked at central, nothing to report"
+        assert stored.resolved_at is not None
+        assert stored.needs_attention_reason == "report_failed"  # history kept
+        assert stored.last_error_code == "x_code"
+        # No effect beyond the record.
+        client.cancel.assert_not_awaited()
+        client.report_result.assert_not_awaited()
+        client.claim.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dismiss_says_when_the_conversation_is_still_waiting_on_the_action(
+        self, governed_service
+    ):
+        """After dismiss the record no longer governs the action, and run() is
+        blocked for a finished record, so the operator must be told it still
+        has to be rejected."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.LATE_REPORT_REFUSED, action=action
+        )
+        self._waiting_on(governed_service, action)
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS, expected_request_id="req-1", note="why"
+        )
+
+        assert result.conversation_still_waiting is True
+        self._rejected(governed_service).assert_not_called()  # not on dismiss
+
+    @pytest.mark.asyncio
+    async def test_dismiss_then_a_different_action_is_governed_again(
+        self, governed_service
+    ):
+        """The point of the whole feature: the conversation is not stuck."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS, expected_request_id="req-1", note="why"
+        )
+        new_action = _governance_pending_action(call_id="call_2")
+        self._waiting_on(governed_service, new_action)
+        governed_service._create_governance_approval = AsyncMock()
+
+        await governed_service.maybe_register_governance_approval()
+        await asyncio.sleep(0)
+
+        governed_service._create_governance_approval.assert_called_once_with(new_action)
+
+    # -- abandon --
+
+    @pytest.mark.asyncio
+    async def test_abandon_cancels_at_central_rejects_the_action_and_ends_the_record(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        client = self._central()
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, action)
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note="not wanted"
+        )
+
+        client.cancel.assert_awaited_once()
+        assert client.cancel.call_args.args == ("approval-1",)
+        assert client.cancel.call_args.kwargs["idempotency_key"] == "cancel-req-1"
+        self._rejected(governed_service).assert_called_once()
+        assert result.central_step == "cancelled"
+        assert result.new_state == "cancelled"
+        stored = governed_service.governance_outbox.load()
+        assert stored.state == OutboxState.CANCELLED
+        assert stored.resolution_note == "not wanted"
+
+    @pytest.mark.asyncio
+    async def test_abandon_aborts_an_already_accepted_approval(self, governed_service):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central(cancel=AsyncMock(side_effect=self._illegal()))
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, _governance_pending_action())
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        client.report_result.assert_awaited_once()
+        assert client.report_result.call_args.kwargs["idempotency_key"] == "abort-req-1"
+        assert result.central_step == "aborted"
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_abandon_of_an_approval_central_already_ended_still_unblocks(
+        self, governed_service
+    ):
+        """approval_cancelled_or_expired: central is already past it, so both
+        calls are refused as illegal transitions. That is not an error."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service,
+            NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED,
+            action=action,
+        )
+        client = self._central(
+            cancel=AsyncMock(side_effect=self._illegal()),
+            report_result=AsyncMock(side_effect=self._illegal()),
+        )
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, action)
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        assert result.central_step == "already_terminal"
+        self._rejected(governed_service).assert_called_once()
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("network down"),
+            GovernancePermanentError(
+                "no", error_code="authorization_denied", status_code=403
+            ),
+        ],
+    )
+    async def test_abandon_fails_closed_when_central_does_not_agree(
+        self, governed_service, failure
+    ):
+        """If central cannot be told, nothing else happens: the record is not
+        ended and the conversation's action is not rejected, so the operator
+        can try again (or dismiss on purpose) instead of being told it worked."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central(cancel=AsyncMock(side_effect=failure))
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, _governance_pending_action())
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "central_failed"
+        self._rejected(governed_service).assert_not_called()
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_abandon_fails_closed_when_the_abort_is_refused(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central(
+            cancel=AsyncMock(side_effect=self._illegal()),
+            report_result=AsyncMock(
+                side_effect=GovernancePermanentError(
+                    "mismatch", error_code="execution_attempt_mismatch", status_code=409
+                )
+            ),
+        )
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, _governance_pending_action())
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "central_failed"
+        self._rejected(governed_service).assert_not_called()
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_abandon_does_not_reject_a_different_pending_action(
+        self, governed_service
+    ):
+        """reject_pending_actions() rejects everything pending. If the agent has
+        since asked for another action, rejecting it on this record's behalf
+        would be rejecting something nobody looked at."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central()
+        governed_service.governance_client = client
+        other = _governance_pending_action(call_id="call_other")
+        self._waiting_on(governed_service, other)
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        self._rejected(governed_service).assert_not_called()
+        assert result.conversation_still_waiting is False
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_abandon_does_not_reject_when_not_waiting_for_confirmation(
+        self, governed_service
+    ):
+        # The record's own action IS the pending one, so only the status stops
+        # the reject; with an unrelated action this test could not tell.
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        governed_service.governance_client = self._central()
+        self._waiting_on(governed_service, action)
+        governed_service._conversation._state.execution_status = (
+            ConversationExecutionStatus.IDLE
+        )
+        governed_service._get_execution_status = AsyncMock(
+            return_value=ConversationExecutionStatus.IDLE
+        )
+
+        await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        self._rejected(governed_service).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_abandon_without_a_live_conversation_changes_nothing(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "conversation_inactive"
+        client.cancel.assert_not_awaited()  # refused before touching central
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_abandon_without_a_central_client_changes_nothing(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        governed_service.governance_client = None
+        self._waiting_on(governed_service, _governance_pending_action())
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "central_client_unavailable"
+        self._rejected(governed_service).assert_not_called()
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_abandon_does_not_overwrite_a_record_that_changed_meanwhile(
+        self, governed_service
+    ):
+        """The checks run again inside the locked write. If someone else moved
+        the record while central was being called, this request must not
+        overwrite their result, and must not reject the conversation's action."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+
+        async def _someone_else_resolves(*_args, **_kwargs):
+            await governed_service.governance_outbox.mutate(
+                lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
+            )
+            return {"status": "cancelled"}
+
+        client = self._central(cancel=AsyncMock(side_effect=_someone_else_resolves))
+        governed_service.governance_client = client
+        # The record's own action is the pending one: without the re-check it
+        # WOULD be rejected, which is what this test is here to rule out.
+        self._waiting_on(governed_service, action)
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "state_changed"
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RESULT_REPORTED
+        )
+        # Central had already been told, but the conversation is left alone.
+        self._rejected(governed_service).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_outbox_damaged_while_central_is_being_told_is_reported_as_such(
+        self, governed_service
+    ):
+        """The re-read after the central call must not leak a raw parse error:
+        central has already agreed, so the caller needs the named error to know
+        what state things are in (and that the abandon can be repeated)."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+
+        async def _damage_the_outbox(*_args, **_kwargs):
+            governed_service.governance_outbox._path.write_text(
+                "{broken", encoding="utf-8"
+            )
+            return {"status": "cancelled"}
+
+        governed_service.governance_client = self._central(
+            cancel=AsyncMock(side_effect=_damage_the_outbox)
+        )
+        self._waiting_on(governed_service, action)
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "unreadable_outbox"
+        self._rejected(governed_service).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_resolve_in_progress_finishes_before_the_next_one_starts(
+        self, governed_service
+    ):
+        """Abandon calls central and rejects the action *before* it commits the
+        record. A retry that arrives while it is waiting on central must not
+        commit in between and leave the abandon having cancelled an approval the
+        retry is about to claim: whoever started first finishes first."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        in_central = asyncio.Event()
+        release_central = asyncio.Event()
+
+        async def _slow_cancel(*_args, **_kwargs):
+            in_central.set()
+            await release_central.wait()
+            return {"status": "cancelled"}
+
+        governed_service.governance_client = self._central(
+            cancel=AsyncMock(side_effect=_slow_cancel)
+        )
+        self._waiting_on(governed_service, action)
+
+        abandon = asyncio.create_task(
+            governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+        )
+        await in_central.wait()  # the abandon is now parked inside the central call
+        retry = asyncio.create_task(
+            governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+        )
+        await asyncio.sleep(0.05)  # a retry with no lock would commit right here
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.NEEDS_ATTENTION
+        )
+        release_central.set()
+        abandoned, retried = await asyncio.gather(
+            abandon, retry, return_exceptions=True
+        )
+
+        assert not isinstance(abandoned, BaseException)
+        assert abandoned.new_state == "cancelled"
+        assert isinstance(retried, ResolveError)
+        assert retried.error_code == "state_changed"
+        self._rejected(governed_service).assert_called_once()
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_abandon_rejects_while_holding_the_state_lock_it_checked_under(
+        self, governed_service
+    ):
+        """Checking "only this action is pending" and then calling the rejecting
+        method separately lets another action slip in between, and that method
+        rejects everything pending. The check and the reject must be one critical
+        section."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        governed_service.governance_client = self._central()
+        self._waiting_on(governed_service, action)
+        state = governed_service._conversation._state
+        depth = {"held": 0}
+
+        def _enter(*_args):
+            depth["held"] += 1
+            return state
+
+        def _exit(*_args):
+            depth["held"] -= 1
+
+        state.__enter__ = MagicMock(side_effect=_enter)
+        state.__exit__ = MagicMock(side_effect=_exit)
+        held_when_rejecting: list[int] = []
+        governed_service._conversation.reject_pending_actions = MagicMock(
+            side_effect=lambda reason: held_when_rejecting.append(depth["held"])
+        )
+
+        await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        assert held_when_rejecting == [1]  # called once, inside the critical section
+
+    @pytest.mark.asyncio
+    async def test_abandon_can_be_repeated_after_the_local_reject_failed(
+        self, governed_service
+    ):
+        """Central is told first, so a failure after that must leave the record
+        alone and the same request must work the second time (central answers
+        the repeated cancel and abort as already terminal)."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        client = self._central()
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, action)
+        self._rejected(governed_service).side_effect = RuntimeError("conversation shut")
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "reject_failed"
+        assert governed_service.governance_outbox.load() == before
+
+        # Second attempt: the conversation can be rejected now; central has
+        # already ended the approval.
+        self._rejected(governed_service).side_effect = None
+        client.cancel.side_effect = self._illegal()
+        client.report_result.side_effect = self._illegal()
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        assert result.central_step == "already_terminal"
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_abandon_on_a_conversation_closed_since_the_check_does_not_crash(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        governed_service.governance_client = self._central()
+        self._waiting_on(governed_service, _governance_pending_action())
+        governed_service._conversation = None  # closed between check and reject
+
+        # The early live-conversation check refuses before any side effect.
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "conversation_inactive"
+        assert governed_service._reject_if_only_sync("any", "r") is False
 
     @pytest.mark.asyncio
     async def test_start_creates_outbox_relay_task_in_team_mode(
@@ -7401,6 +8262,86 @@ class TestEventServiceGovernanceOrchestration:
 
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED
+        )
+        assert updated.last_error_code == "status=cancelled"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status", ["executing", "applied", "failed_definite", "failed_unknown"]
+    )
+    async def test_wait_for_decision_other_status_is_not_filed_as_cancelled(
+        self, governed_service, status
+    ):
+        """/wait answers with the *current* status, so another request may
+        already have claimed or finished the approval. Only cancelled/expired
+        mean "no execution attempt exists"; anything else must not carry that
+        reason, because it decides whether an operator may abandon the action."""
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        fake_client = MagicMock()
+        fake_client.wait = AsyncMock(
+            return_value={"id": "approval-1", "status": status, "changed": True}
+        )
+        governed_service.governance_client = fake_client
+
+        await governed_service._wait_for_decision_loop("approval-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
+        )
+        assert updated.last_error_code == f"status={status}"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_decision_status_from_central_is_not_persisted_verbatim(
+        self, governed_service
+    ):
+        """The status comes from a response body this device does not control;
+        free text in it must not reach the outbox file."""
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        fake_client = MagicMock()
+        fake_client.wait = AsyncMock(
+            return_value={
+                "id": "approval-1",
+                "status": "oops token=sk-123 leaked\nline2",
+                "changed": True,
+            }
+        )
+        governed_service.governance_client = fake_client
+
+        await governed_service._wait_for_decision_loop("approval-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
+        )
+        assert updated.last_error_code == "unrecognized"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_decision_expired_is_filed_as_cancelled_or_expired(
+        self, governed_service
+    ):
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        fake_client = MagicMock()
+        fake_client.wait = AsyncMock(
+            return_value={"id": "approval-1", "status": "expired", "changed": True}
+        )
+        governed_service.governance_client = fake_client
+
+        await governed_service._wait_for_decision_loop("approval-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED
+        )
+        assert updated.last_error_code == "status=expired"
 
     @pytest.mark.asyncio
     async def test_wait_for_decision_retries_on_unchanged_timeout(
