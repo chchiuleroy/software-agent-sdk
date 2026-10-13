@@ -7968,6 +7968,37 @@ class TestEventServiceGovernanceOrchestration:
         self._rejected(governed_service).assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_outbox_damaged_while_central_is_being_told_is_reported_as_such(
+        self, governed_service
+    ):
+        """The re-read after the central call must not leak a raw parse error:
+        central has already agreed, so the caller needs the named error to know
+        what state things are in (and that the abandon can be repeated)."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+
+        async def _damage_the_outbox(*_args, **_kwargs):
+            governed_service.governance_outbox._path.write_text(
+                "{broken", encoding="utf-8"
+            )
+            return {"status": "cancelled"}
+
+        governed_service.governance_client = self._central(
+            cancel=AsyncMock(side_effect=_damage_the_outbox)
+        )
+        self._waiting_on(governed_service, action)
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "unreadable_outbox"
+        self._rejected(governed_service).assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_a_resolve_in_progress_finishes_before_the_next_one_starts(
         self, governed_service
     ):

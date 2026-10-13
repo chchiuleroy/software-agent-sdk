@@ -2891,6 +2891,20 @@ class EventService:
             conversation.reject_pending_actions(reason)
             return True
 
+    def _load_outbox_for_resolve(self) -> OutboxRecord | None:
+        """The current outbox record, with a file that cannot be read reported as
+        the operator-facing ``unreadable_outbox`` instead of a raw parse error.
+        Used for every read of a resolve, including the one made after central has
+        already been told, where a raw error would leave the caller with a generic
+        server error and no hint that central and this device now disagree."""
+        try:
+            return self.governance_outbox.load()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ResolveError(
+                "unreadable_outbox",
+                f"the outbox could not be read ({type(exc).__name__})",
+            ) from exc
+
     async def _cancel_or_abort_at_central(
         self, client: GovernanceClient, record: OutboxRecord
     ) -> Literal["cancelled", "aborted", "already_terminal"]:
@@ -2971,14 +2985,9 @@ class EventService:
     ) -> ResolveResponse:
         if self.governance_deployment_mode != "team":
             raise ResolveError("not_team_mode", "governance is not in team mode")
-        try:
-            loaded = self.governance_outbox.load()
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise ResolveError(
-                "unreadable_outbox",
-                f"the outbox could not be read ({type(exc).__name__})",
-            ) from exc
-        record = check_resolvable(loaded, action, expected_request_id)
+        record = check_resolvable(
+            self._load_outbox_for_resolve(), action, expected_request_id
+        )
 
         central_step: Literal[
             "not_applicable", "cancelled", "aborted", "already_terminal"
@@ -3007,7 +3016,9 @@ class EventService:
             central_step = await self._cancel_or_abort_at_central(client, record)
             # Central has been told; if the record moved meanwhile, stop before
             # touching the conversation (the final write checks once more).
-            check_resolvable(self.governance_outbox.load(), action, expected_request_id)
+            check_resolvable(
+                self._load_outbox_for_resolve(), action, expected_request_id
+            )
             loop = asyncio.get_running_loop()
             try:
                 await loop.run_in_executor(
