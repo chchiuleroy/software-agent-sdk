@@ -214,6 +214,26 @@ def test_invalid_utf8_is_unreadable(tmp_path):
     assert item.reason == UNREADABLE_OUTBOX
 
 
+def test_outbox_archived_during_the_scan_is_not_reported_as_unreadable(
+    tmp_path, monkeypatch
+):
+    """Archiving renames the active file away. A scan that saw it exist a moment
+    earlier must not turn that normal event into a damaged-file warning."""
+    directory = _write(tmp_path, _parked())
+    outbox_file = directory / OUTBOX_FILENAME
+    real_read_text = Path.read_text
+
+    def _vanish_before_the_read(self, *args, **kwargs):
+        # By now exists() and stat() have both succeeded; the rename lands here.
+        if self == outbox_file:
+            outbox_file.unlink()
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _vanish_before_the_read)
+
+    assert scan_needs_attention(tmp_path) == []
+
+
 def test_oversized_outbox_is_unreadable_without_being_parsed(tmp_path, monkeypatch):
     _write(tmp_path, _parked())
     monkeypatch.setattr(attention, "MAX_OUTBOX_BYTES", 10)

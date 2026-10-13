@@ -170,6 +170,9 @@ def test_attention_lists_parked_conversations_in_team_mode(tmp_path):
 
     body = _attention_client(_team_config(), tmp_path).get(ATTENTION_URL).json()
 
+    assert len(body) == 1
+    # The time is "when it was parked": present, but not a fixed value.
+    assert body[0].pop("last_attempt_at") is not None
     assert body == [
         {
             "conversation_id": conversation_id,
@@ -178,11 +181,9 @@ def test_attention_lists_parked_conversations_in_team_mode(tmp_path):
             "central_approval_id": "approval-1",
             "request_id": "req-1",
             "attempt_count": 1,
-            "last_attempt_at": body[0]["last_attempt_at"],
             "allowed_actions": ["retry", "abandon", "dismiss"],
         }
     ]
-    assert body[0]["last_attempt_at"] is not None
 
 
 def test_attention_is_empty_when_nothing_is_parked(tmp_path):

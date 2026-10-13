@@ -131,7 +131,12 @@ def _unreadable(directory_name: str) -> AttentionItem:
 def _read_record(path: Path) -> OutboxRecord:
     """The record at ``path``; raises if it is unreadable or not a valid record.
     A symlink is refused rather than followed: the file is only ever written by
-    an atomic replace, so a link there is not something this server created."""
+    an atomic replace, so a link there is not something this server created.
+
+    This is best effort, not a security boundary: the link checks and the read
+    are separate path lookups, so a process that can already write to the
+    conversations directory (the same trust level as this server) could swap the
+    path in between. It catches accidents and stale links, nothing more."""
     if path.is_symlink():
         raise OSError("outbox path is a symlink")
     if path.stat().st_size > MAX_OUTBOX_BYTES:
@@ -161,6 +166,10 @@ def scan_needs_attention(conversations_dir: Path) -> list[AttentionItem]:
             continue
         try:
             record = _read_record(path)
+        except FileNotFoundError:
+            # Present a moment ago, gone now: the conversation's outbox was
+            # archived (a normal rename) between the check and the read.
+            continue
         except (OSError, ValueError, KeyError, TypeError):
             found.append(_unreadable(entry.name))
             continue
