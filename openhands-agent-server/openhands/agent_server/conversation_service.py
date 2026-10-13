@@ -1977,7 +1977,11 @@ class ConversationService:
         started after a delete finds nothing. (Taking the event service from
         ``get_event_service`` and resolving on it outside the lock left exactly
         that window open.) The price is that other operations on this one
-        conversation wait for it, up to the central client's timeout.
+        conversation wait for it, up to the central client's timeout. Like every
+        other lifecycle operation it also counts toward the server-wide
+        exclusive gate (idle eviction, sandbox pause, shutdown wait for it, and
+        while they wait new lifecycle operations on any conversation queue
+        behind them); that is the existing behaviour of start and delete too.
         """
         event_services = self._event_services
         if event_services is None:
