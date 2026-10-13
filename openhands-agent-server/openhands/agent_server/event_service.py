@@ -19,6 +19,14 @@ from openhands.agent_server.conversation_lease import (
     ConversationLease,
     ConversationOwnershipLostError,
 )
+from openhands.agent_server.governance_attention import (
+    AttentionAction,
+    ResolveError,
+    ResolveResponse,
+    apply_close,
+    apply_retry,
+    check_resolvable,
+)
 from openhands.agent_server.governance_client import (
     GovernanceClient,
     GovernancePermanentError,
@@ -2837,6 +2845,154 @@ class EventService:
                 self.stored.id,
                 exc_info=True,
             )
+
+    async def _action_still_pending(self, action_event_id: str) -> bool | None:
+        """Whether the conversation is waiting for confirmation of exactly this
+        action: waiting, with this action the only one pending. None if there is
+        no live conversation to ask. ``reject_pending_actions()`` rejects *every*
+        pending action and flips a waiting conversation to idle, so anything
+        short of an exact match must not be rejected on a record's behalf."""
+        if self._conversation is None:
+            return None
+        if (
+            await self._get_execution_status()
+            != ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        ):
+            return False
+        loop = asyncio.get_running_loop()
+        pending = await loop.run_in_executor(None, self._snapshot_pending_actions_sync)
+        return [a.id for a in pending] == [action_event_id]
+
+    async def _cancel_or_abort_at_central(
+        self, client: GovernanceClient, record: OutboxRecord
+    ) -> Literal["cancelled", "aborted", "already_terminal"]:
+        """Withdraws the approval at central: cancel while it is still pending,
+        the pre-claim abort once someone accepted it, nothing if it is already
+        terminal. Same calls and idempotency keys as
+        ``cancel_unclaimed_governance_approval()``, but fail-closed: an
+        operator asked for this and is told when central did not agree, instead
+        of the failure being logged and swallowed as on conversation delete."""
+        assert record.central_approval_id is not None
+        approval_id = record.central_approval_id
+        try:
+            await client.cancel(
+                approval_id, idempotency_key=f"cancel-{record.request_id}"
+            )
+            return "cancelled"
+        except GovernancePermanentError as exc:
+            if exc.error_code != "illegal_transition":
+                raise ResolveError(
+                    "central_failed",
+                    f"central refused the cancel ({_error_code_of(exc)})",
+                ) from exc
+        except Exception as exc:
+            raise ResolveError(
+                "central_failed",
+                f"central could not be asked to cancel ({type(exc).__name__})",
+            ) from exc
+        # Not pending any more: accepted (abort it) or already terminal.
+        try:
+            await client.report_result(
+                approval_id, idempotency_key=f"abort-{record.request_id}"
+            )
+            return "aborted"
+        except GovernancePermanentError as exc:
+            if exc.error_code == "illegal_transition":
+                return "already_terminal"
+            raise ResolveError(
+                "central_failed", f"central refused the abort ({_error_code_of(exc)})"
+            ) from exc
+        except Exception as exc:
+            raise ResolveError(
+                "central_failed",
+                f"central could not be asked to abort ({type(exc).__name__})",
+            ) from exc
+
+    async def resolve_needs_attention(
+        self,
+        action: AttentionAction,
+        *,
+        expected_request_id: str,
+        note: str | None,
+    ) -> ResolveResponse:
+        """Acts on an outbox record parked in NEEDS_ATTENTION (operator request).
+
+        * ``retry``: puts the record back in the state the relay already knows
+          how to repeat (same idempotency keys); the next relay cycle does it.
+        * ``abandon``: withdraws the approval at central, rejects the pending
+          action locally and ends the record as CANCELLED. Only offered for
+          reasons where no execution attempt can exist.
+        * ``dismiss``: ends the record as RESOLVED_MANUALLY. No other effect.
+
+        Every precondition is checked before any side effect, and checked again
+        inside the locked write, so a request made from a stale view fails
+        instead of acting on a different workflow.
+        """
+        if self.governance_deployment_mode != "team":
+            raise ResolveError("not_team_mode", "governance is not in team mode")
+        try:
+            loaded = self.governance_outbox.load()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ResolveError(
+                "unreadable_outbox",
+                f"the outbox could not be read ({type(exc).__name__})",
+            ) from exc
+        record = check_resolvable(loaded, action, expected_request_id)
+
+        central_step: Literal[
+            "not_applicable", "cancelled", "aborted", "already_terminal"
+        ] = "not_applicable"
+        if action is AttentionAction.RETRY:
+            updated = await self.governance_outbox.mutate(
+                lambda r: apply_retry(r, expected_request_id)
+            )
+        elif action is AttentionAction.DISMISS:
+            updated = await self.governance_outbox.mutate(
+                lambda r: apply_close(r, action, expected_request_id, note)
+            )
+        else:
+            client = self.governance_client
+            if client is None:
+                raise ResolveError(
+                    "central_client_unavailable",
+                    "the central governance client is not configured",
+                )
+            if self._conversation is None:
+                raise ResolveError(
+                    "conversation_inactive",
+                    "the conversation is not active, so its pending action "
+                    "cannot be rejected",
+                )
+            central_step = await self._cancel_or_abort_at_central(client, record)
+            if await self._action_still_pending(record.action_event_id):
+                await self.reject_pending_actions(
+                    "the governed approval was abandoned by an operator"
+                )
+            updated = await self.governance_outbox.mutate(
+                lambda r: apply_close(r, action, expected_request_id, note)
+            )
+        logger.info(
+            "operator %s on the governance outbox of conversation %s "
+            "(reason=%s, error_code=%s, request_id=%s) -> %s",
+            action.value,
+            self.stored.id,
+            record.needs_attention_reason,
+            record.last_error_code,
+            record.request_id,
+            updated.state.value,
+        )
+        return ResolveResponse(
+            conversation_id=str(self.stored.id),
+            action=action,
+            request_id=record.request_id,
+            new_state=updated.state.value,
+            central_step=central_step,
+            conversation_still_waiting=(
+                None
+                if action is AttentionAction.RETRY
+                else await self._action_still_pending(record.action_event_id)
+            ),
+        )
 
     async def run_and_wait_for_start(
         self, *, central_approval_id: str, timeout_seconds: float = 20.0

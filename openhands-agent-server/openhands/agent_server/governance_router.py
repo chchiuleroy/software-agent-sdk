@@ -1,5 +1,6 @@
-"""Read-only governance endpoints: status for the desktop GUI, and the list of
-conversations whose governance outbox needs an operator (``/attention``).
+"""Governance endpoints: read-only status for the desktop GUI, the list of
+conversations whose governance outbox needs an operator (``GET /attention``),
+and the operator's way to act on one (``POST /attention/{id}/resolve``).
 
 Status: without this, a team-mode server whose central-governance-api is down (or
 whose client credentials were revoked) looks identical to a healthy one until
@@ -10,10 +11,11 @@ is not the approval path there (central's decision drives the run instead).
 """
 
 import asyncio
+import uuid
 from datetime import UTC, datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from openhands.agent_server.config import Config, missing_team_mode_settings
@@ -21,6 +23,9 @@ from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.governance_attention import (
     AttentionItem,
+    ResolveError,
+    ResolveRequest,
+    ResolveResponse,
     scan_needs_attention,
 )
 
@@ -114,3 +119,61 @@ async def list_needs_attention(
     return await asyncio.to_thread(
         scan_needs_attention, conversation_service.conversations_dir
     )
+
+
+# Everything not listed is a 409: the request was understood but the record is
+# not in a state where it can be applied. Central being unusable is 424, not a
+# 5xx: the app replaces the body of every 5xx with "Internal Server Error", which
+# would hide exactly what the operator needs (central refused, or is not
+# configured), and nothing here is a fault of this server.
+_RESOLVE_STATUS = {
+    "not_found": 404,
+    "not_team_mode": 404,
+    "central_failed": 424,
+    "central_client_unavailable": 424,
+}
+
+
+@governance_router.post(
+    "/attention/{conversation_id}/resolve", response_model=ResolveResponse
+)
+async def resolve_needs_attention(
+    conversation_id: uuid.UUID,
+    body: ResolveRequest,
+    request: Request,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> ResolveResponse:
+    """Act on a conversation whose governance outbox is parked in NEEDS_ATTENTION:
+    ``retry`` the step that failed, ``abandon`` the approval (only where nothing
+    can have run), or ``dismiss`` the record. Quote the ``request_id`` from the
+    listing; the request is refused if the record has changed since."""
+    config: Config = request.app.state.config
+    if config.governance_deployment_mode != "team":
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "not_team_mode",
+                "detail": "governance is not in team mode",
+            },
+        )
+    event_service = await conversation_service.get_event_service(conversation_id)
+    if event_service is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "not_found", "detail": "no such conversation"},
+        )
+    try:
+        return await event_service.resolve_needs_attention(
+            body.action,
+            expected_request_id=body.expected_request_id,
+            note=body.note,
+        )
+    except ResolveError as exc:
+        raise HTTPException(
+            status_code=_RESOLVE_STATUS.get(exc.error_code, 409),
+            detail={
+                "error_code": exc.error_code,
+                "detail": exc.detail,
+                "allowed_actions": exc.allowed_actions,
+            },
+        ) from exc

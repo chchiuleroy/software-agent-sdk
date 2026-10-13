@@ -17,11 +17,19 @@ from openhands.agent_server.governance_attention import (
     UNREADABLE_OUTBOX,
     AttentionAction,
     AttentionItem,
+    ResolveError,
+    ResolveRequest,
     allowed_actions_for,
+    apply_close,
+    apply_retry,
+    check_resolvable,
+    retry_target,
     scan_needs_attention,
 )
 from openhands.agent_server.governance_outbox import (
     OUTBOX_FILENAME,
+    RETRIABLE_STATES,
+    TERMINAL_STATES,
     NeedsAttentionReason,
     OutboxRecord,
     OutboxState,
@@ -371,3 +379,180 @@ def test_record_parked_before_reasons_were_recorded_is_listed(tmp_path):
 
     assert item.reason is None
     assert item.allowed_actions == ["dismiss"]
+
+
+# ------------------------------- resolving -------------------------------
+
+
+def _error_of(call, *args, **kwargs) -> ResolveError:
+    with pytest.raises(ResolveError) as exc:
+        call(*args, **kwargs)
+    return exc.value
+
+
+def test_check_resolvable_refuses_a_missing_record():
+    err = _error_of(check_resolvable, None, AttentionAction.RETRY, "req-1")
+    assert err.error_code == "not_found"
+
+
+def test_check_resolvable_refuses_a_record_that_is_no_longer_parked():
+    record = _record(state=OutboxState.CLAIMED)
+    err = _error_of(check_resolvable, record, AttentionAction.RETRY, "req-1")
+    assert err.error_code == "state_changed"
+
+
+def test_check_resolvable_refuses_a_different_workflow():
+    err = _error_of(check_resolvable, _parked(), AttentionAction.RETRY, "req-OTHER")
+    assert err.error_code == "request_id_mismatch"
+
+
+def test_check_resolvable_names_what_would_have_been_allowed():
+    record = _parked(NeedsAttentionReason.REPORT_FAILED)
+    err = _error_of(check_resolvable, record, AttentionAction.ABANDON, "req-1")
+    assert err.error_code == "action_not_allowed"
+    assert err.allowed_actions == ["retry", "dismiss"]
+
+
+def test_check_resolvable_accepts_an_allowed_action():
+    record = _parked(NeedsAttentionReason.CLAIM_FAILED)
+    assert check_resolvable(record, AttentionAction.ABANDON, "req-1") is record
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_state", "expected_outcome"),
+    [
+        (NeedsAttentionReason.CLAIM_FAILED, OutboxState.CLAIM_INFLIGHT, None),
+        (NeedsAttentionReason.REPORT_FAILED, OutboxState.RESULT_PENDING, None),
+        (NeedsAttentionReason.RECONCILE_FAILED, OutboxState.RESULT_PENDING, None),
+        (
+            NeedsAttentionReason.BINDING_REPORT_FAILED,
+            OutboxState.RESULT_PENDING,
+            "failure_definite",
+        ),
+    ],
+)
+def test_retry_target_per_reason(reason, expected_state, expected_outcome):
+    record = _parked(
+        reason, execution_attempt_id="attempt-1", pending_report_outcome="success"
+    )
+    assert retry_target(record) == (expected_state, expected_outcome)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED,
+        NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED,
+        NeedsAttentionReason.LATE_REPORT_REFUSED,
+    ],
+)
+def test_retry_target_has_no_answer_where_retry_is_not_offered(reason):
+    record = _parked(
+        reason, execution_attempt_id="attempt-1", pending_report_outcome="success"
+    )
+    assert _error_of(retry_target, record).error_code == "retry_not_possible"
+
+
+def test_retry_target_needs_the_approval_id():
+    record = _parked(NeedsAttentionReason.CLAIM_FAILED, central_approval_id=None)
+    assert _error_of(retry_target, record).error_code == "retry_not_possible"
+
+
+def test_apply_retry_rearms_the_step_and_forgets_the_old_failure():
+    record = _parked(NeedsAttentionReason.CLAIM_FAILED)
+    attempts = record.attempt_count
+
+    apply_retry(record, "req-1")
+
+    assert record.state == OutboxState.CLAIM_INFLIGHT
+    assert record.needs_attention_reason is None
+    assert record.last_error_code is None
+    assert record.attempt_count == attempts  # an operator action is not an attempt
+
+
+def test_apply_retry_sets_the_definite_failure_for_a_binding_report():
+    record = _parked(
+        NeedsAttentionReason.BINDING_REPORT_FAILED, execution_attempt_id="attempt-1"
+    )
+
+    apply_retry(record, "req-1")
+
+    assert record.state == OutboxState.RESULT_PENDING
+    assert record.pending_report_outcome == "failure_definite"
+
+
+def test_apply_retry_rechecks_the_record_it_is_given():
+    """It runs inside the locked write, on the freshly read record."""
+    record = _record(state=OutboxState.CLAIMED)
+    assert _error_of(apply_retry, record, "req-1").error_code == "state_changed"
+    assert record.state == OutboxState.CLAIMED
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_state"),
+    [
+        (AttentionAction.ABANDON, OutboxState.CANCELLED),
+        (AttentionAction.DISMISS, OutboxState.RESOLVED_MANUALLY),
+    ],
+)
+def test_apply_close_ends_the_record_and_keeps_why_it_was_parked(
+    action, expected_state
+):
+    record = _parked(NeedsAttentionReason.CLAIM_FAILED)
+
+    apply_close(record, action, "req-1", "operator note")
+
+    assert record.state == expected_state
+    assert record.resolution_note == "operator note"
+    assert record.resolved_at is not None
+    assert record.needs_attention_reason == "claim_failed"
+    assert record.last_error_code == "not_found"
+
+
+def test_apply_close_rechecks_the_record_it_is_given():
+    record = _record(state=OutboxState.RESULT_REPORTED)
+    err = _error_of(apply_close, record, AttentionAction.DISMISS, "req-1", "n")
+    assert err.error_code == "state_changed"
+    assert record.state == OutboxState.RESULT_REPORTED
+    assert record.resolution_note is None
+
+
+def test_apply_close_refuses_an_action_the_reason_does_not_allow():
+    record = _parked(NeedsAttentionReason.REPORT_FAILED)
+    err = _error_of(apply_close, record, AttentionAction.ABANDON, "req-1", None)
+    assert err.error_code == "action_not_allowed"
+    assert record.state == OutboxState.NEEDS_ATTENTION
+
+
+def test_resolved_manually_is_terminal_not_retriable():
+    """It must end the record the way CANCELLED does: a finished record is
+    archived for the next action and blocks run() for the old one."""
+    assert OutboxState.RESOLVED_MANUALLY in TERMINAL_STATES
+    assert OutboxState.RESOLVED_MANUALLY not in RETRIABLE_STATES
+
+
+def test_dismiss_needs_a_note():
+    for blank in (None, "", "   \n"):
+        with pytest.raises(ValueError, match="needs a note"):
+            ResolveRequest(action="dismiss", expected_request_id="r", note=blank)
+
+
+def test_the_note_is_trimmed_and_other_actions_do_not_need_one():
+    request = ResolveRequest(action="dismiss", expected_request_id="r", note="  why  ")
+    assert request.note == "why"
+    assert ResolveRequest(action="retry", expected_request_id="r").note is None
+    assert (
+        ResolveRequest(action="abandon", expected_request_id="r", note="  ").note
+        is None
+    )
+
+
+def test_the_request_bounds_its_free_text():
+    with pytest.raises(ValueError):
+        ResolveRequest(action="dismiss", expected_request_id="r", note="x" * 1001)
+    with pytest.raises(ValueError):
+        ResolveRequest(action="retry", expected_request_id="")
+    with pytest.raises(ValueError):
+        ResolveRequest(action="retry", expected_request_id="r" * 257)
+    with pytest.raises(ValueError):
+        ResolveRequest(action="purge", expected_request_id="r")

@@ -61,6 +61,10 @@ class OutboxState(StrEnum):
     REJECTED_LOCALLY = "rejected_locally"
     CANCELLED = "cancelled"
     NEEDS_ATTENTION = "needs_attention"
+    # An operator closed a NEEDS_ATTENTION record without any further effect
+    # (see governance_attention.py). Terminal, and deliberately not CANCELLED:
+    # nothing was cancelled, someone decided to stop looking at it.
+    RESOLVED_MANUALLY = "resolved_manually"
 
 
 class NeedsAttentionReason(StrEnum):
@@ -120,6 +124,7 @@ TERMINAL_STATES = frozenset(
         OutboxState.RESULT_REPORTED,
         OutboxState.RECONCILIATION_REPORTED,
         OutboxState.CANCELLED,
+        OutboxState.RESOLVED_MANUALLY,
     }
 )
 
@@ -169,6 +174,10 @@ class OutboxRecord:
     # central at report-result; a lost marker means "not attested", which
     # central records as unknown rather than as a pass.
     execution_attested: bool = False
+    # Set when an operator closes a NEEDS_ATTENTION record (abandon or dismiss).
+    # needs_attention_reason / last_error_code are kept as the history of why.
+    resolution_note: str | None = None
+    resolved_at: str | None = None
 
     def registered_commitment(self) -> str | None:
         """The commitment central holds for this record, or None if this
