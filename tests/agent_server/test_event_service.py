@@ -33,6 +33,7 @@ from openhands.agent_server.governance_client import (
 )
 from openhands.agent_server.governance_display import POLICY_REVISION, build_display
 from openhands.agent_server.governance_outbox import (
+    NeedsAttentionReason,
     OutboxRecord,
     OutboxState,
     record_attempt,
@@ -4617,6 +4618,8 @@ class TestEventServiceGovernanceOrchestration:
         updated = governed_service.governance_outbox.load()
         assert updated is not None
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.CLAIM_FAILED
+        assert updated.last_error_code == "RuntimeError"
 
     @pytest.mark.asyncio
     async def test_claim_and_run_governed_reports_binding_mismatch_to_central(
@@ -4749,6 +4752,10 @@ class TestEventServiceGovernanceOrchestration:
         updated = governed_service.governance_outbox.load()
         assert updated is not None
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason == NeedsAttentionReason.BINDING_REPORT_FAILED
+        )
+        assert updated.last_error_code == "RuntimeError"
 
     # ---------------- maybe_report_governance_result ----------------
 
@@ -6127,6 +6134,8 @@ class TestEventServiceGovernanceOrchestration:
 
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.CLAIM_FAILED
+        assert updated.last_error_code == "not_found"
 
     @pytest.mark.asyncio
     async def test_relay_claim_inflight_transient_error_keeps_retrying(
@@ -6970,6 +6979,8 @@ class TestEventServiceGovernanceOrchestration:
 
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "validation_error"
 
     # ---------------- late report after central failed the attempt ----------------
     # When the device holds the real outcome but central already moved the
@@ -7065,10 +7076,10 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service._relay_outbox_once()
 
         client.reconciliation_finding.assert_not_awaited()
-        assert (
-            governed_service.governance_outbox.load().state
-            == OutboxState.NEEDS_ATTENTION
-        )
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "illegal_transition"
 
     @pytest.mark.asyncio
     async def test_relay_keeps_retrying_when_central_status_cannot_be_read(
@@ -7110,10 +7121,10 @@ class TestEventServiceGovernanceOrchestration:
 
         client.wait.assert_not_awaited()
         client.reconciliation_finding.assert_not_awaited()
-        assert (
-            governed_service.governance_outbox.load().state
-            == OutboxState.NEEDS_ATTENTION
-        )
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "execution_attempt_mismatch"
 
     @pytest.mark.asyncio
     async def test_late_report_is_retried_from_reconciliation_pending(
@@ -7162,10 +7173,12 @@ class TestEventServiceGovernanceOrchestration:
 
         await governed_service._relay_outbox_once()
 
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
         assert (
-            governed_service.governance_outbox.load().state
-            == OutboxState.NEEDS_ATTENTION
+            updated.needs_attention_reason == NeedsAttentionReason.LATE_REPORT_REFUSED
         )
+        assert updated.last_error_code == "late_report_not_applicable"
 
     @pytest.mark.asyncio
     async def test_concurrent_fallbacks_do_not_move_a_finished_record_backwards(
@@ -7282,6 +7295,56 @@ class TestEventServiceGovernanceOrchestration:
             governed_service.governance_outbox.load().state
             == OutboxState.RECONCILIATION_REPORTED
         )
+
+    @pytest.mark.asyncio
+    async def test_inline_report_permanent_refusal_records_why(self, governed_service):
+        """A permanent refusal of the first (inline) report that is not the
+        failed_unknown case ends in NEEDS_ATTENTION as report_failed."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+        observation = ObservationEvent(
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            observation=TerminalObservation(command="ls", is_error=False),
+            action_id=action.id,
+        )
+        governed_service._conversation = self._mock_conversation([])
+        governed_service._conversation._state.events = [action, observation]
+        client = self._late_client()
+        client.report_result = AsyncMock(
+            side_effect=GovernancePermanentError(
+                "bad", error_code="execution_attempt_mismatch", status_code=409
+            )
+        )
+        governed_service.governance_client = client
+
+        await governed_service.maybe_report_governance_result()
+
+        client.reconciliation_finding.assert_not_awaited()
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
+        assert updated.last_error_code == "execution_attempt_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_after_close_failure_records_why(self, governed_service):
+        """The failure_unknown report made while closing is the one report
+        nobody retries (the relay is already stopped): it must say why it was
+        parked."""
+        action = _governance_pending_action()
+        record = self._claimed_record(governed_service, action)
+        await governed_service.governance_outbox.create_record(record)
+        client = MagicMock()
+        client.report_result = AsyncMock(side_effect=RuntimeError("network down"))
+        governed_service.governance_client = client
+
+        await governed_service._reconcile_governance_after_close()
+
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert updated.needs_attention_reason == NeedsAttentionReason.RECONCILE_FAILED
+        assert updated.last_error_code == "RuntimeError"
 
     @pytest.mark.asyncio
     async def test_start_creates_outbox_relay_task_in_team_mode(
@@ -7401,6 +7464,59 @@ class TestEventServiceGovernanceOrchestration:
 
         updated = governed_service.governance_outbox.load()
         assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED
+        )
+        assert updated.last_error_code == "status=cancelled"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status", ["executing", "applied", "failed_definite", "failed_unknown"]
+    )
+    async def test_wait_for_decision_other_status_is_not_filed_as_cancelled(
+        self, governed_service, status
+    ):
+        """/wait answers with the *current* status, so another request may
+        already have claimed or finished the approval. Only cancelled/expired
+        mean "no execution attempt exists"; anything else must not carry that
+        reason, because it decides whether an operator may abandon the action."""
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        fake_client = MagicMock()
+        fake_client.wait = AsyncMock(
+            return_value={"id": "approval-1", "status": status, "changed": True}
+        )
+        governed_service.governance_client = fake_client
+
+        await governed_service._wait_for_decision_loop("approval-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
+        )
+        assert updated.last_error_code == f"status={status}"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_decision_expired_is_filed_as_cancelled_or_expired(
+        self, governed_service
+    ):
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        fake_client = MagicMock()
+        fake_client.wait = AsyncMock(
+            return_value={"id": "approval-1", "status": "expired", "changed": True}
+        )
+        governed_service.governance_client = fake_client
+
+        await governed_service._wait_for_decision_loop("approval-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED
+        )
+        assert updated.last_error_code == "status=expired"
 
     @pytest.mark.asyncio
     async def test_wait_for_decision_retries_on_unchanged_timeout(

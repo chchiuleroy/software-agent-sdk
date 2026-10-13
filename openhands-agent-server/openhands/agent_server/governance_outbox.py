@@ -62,6 +62,35 @@ class OutboxState(StrEnum):
     NEEDS_ATTENTION = "needs_attention"
 
 
+class NeedsAttentionReason(StrEnum):
+    """Why a record was parked in ``OutboxState.NEEDS_ATTENTION``.
+
+    The state alone says nothing: several unrelated failures end there, and
+    what an operator may safely do about each differs (see
+    ``ops_notes/design_1_11_needs_attention.md``). Persisted as the string
+    value in ``OutboxRecord.needs_attention_reason``.
+    """
+
+    # A claim was refused or failed before any execution attempt existed.
+    CLAIM_FAILED = "claim_failed"
+    # report-result was refused after the action may already have run.
+    REPORT_FAILED = "report_failed"
+    # Central resolved the approval to cancelled/expired while this device
+    # waited for a decision: no execution attempt exists.
+    APPROVAL_CANCELLED_OR_EXPIRED = "approval_cancelled_or_expired"
+    # Central answered the decision wait with any other unexpected status
+    # (executing, applied, failed_*, ...): another request may already have
+    # moved the approval on, so the action may have run.
+    CENTRAL_STATUS_UNEXPECTED = "central_status_unexpected"
+    # The failure_unknown report made while closing the conversation failed.
+    RECONCILE_FAILED = "reconcile_failed"
+    # A binding mismatch was found after claim and reporting it failed; the
+    # tool did not run.
+    BINDING_REPORT_FAILED = "binding_report_failed"
+    # Central permanently refused the late_report finding.
+    LATE_REPORT_REFUSED = "late_report_refused"
+
+
 # States a relay loop should keep retrying from — everything else is either
 # a terminal success/cancel or NEEDS_ATTENTION (deliberately excluded: a
 # permanent failure must not be auto-retried, see governance_client.py's
@@ -238,6 +267,21 @@ def record_attempt(
     record.last_attempt_at = datetime.now(UTC).isoformat()
     if new_state is not None:
         record.state = new_state
+    return record
+
+
+def mark_needs_attention(
+    record: OutboxRecord,
+    reason: NeedsAttentionReason,
+    *,
+    error_code: str | None = None,
+) -> OutboxRecord:
+    """Parks ``record`` in NEEDS_ATTENTION and records why. ``error_code`` must
+    be secret-free: central's ``error_code``, an exception class name, or the
+    central status that was observed."""
+    record_attempt(record, new_state=OutboxState.NEEDS_ATTENTION)
+    record.needs_attention_reason = reason.value
+    record.last_error_code = error_code
     return record
 
 

@@ -34,9 +34,11 @@ from openhands.agent_server.governance_outbox import (
     RETRIABLE_STATES,
     TERMINAL_STATES,
     GovernanceOutbox,
+    NeedsAttentionReason,
     OutboxRecord,
     OutboxState,
     check_governed_binding_required,
+    mark_needs_attention,
     record_attempt,
 )
 from openhands.agent_server.models import (
@@ -289,6 +291,29 @@ def _advance_only_from(
         return record_attempt(
             record, new_state=new_state if record.state == expected else None
         )
+
+    return _apply
+
+
+def _error_code_of(exc: BaseException) -> str:
+    """A secret-free label for ``OutboxRecord.last_error_code``: central's
+    ``error_code`` when the exception carries one, else the exception class
+    name. Never the message, which can contain request detail."""
+    return getattr(exc, "error_code", None) or type(exc).__name__
+
+
+def _needs_attention_only_from(
+    expected: OutboxState,
+    reason: NeedsAttentionReason,
+    error_code: str | None,
+) -> Callable[[OutboxRecord], OutboxRecord]:
+    """Like ``_advance_only_from`` for NEEDS_ATTENTION: parks the record only
+    if it is still in ``expected``, else only bumps the retry bookkeeping."""
+
+    def _apply(record: OutboxRecord) -> OutboxRecord:
+        if record.state != expected:
+            return record_attempt(record)
+        return mark_needs_attention(record, reason, error_code=error_code)
 
     return _apply
 
@@ -773,13 +798,16 @@ class EventService:
                     idempotency_key=f"claim-{record.request_id}",
                     execution_commitment=record.registered_commitment(),
                 )
-            except GovernancePermanentError:
+            except GovernancePermanentError as exc:
                 logger.exception(
                     "outbox relay: claim permanently failed for approval %s",
                     record.central_approval_id,
                 )
+                code = _error_code_of(exc)
                 await self.governance_outbox.mutate(
-                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
+                    )
                 )
                 return
             except Exception:
@@ -853,8 +881,11 @@ class EventService:
                     "approval %s",
                     record.central_approval_id,
                 )
+                code = _error_code_of(exc)
                 await self.governance_outbox.mutate(
-                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.REPORT_FAILED, error_code=code
+                    )
                 )
             except Exception:
                 logger.warning(
@@ -954,14 +985,16 @@ class EventService:
                     OutboxState.RECONCILIATION_REPORTED,
                 )
             )
-        except GovernancePermanentError:
+        except GovernancePermanentError as exc:
             logger.exception(
                 "late_report permanently refused for approval %s",
                 record.central_approval_id,
             )
             await self.governance_outbox.mutate(
-                _advance_only_from(
-                    OutboxState.RECONCILIATION_PENDING, OutboxState.NEEDS_ATTENTION
+                _needs_attention_only_from(
+                    OutboxState.RECONCILIATION_PENDING,
+                    NeedsAttentionReason.LATE_REPORT_REFUSED,
+                    _error_code_of(exc),
                 )
             )
         except Exception:
@@ -1119,9 +1152,17 @@ class EventService:
                         central_approval_id,
                         status,
                     )
+                    # Only cancelled/expired are known to mean "no execution
+                    # attempt exists". Any other status may mean another
+                    # request already moved the approval on (claimed, ran).
+                    reason = (
+                        NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED
+                        if status in ("cancelled", "expired")
+                        else NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
+                    )
                     await self.governance_outbox.mutate(
-                        lambda r: record_attempt(
-                            r, new_state=OutboxState.NEEDS_ATTENTION
+                        lambda r: mark_needs_attention(
+                            r, reason, error_code=f"status={status}"
                         )
                     )
                 return
@@ -2648,8 +2689,11 @@ class EventService:
                 "failed to report governed execution result for approval %s",
                 record.central_approval_id,
             )
+            code = _error_code_of(exc)
             await self.governance_outbox.mutate(
-                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                lambda r: mark_needs_attention(
+                    r, NeedsAttentionReason.REPORT_FAILED, error_code=code
+                )
             )
         except Exception:
             # Transient (network/5xx) or unclassified — leave state as
@@ -2714,13 +2758,16 @@ class EventService:
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "failed to reconcile orphaned governance claim %s during close",
                 record.central_approval_id,
             )
+            code = _error_code_of(exc)
             await self.governance_outbox.mutate(
-                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                lambda r: mark_needs_attention(
+                    r, NeedsAttentionReason.RECONCILE_FAILED, error_code=code
+                )
             )
 
     async def cancel_unclaimed_governance_approval(self) -> None:
@@ -2924,12 +2971,15 @@ class EventService:
                     idempotency_key=f"claim-{outbox_record.request_id}",
                     execution_commitment=outbox_record.registered_commitment(),
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "claim failed for governance approval %s", central_approval_id
                 )
+                code = _error_code_of(exc)
                 await self.governance_outbox.mutate(
-                    lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
+                    )
                 )
                 _resolve_handshake_once(
                     future, GovernanceStartOutcome.REJECTED_CLAIM_FAILED
@@ -3161,13 +3211,16 @@ class EventService:
             await self.governance_outbox.mutate(
                 lambda r: record_attempt(r, new_state=OutboxState.RESULT_REPORTED)
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "failed to report binding-mismatch failure for approval %s",
                 central_approval_id,
             )
+            code = _error_code_of(exc)
             await self.governance_outbox.mutate(
-                lambda r: record_attempt(r, new_state=OutboxState.NEEDS_ATTENTION)
+                lambda r: mark_needs_attention(
+                    r, NeedsAttentionReason.BINDING_REPORT_FAILED, error_code=code
+                )
             )
 
     async def start_goal_loop(

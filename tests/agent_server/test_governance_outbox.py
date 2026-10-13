@@ -4,14 +4,19 @@ transitions.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
 
 from openhands.agent_server.governance_outbox import (
+    RETRIABLE_STATES,
+    TERMINAL_STATES,
     GovernanceOutbox,
+    NeedsAttentionReason,
     OutboxRecord,
     OutboxState,
+    mark_needs_attention,
     record_attempt,
 )
 
@@ -116,6 +121,64 @@ def test_record_attempt_without_state_change_only_bumps_bookkeeping():
     updated = record_attempt(record)
     assert updated.attempt_count == 1
     assert updated.state == OutboxState.CLAIMED
+
+
+def test_mark_needs_attention_records_state_reason_and_code():
+    record = _record(state=OutboxState.CLAIM_INFLIGHT)
+
+    updated = mark_needs_attention(
+        record, NeedsAttentionReason.CLAIM_FAILED, error_code="not_found"
+    )
+
+    assert updated.state == OutboxState.NEEDS_ATTENTION
+    assert updated.needs_attention_reason == "claim_failed"
+    assert updated.last_error_code == "not_found"
+    assert updated.attempt_count == 1
+    assert updated.last_attempt_at is not None
+
+
+def test_mark_needs_attention_replaces_a_previous_error_code():
+    """A record that is parked again must not keep the earlier failure's code."""
+    record = _record(last_error_code="stale-code")
+
+    updated = mark_needs_attention(record, NeedsAttentionReason.REPORT_FAILED)
+
+    assert updated.last_error_code is None
+
+
+@pytest.mark.asyncio
+async def test_needs_attention_reason_is_persisted_as_its_plain_string(tmp_path):
+    """The reason values are the contract an operator API will expose, so the
+    exact strings on disk matter, and they must survive a restart."""
+    outbox = GovernanceOutbox(tmp_path)
+    await outbox.create_record(_record())
+    await outbox.mutate(
+        lambda r: mark_needs_attention(
+            r,
+            NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED,
+            error_code="status=applied",
+        )
+    )
+
+    raw = json.loads((tmp_path / "governance_outbox.json").read_text(encoding="utf-8"))
+    assert raw["state"] == "needs_attention"
+    assert raw["needs_attention_reason"] == "central_status_unexpected"
+    assert raw["last_error_code"] == "status=applied"
+
+    reloaded = GovernanceOutbox(tmp_path).load()
+    assert reloaded is not None
+    assert (
+        reloaded.needs_attention_reason
+        == NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
+    )
+
+
+def test_needs_attention_is_neither_retriable_nor_terminal():
+    """Everything in the 1.11 design rests on this: relay never touches the
+    state, and a new governed action is refused while a record sits in it.
+    Changing either set changes that analysis, so make it a conscious edit."""
+    assert OutboxState.NEEDS_ATTENTION not in RETRIABLE_STATES
+    assert OutboxState.NEEDS_ATTENTION not in TERMINAL_STATES
 
 
 @pytest.mark.asyncio
