@@ -441,6 +441,10 @@ class EventService:
     _explicit_interrupt_generation: int = field(default=0, init=False)
     _closing: bool = field(default=False, init=False)
     _run_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # Serialises operator resolves of one conversation's NEEDS_ATTENTION record:
+    # abandon calls central and rejects the action *before* it commits the
+    # record, so two overlapping resolves must not interleave.
+    _resolve_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _callback_wrapper: AsyncCallbackWrapper | None = field(default=None, init=False)
     _lease: ConversationLease | None = field(default=None, init=False)
     _lease_generation: int | None = field(default=None, init=False)
@@ -2863,6 +2867,30 @@ class EventService:
         pending = await loop.run_in_executor(None, self._snapshot_pending_actions_sync)
         return [a.id for a in pending] == [action_event_id]
 
+    def _reject_if_only_sync(self, action_event_id: str, reason: str) -> bool:
+        """Rejects the pending action iff the conversation is waiting for
+        confirmation of exactly ``action_event_id`` and nothing else. Off-loop.
+
+        The state lock is held across the check and the reject (it is reentrant
+        per thread, and ``reject_pending_actions()`` takes it again), so what is
+        rejected is what was checked. Checking first and then calling the
+        rejecting method separately would let a confirmation or a new action slip
+        in between, and it rejects *everything* pending."""
+        conversation = self._conversation
+        if conversation is None:  # closed since the caller looked
+            return False
+        with conversation._state as state:
+            if (
+                state.execution_status
+                != ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            ):
+                return False
+            pending = ConversationState.get_unmatched_actions(state.active_branch())
+            if [a.id for a in pending] != [action_event_id]:
+                return False
+            conversation.reject_pending_actions(reason)
+            return True
+
     async def _cancel_or_abort_at_central(
         self, client: GovernanceClient, record: OutboxRecord
     ) -> Literal["cancelled", "aborted", "already_terminal"]:
@@ -2926,8 +2954,21 @@ class EventService:
 
         Every precondition is checked before any side effect, and checked again
         inside the locked write, so a request made from a stale view fails
-        instead of acting on a different workflow.
+        instead of acting on a different workflow. Resolves of one conversation
+        run one at a time: a second one is checked against what the first left.
         """
+        async with self._resolve_lock:
+            return await self._resolve_needs_attention_locked(
+                action, expected_request_id=expected_request_id, note=note
+            )
+
+    async def _resolve_needs_attention_locked(
+        self,
+        action: AttentionAction,
+        *,
+        expected_request_id: str,
+        note: str | None,
+    ) -> ResolveResponse:
         if self.governance_deployment_mode != "team":
             raise ResolveError("not_team_mode", "governance is not in team mode")
         try:
@@ -2964,10 +3005,26 @@ class EventService:
                     "cannot be rejected",
                 )
             central_step = await self._cancel_or_abort_at_central(client, record)
-            if await self._action_still_pending(record.action_event_id):
-                await self.reject_pending_actions(
-                    "the governed approval was abandoned by an operator"
+            # Central has been told; if the record moved meanwhile, stop before
+            # touching the conversation (the final write checks once more).
+            check_resolvable(self.governance_outbox.load(), action, expected_request_id)
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.run_in_executor(
+                    None,
+                    self._reject_if_only_sync,
+                    record.action_event_id,
+                    "the governed approval was abandoned by an operator",
                 )
+            except Exception as exc:
+                # Central already agreed and the record is untouched, so the
+                # same abandon can simply be repeated (central answers it as
+                # already terminal).
+                raise ResolveError(
+                    "reject_failed",
+                    "central was told, but rejecting the pending action here "
+                    f"failed ({type(exc).__name__}); the abandon can be repeated",
+                ) from exc
             updated = await self.governance_outbox.mutate(
                 lambda r: apply_close(r, action, expected_request_id, note)
             )

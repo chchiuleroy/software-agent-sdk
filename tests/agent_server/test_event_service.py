@@ -7413,11 +7413,19 @@ class TestEventServiceGovernanceOrchestration:
         return client
 
     def _waiting_on(self, governed_service, *actions) -> None:
-        governed_service._conversation = self._mock_conversation(list(actions))
+        conversation = self._mock_conversation(list(actions))
+        conversation._state.execution_status = (
+            ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+        conversation.reject_pending_actions = MagicMock()
+        governed_service._conversation = conversation
         governed_service._get_execution_status = AsyncMock(
             return_value=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
         )
-        governed_service.reject_pending_actions = AsyncMock()
+
+    def _rejected(self, governed_service) -> MagicMock:
+        """The conversation's own reject_pending_actions (what actually rejects)."""
+        return governed_service._conversation.reject_pending_actions
 
     def _illegal(self) -> GovernancePermanentError:
         return GovernancePermanentError(
@@ -7580,7 +7588,7 @@ class TestEventServiceGovernanceOrchestration:
         assert exc.value.allowed_actions == ["retry", "dismiss"]
         client.cancel.assert_not_awaited()
         client.report_result.assert_not_awaited()
-        governed_service.reject_pending_actions.assert_not_awaited()
+        self._rejected(governed_service).assert_not_called()
         assert governed_service.governance_outbox.load() == before
 
     @pytest.mark.asyncio
@@ -7691,7 +7699,7 @@ class TestEventServiceGovernanceOrchestration:
         )
 
         assert result.conversation_still_waiting is True
-        governed_service.reject_pending_actions.assert_not_awaited()  # not on dismiss
+        self._rejected(governed_service).assert_not_called()  # not on dismiss
 
     @pytest.mark.asyncio
     async def test_dismiss_then_a_different_action_is_governed_again(
@@ -7732,7 +7740,7 @@ class TestEventServiceGovernanceOrchestration:
         client.cancel.assert_awaited_once()
         assert client.cancel.call_args.args == ("approval-1",)
         assert client.cancel.call_args.kwargs["idempotency_key"] == "cancel-req-1"
-        governed_service.reject_pending_actions.assert_awaited_once()
+        self._rejected(governed_service).assert_called_once()
         assert result.central_step == "cancelled"
         assert result.new_state == "cancelled"
         stored = governed_service.governance_outbox.load()
@@ -7779,7 +7787,7 @@ class TestEventServiceGovernanceOrchestration:
         )
 
         assert result.central_step == "already_terminal"
-        governed_service.reject_pending_actions.assert_awaited_once()
+        self._rejected(governed_service).assert_called_once()
         assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
 
     @pytest.mark.asyncio
@@ -7810,7 +7818,7 @@ class TestEventServiceGovernanceOrchestration:
             )
 
         assert exc.value.error_code == "central_failed"
-        governed_service.reject_pending_actions.assert_not_awaited()
+        self._rejected(governed_service).assert_not_called()
         assert governed_service.governance_outbox.load() == before
 
     @pytest.mark.asyncio
@@ -7836,7 +7844,7 @@ class TestEventServiceGovernanceOrchestration:
             )
 
         assert exc.value.error_code == "central_failed"
-        governed_service.reject_pending_actions.assert_not_awaited()
+        self._rejected(governed_service).assert_not_called()
         assert governed_service.governance_outbox.load() == before
 
     @pytest.mark.asyncio
@@ -7856,7 +7864,7 @@ class TestEventServiceGovernanceOrchestration:
             AttentionAction.ABANDON, expected_request_id="req-1", note=None
         )
 
-        governed_service.reject_pending_actions.assert_not_awaited()
+        self._rejected(governed_service).assert_not_called()
         assert result.conversation_still_waiting is False
         assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
 
@@ -7864,9 +7872,17 @@ class TestEventServiceGovernanceOrchestration:
     async def test_abandon_does_not_reject_when_not_waiting_for_confirmation(
         self, governed_service
     ):
-        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        # The record's own action IS the pending one, so only the status stops
+        # the reject; with an unrelated action this test could not tell.
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
         governed_service.governance_client = self._central()
-        self._waiting_on(governed_service, _governance_pending_action())
+        self._waiting_on(governed_service, action)
+        governed_service._conversation._state.execution_status = (
+            ConversationExecutionStatus.IDLE
+        )
         governed_service._get_execution_status = AsyncMock(
             return_value=ConversationExecutionStatus.IDLE
         )
@@ -7875,7 +7891,7 @@ class TestEventServiceGovernanceOrchestration:
             AttentionAction.ABANDON, expected_request_id="req-1", note=None
         )
 
-        governed_service.reject_pending_actions.assert_not_awaited()
+        self._rejected(governed_service).assert_not_called()
 
     @pytest.mark.asyncio
     async def test_abandon_without_a_live_conversation_changes_nothing(
@@ -7911,7 +7927,7 @@ class TestEventServiceGovernanceOrchestration:
             )
 
         assert exc.value.error_code == "central_client_unavailable"
-        governed_service.reject_pending_actions.assert_not_awaited()
+        self._rejected(governed_service).assert_not_called()
         assert governed_service.governance_outbox.load() == before
 
     @pytest.mark.asyncio
@@ -7920,8 +7936,11 @@ class TestEventServiceGovernanceOrchestration:
     ):
         """The checks run again inside the locked write. If someone else moved
         the record while central was being called, this request must not
-        overwrite their result."""
-        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        overwrite their result, and must not reject the conversation's action."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
 
         async def _someone_else_resolves(*_args, **_kwargs):
             await governed_service.governance_outbox.mutate(
@@ -7931,7 +7950,9 @@ class TestEventServiceGovernanceOrchestration:
 
         client = self._central(cancel=AsyncMock(side_effect=_someone_else_resolves))
         governed_service.governance_client = client
-        self._waiting_on(governed_service, _governance_pending_action())
+        # The record's own action is the pending one: without the re-check it
+        # WOULD be rejected, which is what this test is here to rule out.
+        self._waiting_on(governed_service, action)
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
@@ -7943,6 +7964,154 @@ class TestEventServiceGovernanceOrchestration:
             governed_service.governance_outbox.load().state
             == OutboxState.RESULT_REPORTED
         )
+        # Central had already been told, but the conversation is left alone.
+        self._rejected(governed_service).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_resolve_in_progress_finishes_before_the_next_one_starts(
+        self, governed_service
+    ):
+        """Abandon calls central and rejects the action *before* it commits the
+        record. A retry that arrives while it is waiting on central must not
+        commit in between and leave the abandon having cancelled an approval the
+        retry is about to claim: whoever started first finishes first."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        in_central = asyncio.Event()
+        release_central = asyncio.Event()
+
+        async def _slow_cancel(*_args, **_kwargs):
+            in_central.set()
+            await release_central.wait()
+            return {"status": "cancelled"}
+
+        governed_service.governance_client = self._central(
+            cancel=AsyncMock(side_effect=_slow_cancel)
+        )
+        self._waiting_on(governed_service, action)
+
+        abandon = asyncio.create_task(
+            governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+        )
+        await in_central.wait()  # the abandon is now parked inside the central call
+        retry = asyncio.create_task(
+            governed_service.resolve_needs_attention(
+                AttentionAction.RETRY, expected_request_id="req-1", note=None
+            )
+        )
+        await asyncio.sleep(0.05)  # a retry with no lock would commit right here
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.NEEDS_ATTENTION
+        )
+        release_central.set()
+        abandoned, retried = await asyncio.gather(
+            abandon, retry, return_exceptions=True
+        )
+
+        assert not isinstance(abandoned, Exception)
+        assert abandoned.new_state == "cancelled"
+        assert isinstance(retried, ResolveError)
+        assert retried.error_code == "state_changed"
+        self._rejected(governed_service).assert_called_once()
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_abandon_rejects_while_holding_the_state_lock_it_checked_under(
+        self, governed_service
+    ):
+        """Checking "only this action is pending" and then calling the rejecting
+        method separately lets another action slip in between, and that method
+        rejects everything pending. The check and the reject must be one critical
+        section."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        governed_service.governance_client = self._central()
+        self._waiting_on(governed_service, action)
+        state = governed_service._conversation._state
+        depth = {"held": 0}
+
+        def _enter(*_args):
+            depth["held"] += 1
+            return state
+
+        def _exit(*_args):
+            depth["held"] -= 1
+
+        state.__enter__ = MagicMock(side_effect=_enter)
+        state.__exit__ = MagicMock(side_effect=_exit)
+        held_when_rejecting: list[int] = []
+        governed_service._conversation.reject_pending_actions = MagicMock(
+            side_effect=lambda reason: held_when_rejecting.append(depth["held"])
+        )
+
+        await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        assert held_when_rejecting == [1]  # called once, inside the critical section
+
+    @pytest.mark.asyncio
+    async def test_abandon_can_be_repeated_after_the_local_reject_failed(
+        self, governed_service
+    ):
+        """Central is told first, so a failure after that must leave the record
+        alone and the same request must work the second time (central answers
+        the repeated cancel and abort as already terminal)."""
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        client = self._central()
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, action)
+        self._rejected(governed_service).side_effect = RuntimeError("conversation shut")
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "reject_failed"
+        assert governed_service.governance_outbox.load() == before
+
+        # Second attempt: the conversation can be rejected now; central has
+        # already ended the approval.
+        self._rejected(governed_service).side_effect = None
+        client.cancel.side_effect = self._illegal()
+        client.report_result.side_effect = self._illegal()
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+        )
+
+        assert result.central_step == "already_terminal"
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_abandon_on_a_conversation_closed_since_the_check_does_not_crash(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        governed_service.governance_client = self._central()
+        self._waiting_on(governed_service, _governance_pending_action())
+        governed_service._conversation = None  # closed between check and reject
+
+        # The early live-conversation check refuses before any side effect.
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            )
+
+        assert exc.value.error_code == "conversation_inactive"
+        assert governed_service._reject_if_only_sync("any", "r") is False
 
     @pytest.mark.asyncio
     async def test_start_creates_outbox_relay_task_in_team_mode(
