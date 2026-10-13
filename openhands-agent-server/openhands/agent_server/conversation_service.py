@@ -26,6 +26,10 @@ from openhands.agent_server.event_service import (
     EventService,
     _without_agent_context_secret,
 )
+from openhands.agent_server.governance_attention import (
+    AttentionAction,
+    ResolveResponse,
+)
 from openhands.agent_server.governance_client import GovernanceClient
 from openhands.agent_server.models import (
     ConversationInfo,
@@ -1952,6 +1956,46 @@ class ConversationService:
 
     async def get_event_service(self, conversation_id: UUID) -> EventService | None:
         return await self._get_or_load_event_service(conversation_id)
+
+    async def resolve_needs_attention(
+        self,
+        conversation_id: UUID,
+        action: AttentionAction,
+        *,
+        expected_request_id: str,
+        note: str | None,
+    ) -> ResolveResponse | None:
+        """Operator action on a conversation's governance outbox (see
+        ``EventService.resolve_needs_attention``); None if there is no such
+        conversation.
+
+        The conversation's lifecycle lock is held from loading the event service
+        to the end of the resolve. ``delete_conversation`` holds the same lock for
+        its whole body, so whichever starts first finishes first: a delete can no
+        longer close the conversation and remove its directory between the central
+        call an abandon makes and the local steps that follow it, and a resolve
+        started after a delete finds nothing. (Taking the event service from
+        ``get_event_service`` and resolving on it outside the lock left exactly
+        that window open.) The price is that other operations on this one
+        conversation wait for it, up to the central client's timeout.
+        """
+        event_services = self._event_services
+        if event_services is None:
+            raise ValueError("inactive_service")
+        if (
+            conversation_id not in event_services
+            and conversation_id not in self._conversation_records
+        ):
+            return None
+        async with self._conversation_lifecycle(conversation_id):
+            event_service = await self._get_or_load_event_service_locked(
+                conversation_id
+            )
+            if event_service is None:
+                return None
+            return await event_service.resolve_needs_attention(
+                action, expected_request_id=expected_request_id, note=note
+            )
 
     async def generate_conversation_title(
         self, conversation_id: UUID, max_length: int = 50, llm: LLM | None = None
