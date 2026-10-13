@@ -8044,7 +8044,7 @@ class TestEventServiceGovernanceOrchestration:
             abandon, retry, return_exceptions=True
         )
 
-        assert not isinstance(abandoned, Exception)
+        assert not isinstance(abandoned, BaseException)
         assert abandoned.new_state == "cancelled"
         assert isinstance(retried, ResolveError)
         assert retried.error_code == "state_changed"

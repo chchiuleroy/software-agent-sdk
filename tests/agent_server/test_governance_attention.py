@@ -531,28 +531,32 @@ def test_resolved_manually_is_terminal_not_retriable():
     assert OutboxState.RESOLVED_MANUALLY not in RETRIABLE_STATES
 
 
+# Built with model_validate from a plain dict, the way FastAPI builds it from a request
+# body: the action then arrives as the string a client sends, not as an enum member.
+
+
+def _request(**body) -> ResolveRequest:
+    return ResolveRequest.model_validate({"expected_request_id": "r", **body})
+
+
 def test_dismiss_needs_a_note():
     for blank in (None, "", "   \n"):
         with pytest.raises(ValueError, match="needs a note"):
-            ResolveRequest(action="dismiss", expected_request_id="r", note=blank)
+            _request(action="dismiss", note=blank)
 
 
 def test_the_note_is_trimmed_and_other_actions_do_not_need_one():
-    request = ResolveRequest(action="dismiss", expected_request_id="r", note="  why  ")
-    assert request.note == "why"
-    assert ResolveRequest(action="retry", expected_request_id="r").note is None
-    assert (
-        ResolveRequest(action="abandon", expected_request_id="r", note="  ").note
-        is None
-    )
+    assert _request(action="dismiss", note="  why  ").note == "why"
+    assert _request(action="retry").note is None
+    assert _request(action="abandon", note="  ").note is None
 
 
 def test_the_request_bounds_its_free_text():
     with pytest.raises(ValueError):
-        ResolveRequest(action="dismiss", expected_request_id="r", note="x" * 1001)
+        _request(action="dismiss", note="x" * 1001)
     with pytest.raises(ValueError):
-        ResolveRequest(action="retry", expected_request_id="")
+        _request(action="retry", expected_request_id="")
     with pytest.raises(ValueError):
-        ResolveRequest(action="retry", expected_request_id="r" * 257)
+        _request(action="retry", expected_request_id="r" * 257)
     with pytest.raises(ValueError):
-        ResolveRequest(action="purge", expected_request_id="r")
+        _request(action="purge")
