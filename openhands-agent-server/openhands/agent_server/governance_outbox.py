@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -270,18 +271,34 @@ def record_attempt(
     return record
 
 
+_SAFE_ERROR_CODE = re.compile(r"[A-Za-z0-9_.:=-]{1,64}")
+UNRECOGNIZED_ERROR_CODE = "unrecognized"
+
+
+def is_safe_error_code(value: object) -> bool:
+    """True for a short label made only of identifier-like characters. The
+    codes and statuses we record come from central's response bodies, which
+    this device does not control, so anything else is not written to disk."""
+    return isinstance(value, str) and _SAFE_ERROR_CODE.fullmatch(value) is not None
+
+
 def mark_needs_attention(
     record: OutboxRecord,
     reason: NeedsAttentionReason,
     *,
     error_code: str | None = None,
 ) -> OutboxRecord:
-    """Parks ``record`` in NEEDS_ATTENTION and records why. ``error_code`` must
-    be secret-free: central's ``error_code``, an exception class name, or the
-    central status that was observed."""
+    """Parks ``record`` in NEEDS_ATTENTION and records why. ``error_code`` is
+    a short label (central's ``error_code``, an exception class name, or the
+    central status that was observed). It is persisted only if
+    ``is_safe_error_code`` accepts it; otherwise ``UNRECOGNIZED_ERROR_CODE`` is
+    stored, so a remote response can never put free text into the outbox file."""
     record_attempt(record, new_state=OutboxState.NEEDS_ATTENTION)
     record.needs_attention_reason = reason.value
-    record.last_error_code = error_code
+    if error_code is None or is_safe_error_code(error_code):
+        record.last_error_code = error_code
+    else:
+        record.last_error_code = UNRECOGNIZED_ERROR_CODE
     return record
 
 

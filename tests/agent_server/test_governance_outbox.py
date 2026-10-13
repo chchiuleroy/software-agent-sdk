@@ -12,6 +12,7 @@ import pytest
 from openhands.agent_server.governance_outbox import (
     RETRIABLE_STATES,
     TERMINAL_STATES,
+    UNRECOGNIZED_ERROR_CODE,
     GovernanceOutbox,
     NeedsAttentionReason,
     OutboxRecord,
@@ -135,6 +136,38 @@ def test_mark_needs_attention_records_state_reason_and_code():
     assert updated.last_error_code == "not_found"
     assert updated.attempt_count == 1
     assert updated.last_attempt_at is not None
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "oops token=sk-123 leaked",  # contains a space
+        "line1\nline2",  # control character
+        "x" * 65,  # over the length limit
+        "",  # empty
+        "中文",  # outside the identifier alphabet
+    ],
+)
+def test_mark_needs_attention_never_persists_a_free_text_error_code(unsafe):
+    """The code comes from a remote response body. Whatever the caller passes,
+    only a short identifier-like label may reach the outbox file."""
+    updated = mark_needs_attention(
+        _record(), NeedsAttentionReason.REPORT_FAILED, error_code=unsafe
+    )
+
+    assert updated.last_error_code == UNRECOGNIZED_ERROR_CODE
+    assert updated.needs_attention_reason == "report_failed"
+
+
+@pytest.mark.parametrize(
+    "safe", ["not_found", "status=executing", "RuntimeError", "a.b:c-d_1", "x" * 64]
+)
+def test_mark_needs_attention_keeps_a_well_formed_error_code(safe):
+    updated = mark_needs_attention(
+        _record(), NeedsAttentionReason.REPORT_FAILED, error_code=safe
+    )
+
+    assert updated.last_error_code == safe
 
 
 def test_mark_needs_attention_replaces_a_previous_error_code():

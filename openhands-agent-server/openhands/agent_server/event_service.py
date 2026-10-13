@@ -38,6 +38,7 @@ from openhands.agent_server.governance_outbox import (
     OutboxRecord,
     OutboxState,
     check_governed_binding_required,
+    is_safe_error_code,
     mark_needs_attention,
     record_attempt,
 )
@@ -296,10 +297,13 @@ def _advance_only_from(
 
 
 def _error_code_of(exc: BaseException) -> str:
-    """A secret-free label for ``OutboxRecord.last_error_code``: central's
-    ``error_code`` when the exception carries one, else the exception class
-    name. Never the message, which can contain request detail."""
-    return getattr(exc, "error_code", None) or type(exc).__name__
+    """A label for ``OutboxRecord.last_error_code``: central's ``error_code``
+    when the exception carries a well-formed one, else the exception class
+    name. Never the message, which can contain request detail. The code comes
+    from a response body this device does not control, hence the shape check
+    (``mark_needs_attention`` enforces the same rule at the point of writing)."""
+    code = getattr(exc, "error_code", None)
+    return code if is_safe_error_code(code) else type(exc).__name__
 
 
 def _needs_attention_only_from(

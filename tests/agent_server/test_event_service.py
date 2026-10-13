@@ -21,6 +21,7 @@ from openhands.agent_server.event_service import (
     GovernanceApprovalRequiredError,
     GovernanceStartOutcome,
     GovernanceStartRejectedError,
+    _error_code_of,
     _GovernanceHandshake,
     _with_execution_attested,
     _with_execution_started,
@@ -7327,6 +7328,26 @@ class TestEventServiceGovernanceOrchestration:
         assert updated.needs_attention_reason == NeedsAttentionReason.REPORT_FAILED
         assert updated.last_error_code == "execution_attempt_mismatch"
 
+    @pytest.mark.parametrize(
+        "central_code",
+        [
+            "oops token=sk-123 leaked",  # free text with a space
+            "x" * 65,  # too long
+            {"nested": "object"},  # not a string
+            "",  # empty
+            None,  # absent
+        ],
+    )
+    def test_error_code_of_falls_back_to_the_class_name(self, central_code):
+        exc = GovernancePermanentError("m", error_code=central_code, status_code=400)
+        assert _error_code_of(exc) == "GovernancePermanentError"
+
+    def test_error_code_of_keeps_a_well_formed_central_code(self):
+        exc = GovernancePermanentError(
+            "m", error_code="illegal_transition", status_code=409
+        )
+        assert _error_code_of(exc) == "illegal_transition"
+
     @pytest.mark.asyncio
     async def test_reconcile_after_close_failure_records_why(self, governed_service):
         """The failure_unknown report made while closing is the one report
@@ -7497,6 +7518,33 @@ class TestEventServiceGovernanceOrchestration:
             == NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
         )
         assert updated.last_error_code == f"status={status}"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_decision_status_from_central_is_not_persisted_verbatim(
+        self, governed_service
+    ):
+        """The status comes from a response body this device does not control;
+        free text in it must not reach the outbox file."""
+        await self._create_outbox_record(governed_service, state=OutboxState.CREATED)
+        fake_client = MagicMock()
+        fake_client.wait = AsyncMock(
+            return_value={
+                "id": "approval-1",
+                "status": "oops token=sk-123 leaked\nline2",
+                "changed": True,
+            }
+        )
+        governed_service.governance_client = fake_client
+
+        await governed_service._wait_for_decision_loop("approval-1")
+
+        updated = governed_service.governance_outbox.load()
+        assert updated.state == OutboxState.NEEDS_ATTENTION
+        assert (
+            updated.needs_attention_reason
+            == NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED
+        )
+        assert updated.last_error_code == "unrecognized"
 
     @pytest.mark.asyncio
     async def test_wait_for_decision_expired_is_filed_as_cancelled_or_expired(
