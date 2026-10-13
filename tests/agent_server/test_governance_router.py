@@ -1,8 +1,10 @@
-"""Tests for GET /api/governance/status (read-only GUI status)."""
+"""Tests for GET /api/governance/status (read-only GUI status) and
+GET /api/governance/attention (conversations parked in NEEDS_ATTENTION)."""
 
 from __future__ import annotations
 
 import asyncio
+import uuid
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -12,6 +14,12 @@ from openhands.agent_server import governance_router as router_mod
 from openhands.agent_server.api import create_app
 from openhands.agent_server.config import Config
 from openhands.agent_server.dependencies import get_conversation_service
+from openhands.agent_server.governance_outbox import (
+    OUTBOX_FILENAME,
+    NeedsAttentionReason,
+    OutboxRecord,
+    mark_needs_attention,
+)
 
 
 URL = "/api/governance/status"
@@ -116,3 +124,84 @@ def test_status_requires_session_api_key_when_configured():
 
     assert client.get(URL).status_code == 401
     assert client.get(URL, headers={"X-Session-API-Key": "k1"}).status_code == 200
+
+
+# ----------------------------- GET /attention -----------------------------
+
+ATTENTION_URL = "/api/governance/attention"
+
+
+def _attention_client(config: Config, conversations_dir) -> TestClient:
+    app = create_app(config)
+    app.dependency_overrides[get_conversation_service] = lambda: SimpleNamespace(
+        conversations_dir=conversations_dir, governance_client=None
+    )
+    return TestClient(app)
+
+
+def _park_a_conversation(conversations_dir) -> str:
+    directory = conversations_dir / uuid.uuid4().hex
+    directory.mkdir()
+    record = OutboxRecord(
+        request_id="req-1",
+        conversation_id=directory.name,
+        action_event_id="event-1",
+        tool_call_id="call-1",
+        tool_name="bash",
+        action_type="terminal_command",
+        policy_revision="v1",
+        action_summary="echo hi",
+        action_payload={"command": "echo hi"},
+        digest_salt=None,
+        action_payload_digest="deadbeef",
+        execution_commitment="commitment-hash",
+        origin_device_id="device-1",
+        central_approval_id="approval-1",
+    )
+    mark_needs_attention(
+        record, NeedsAttentionReason.CLAIM_FAILED, error_code="not_found"
+    )
+    (directory / OUTBOX_FILENAME).write_text(record.to_json(), encoding="utf-8")
+    return str(uuid.UUID(hex=directory.name))
+
+
+def test_attention_lists_parked_conversations_in_team_mode(tmp_path):
+    conversation_id = _park_a_conversation(tmp_path)
+
+    body = _attention_client(_team_config(), tmp_path).get(ATTENTION_URL).json()
+
+    assert body == [
+        {
+            "conversation_id": conversation_id,
+            "reason": "claim_failed",
+            "last_error_code": "not_found",
+            "central_approval_id": "approval-1",
+            "request_id": "req-1",
+            "attempt_count": 1,
+            "last_attempt_at": body[0]["last_attempt_at"],
+            "allowed_actions": ["retry", "abandon", "dismiss"],
+        }
+    ]
+    assert body[0]["last_attempt_at"] is not None
+
+
+def test_attention_is_empty_when_nothing_is_parked(tmp_path):
+    assert _attention_client(_team_config(), tmp_path).get(ATTENTION_URL).json() == []
+
+
+def test_attention_is_empty_in_personal_mode_even_if_a_file_exists(tmp_path):
+    # Personal mode has no outbox; a leftover file must not be reported as work.
+    _park_a_conversation(tmp_path)
+
+    assert _attention_client(Config(), tmp_path).get(ATTENTION_URL).json() == []
+
+
+def test_attention_requires_session_api_key_when_configured(tmp_path):
+    # It names conversations and approval ids, so it is not a public endpoint.
+    _park_a_conversation(tmp_path)
+    client = _attention_client(_team_config(session_api_keys=["k1"]), tmp_path)
+
+    assert client.get(ATTENTION_URL).status_code == 401
+    ok = client.get(ATTENTION_URL, headers={"X-Session-API-Key": "k1"})
+    assert ok.status_code == 200
+    assert len(ok.json()) == 1

@@ -1,6 +1,7 @@
-"""Read-only governance status for the desktop GUI.
+"""Read-only governance endpoints: status for the desktop GUI, and the list of
+conversations whose governance outbox needs an operator (``/attention``).
 
-Without this, a team-mode server whose central-governance-api is down (or
+Status: without this, a team-mode server whose central-governance-api is down (or
 whose client credentials were revoked) looks identical to a healthy one until
 an action hangs waiting for a central approval that was never created. The
 GUI reads this to show which mode it is in and, in team mode, whether the
@@ -18,6 +19,10 @@ from pydantic import BaseModel, Field
 from openhands.agent_server.config import Config, missing_team_mode_settings
 from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
+from openhands.agent_server.governance_attention import (
+    AttentionItem,
+    scan_needs_attention,
+)
 
 
 governance_router = APIRouter(prefix="/governance", tags=["Governance"])
@@ -91,4 +96,21 @@ async def get_governance_status(
         deployment_mode="team",
         missing_settings=missing_team_mode_settings(config),
         central_api=CentralApiStatus(**probe, checked_at=checked_at),
+    )
+
+
+@governance_router.get("/attention", response_model=list[AttentionItem])
+async def list_needs_attention(
+    request: Request,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> list[AttentionItem]:
+    """Conversations whose governance outbox is parked in NEEDS_ATTENTION, each
+    with the follow-up actions that are safe for it. Empty outside team mode:
+    personal mode has no outbox."""
+    config: Config = request.app.state.config
+    if config.governance_deployment_mode != "team":
+        return []
+    # Reads one small file per conversation; keep it off the event loop.
+    return await asyncio.to_thread(
+        scan_needs_attention, conversation_service.conversations_dir
     )

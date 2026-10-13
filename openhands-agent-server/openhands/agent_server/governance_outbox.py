@@ -39,7 +39,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from openhands.sdk.security.roy_action_binding import (
     ActionBinding,
@@ -191,8 +191,11 @@ class OutboxRecord:
         return cls(**raw)
 
 
+OUTBOX_FILENAME = "governance_outbox.json"
+
+
 def _outbox_path(conversation_dir: Path) -> Path:
-    return conversation_dir / "governance_outbox.json"
+    return conversation_dir / OUTBOX_FILENAME
 
 
 class GovernanceOutbox:
@@ -275,7 +278,7 @@ _SAFE_ERROR_CODE = re.compile(r"[A-Za-z0-9_.:=-]{1,64}")
 UNRECOGNIZED_ERROR_CODE = "unrecognized"
 
 
-def is_safe_error_code(value: object) -> bool:
+def is_safe_error_code(value: object) -> TypeGuard[str]:
     """True for a short label made only of identifier-like characters. The
     codes and statuses we record come from central's response bodies, which
     this device does not control, so anything else is not written to disk."""
