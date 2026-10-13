@@ -78,6 +78,13 @@ class NeedsAttentionReason(StrEnum):
 
     # A claim was refused or failed before any execution attempt existed.
     CLAIM_FAILED = "claim_failed"
+    # The first claim failed in a way that may be temporary (network, 5xx,
+    # anything but a refusal by central). Central may in fact have claimed: the
+    # reply can be what was lost, so an execution attempt may exist.
+    CLAIM_TRANSIENT = "claim_transient"
+    # The claim was retried after CLAIM_TRANSIENT and failed again. An operator
+    # cannot settle this: a superadmin has to find out what happened.
+    CLAIM_RETRY_FAILED = "claim_retry_failed"
     # report-result was refused after the action may already have run.
     REPORT_FAILED = "report_failed"
     # Central resolved the approval to cancelled/expired while this device
@@ -130,7 +137,7 @@ TERMINAL_STATES = frozenset(
 
 
 # OutboxRecord fields added after the first release of the file format (see to_json).
-_OMITTED_WHEN_UNSET = ("resolution_note", "resolved_at")
+_OMITTED_WHEN_UNSET = ("resolution_note", "resolved_at", "claim_failures")
 
 
 @dataclass
@@ -158,6 +165,9 @@ class OutboxRecord:
     last_attempt_at: str | None = None
     last_error_code: str | None = None
     needs_attention_reason: str | None = None
+    # Claims that failed for a possibly temporary reason (see
+    # NeedsAttentionReason.CLAIM_TRANSIENT). Left out of the file while zero.
+    claim_failures: int = 0
     # The outcome ("success" / "failure_definite" / "failure_unknown")
     # durably persisted *before* calling report_result(), so a crash
     # between "decided to report X" and "central acknowledged X" resumes
@@ -200,7 +210,7 @@ class OutboxRecord:
         # before these fields existed: from_json() rejects keys it does not know, so
         # an older server could otherwise not read ANY outbox written by this one.
         for name in _OMITTED_WHEN_UNSET:
-            if data.get(name) is None:
+            if data.get(name) in (None, 0):
                 data.pop(name, None)
         return json.dumps(data, indent=2, sort_keys=True, default=str)
 
@@ -323,6 +333,21 @@ def mark_needs_attention(
     else:
         record.last_error_code = UNRECOGNIZED_ERROR_CODE
     return record
+
+
+def mark_claim_transient(
+    record: OutboxRecord, *, error_code: str | None = None
+) -> OutboxRecord:
+    """Parks ``record`` after a claim failed for a possibly temporary reason.
+    The first such failure is CLAIM_TRANSIENT (an operator may retry); a failure
+    after that retry is CLAIM_RETRY_FAILED (a superadmin has to look)."""
+    record.claim_failures += 1
+    reason = (
+        NeedsAttentionReason.CLAIM_TRANSIENT
+        if record.claim_failures == 1
+        else NeedsAttentionReason.CLAIM_RETRY_FAILED
+    )
+    return mark_needs_attention(record, reason, error_code=error_code)
 
 
 def check_governed_binding_required(

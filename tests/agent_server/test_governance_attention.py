@@ -343,6 +343,8 @@ def test_every_reason_has_an_explicit_entry():
     ("reason", "expected"),
     [
         (NeedsAttentionReason.CLAIM_FAILED, ["retry", "abandon", "dismiss"]),
+        (NeedsAttentionReason.CLAIM_TRANSIENT, ["retry", "dismiss"]),
+        (NeedsAttentionReason.CLAIM_RETRY_FAILED, ["dismiss"]),
         (NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED, ["abandon", "dismiss"]),
         (NeedsAttentionReason.REPORT_FAILED, ["retry", "dismiss"]),
         (NeedsAttentionReason.RECONCILE_FAILED, ["retry", "dismiss"]),
@@ -422,6 +424,7 @@ def test_check_resolvable_accepts_an_allowed_action():
     ("reason", "expected_state", "expected_outcome"),
     [
         (NeedsAttentionReason.CLAIM_FAILED, OutboxState.CLAIM_INFLIGHT, None),
+        (NeedsAttentionReason.CLAIM_TRANSIENT, OutboxState.CLAIM_INFLIGHT, None),
         (NeedsAttentionReason.REPORT_FAILED, OutboxState.RESULT_PENDING, None),
         (NeedsAttentionReason.RECONCILE_FAILED, OutboxState.RESULT_PENDING, None),
         (

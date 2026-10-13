@@ -156,6 +156,36 @@ def test_list_shows_what_identifies_each_record(server, capsys):
         assert expected in out
 
 
+@pytest.mark.parametrize(
+    ("reason", "allowed", "advice"),
+    [
+        ("claim_transient", ["retry", "dismiss"], "run `resolve retry` once"),
+        ("claim_retry_failed", ["dismiss"], "ask a superadmin"),
+    ],
+)
+def test_list_tells_the_operator_what_to_do_about_a_temporary_claim_failure(
+    server, capsys, reason, allowed, advice
+):
+    """The rule the operator follows: retry once, and if that fails again, ask a
+    superadmin. Without the line they would see only a reason code."""
+    server.routes[("GET", LIST_PATH)] = (
+        200,
+        [{**ITEM, "reason": reason, "allowed_actions": allowed}],
+    )
+
+    _, out, _ = run(capsys, "list", "--url", server.url)
+
+    assert advice in out
+
+
+def test_list_adds_no_advice_line_for_other_reasons(server, capsys):
+    server.routes[("GET", LIST_PATH)] = (200, [ITEM])
+
+    _, out, _ = run(capsys, "list", "--url", server.url)
+
+    assert "next" not in out
+
+
 def test_list_json_is_the_servers_answer_unchanged(server, capsys):
     server.routes[("GET", LIST_PATH)] = (200, [ITEM])
 

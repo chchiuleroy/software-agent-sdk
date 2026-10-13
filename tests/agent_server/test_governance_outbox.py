@@ -18,6 +18,7 @@ from openhands.agent_server.governance_outbox import (
     NeedsAttentionReason,
     OutboxRecord,
     OutboxState,
+    mark_claim_transient,
     mark_needs_attention,
     record_attempt,
 )
@@ -217,7 +218,33 @@ def test_a_record_nobody_resolved_is_written_in_the_original_format():
     assert written == {f.name for f in dataclasses.fields(OutboxRecord)} - {
         "resolution_note",
         "resolved_at",
+        "claim_failures",
     }
+
+
+def test_claim_failures_are_written_only_once_there_are_some_and_round_trip():
+    record = _record()
+    assert "claim_failures" not in json.loads(record.to_json())
+
+    mark_claim_transient(record, error_code="ConnectError")
+
+    assert json.loads(record.to_json())["claim_failures"] == 1
+    assert OutboxRecord.from_json(record.to_json()).claim_failures == 1
+
+
+def test_a_temporary_claim_failure_is_parked_for_one_retry_then_a_superadmin():
+    """The operator rule: tell them to retry once; after that retry fails again,
+    tell them to ask a superadmin. The reason is what says which of the two."""
+    record = _record()
+
+    mark_claim_transient(record, error_code="ConnectError")
+    assert record.needs_attention_reason == NeedsAttentionReason.CLAIM_TRANSIENT
+    assert record.state == OutboxState.NEEDS_ATTENTION
+
+    mark_claim_transient(record, error_code="ConnectError")
+    assert record.needs_attention_reason == NeedsAttentionReason.CLAIM_RETRY_FAILED
+    mark_claim_transient(record, error_code="ConnectError")
+    assert record.needs_attention_reason == NeedsAttentionReason.CLAIM_RETRY_FAILED
 
 
 def test_a_resolved_record_carries_the_resolution_and_round_trips():

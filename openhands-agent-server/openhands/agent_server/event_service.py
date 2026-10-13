@@ -47,6 +47,7 @@ from openhands.agent_server.governance_outbox import (
     OutboxState,
     check_governed_binding_required,
     is_safe_error_code,
+    mark_claim_transient,
     mark_needs_attention,
     record_attempt,
 )
@@ -820,13 +821,35 @@ class EventService:
                     record.central_approval_id,
                 )
                 code = _error_code_of(exc)
+                if record.claim_failures >= 1:
+                    # The operator's retry of a temporary failure was refused:
+                    # still the end of the one retry, not a fresh claim_failed
+                    # that would offer retry again.
+                    await self.governance_outbox.mutate(
+                        lambda r: mark_claim_transient(r, error_code=code)
+                    )
+                    return
                 await self.governance_outbox.mutate(
                     lambda r: mark_needs_attention(
                         r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
                     )
                 )
                 return
-            except Exception:
+            except Exception as exc:
+                if record.claim_failures >= 1:
+                    # An operator retried a claim that had failed temporarily
+                    # and it failed again: stop retrying here and tell them to
+                    # ask a superadmin (see NeedsAttentionReason).
+                    logger.exception(
+                        "outbox relay: claim retried after a temporary failure "
+                        "failed again for approval %s",
+                        record.central_approval_id,
+                    )
+                    code = _error_code_of(exc)
+                    await self.governance_outbox.mutate(
+                        lambda r: mark_claim_transient(r, error_code=code)
+                    )
+                    return
                 # Transient (network/5xx) or unclassified — leave state as
                 # CLAIM_INFLIGHT so the next relay cycle retries with the
                 # same idempotency key rather than giving up.
@@ -893,8 +916,7 @@ class EventService:
                 if await self._fall_back_to_late_report(record, exc):
                     return
                 logger.exception(
-                    "outbox relay: report-result permanently failed for "
-                    "approval %s",
+                    "outbox relay: report-result permanently failed for approval %s",
                     record.central_approval_id,
                 )
                 code = _error_code_of(exc)
@@ -1154,9 +1176,7 @@ class EventService:
                         central_approval_id=central_approval_id
                     )
                 elif status == "rejected":
-                    await self.reject_pending_actions(
-                        "rejected via central governance"
-                    )
+                    await self.reject_pending_actions("rejected via central governance")
                 else:
                     # cancelled/expired, or a status this MVP slice's
                     # state machine doesn't expect to see land here —
@@ -1939,9 +1959,7 @@ class EventService:
                 and existing_record.state == OutboxState.CREATED
                 and existing_record.central_approval_id is not None
             ):
-                self._ensure_wait_for_decision_task(
-                    existing_record.central_approval_id
-                )
+                self._ensure_wait_for_decision_task(existing_record.central_approval_id)
             elif (
                 existing_record is not None
                 and existing_record.state == OutboxState.CLAIMED
@@ -3204,11 +3222,18 @@ class EventService:
                     "claim failed for governance approval %s", central_approval_id
                 )
                 code = _error_code_of(exc)
-                await self.governance_outbox.mutate(
-                    lambda r: mark_needs_attention(
-                        r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
+                if isinstance(exc, GovernancePermanentError):
+                    await self.governance_outbox.mutate(
+                        lambda r: mark_needs_attention(
+                            r, NeedsAttentionReason.CLAIM_FAILED, error_code=code
+                        )
                     )
-                )
+                else:
+                    # May be temporary, and central may even have claimed: the
+                    # operator is offered a retry, once (mark_claim_transient).
+                    await self.governance_outbox.mutate(
+                        lambda r: mark_claim_transient(r, error_code=code)
+                    )
                 _resolve_handshake_once(
                     future, GovernanceStartOutcome.REJECTED_CLAIM_FAILED
                 )
@@ -3341,9 +3366,7 @@ class EventService:
                     self.governance_outbox.mutate(_with_execution_started)
                 )
                 self._pending_governance_report_tasks.add(task)
-                task.add_done_callback(
-                    self._pending_governance_report_tasks.discard
-                )
+                task.add_done_callback(self._pending_governance_report_tasks.discard)
 
             loop.call_soon_threadsafe(_mark_started_on_loop)
 
@@ -3380,9 +3403,7 @@ class EventService:
                     )
                 )
                 self._pending_governance_report_tasks.add(task)
-                task.add_done_callback(
-                    self._pending_governance_report_tasks.discard
-                )
+                task.add_done_callback(self._pending_governance_report_tasks.discard)
 
             loop.call_soon_threadsafe(_handle_reject_on_loop)
 

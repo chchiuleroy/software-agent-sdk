@@ -59,6 +59,13 @@ _ALLOWED_ACTIONS: dict[NeedsAttentionReason, tuple[AttentionAction, ...]] = {
         AttentionAction.ABANDON,
         AttentionAction.DISMISS,
     ),
+    # No abandon: central may have claimed (only the reply was lost), so an
+    # execution attempt may exist.
+    NeedsAttentionReason.CLAIM_TRANSIENT: (
+        AttentionAction.RETRY,
+        AttentionAction.DISMISS,
+    ),
+    NeedsAttentionReason.CLAIM_RETRY_FAILED: (AttentionAction.DISMISS,),
     NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED: (
         AttentionAction.ABANDON,
         AttentionAction.DISMISS,
@@ -291,7 +298,10 @@ def retry_target(record: OutboxRecord) -> tuple[OutboxState, str | None]:
         raise ResolveError(
             "retry_not_possible", "the record has no central approval id"
         )
-    if reason == NeedsAttentionReason.CLAIM_FAILED:
+    if reason in (
+        NeedsAttentionReason.CLAIM_FAILED,
+        NeedsAttentionReason.CLAIM_TRANSIENT,
+    ):
         return OutboxState.CLAIM_INFLIGHT, None
     if record.execution_attempt_id is None:
         raise ResolveError(

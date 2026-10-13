@@ -86,6 +86,7 @@ def pg_tool(name: str) -> str:
 
 DB = "central_e2e_attn"
 IDP_PORT, API_PORT, AGENT_PORT, LLM_PORT = 18794, 8898, 8797, 18795
+PROXY_PORT = 18796  # the agent-server reaches central through this
 ISSUER = f"http://127.0.0.1:{IDP_PORT}/realms/e2e"
 AUDIENCE = "central-governance-api"
 SERVICE_CLIENT = "svc-agent-attn"
@@ -138,6 +139,61 @@ class _Idp(BaseHTTPRequestHandler):
 LOGDIR = pathlib.Path(tempfile.mkdtemp(prefix="attn_logs_"))
 WORKSPACE = pathlib.Path(tempfile.mkdtemp(prefix="attn_ws_"))
 LLM_CALLS: list[str] = []
+
+
+class _FaultProxy(BaseHTTPRequestHandler):
+    """Sits between the agent-server and central. While ``FAULT["claims"]`` is above
+    zero, a claim call is answered 503 without reaching central (a temporary failure);
+    everything else is passed through unchanged."""
+
+    def _forward(self, method: str):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        if method == "POST" and self.path.endswith("/claim") and FAULT["claims"] > 0:
+            FAULT["claims"] -= 1
+            FAULT["refused"] += 1
+            payload = json.dumps({"detail": "injected"}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length", "connection")
+        }
+        try:
+            r = httpx.request(
+                method,
+                f"http://127.0.0.1:{API_PORT}{self.path}",
+                content=body,
+                headers=headers,
+                timeout=30,
+            )
+        except httpx.HTTPError:
+            self.send_response(502)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(r.status_code)
+        self.send_header("Content-Type", r.headers.get("content-type", "text/plain"))
+        self.send_header("Content-Length", str(len(r.content)))
+        self.end_headers()
+        self.wfile.write(r.content)
+
+    def do_GET(self):  # noqa: N802
+        self._forward("GET")
+
+    def do_POST(self):  # noqa: N802
+        self._forward("POST")
+
+    def log_message(self, format, *args):
+        pass
+
+
+FAULT = {"claims": 0, "refused": 0}
 
 
 def _chat_response(message: dict) -> bytes:
@@ -284,6 +340,12 @@ async def main():
         target=ThreadingHTTPServer(("127.0.0.1", LLM_PORT), _Llm).serve_forever,
         daemon=True,
     ).start()
+    threading.Thread(
+        target=ThreadingHTTPServer(
+            ("127.0.0.1", PROXY_PORT), _FaultProxy
+        ).serve_forever,
+        daemon=True,
+    ).start()
     subprocess.run([pg_tool("dropdb"), *PG, "--if-exists", DB], check=True)
     subprocess.run([pg_tool("createdb"), *PG, DB], check=True)
     cenv_base = {
@@ -349,7 +411,7 @@ async def main():
         "OPENHANDS_SUPPRESS_BANNER": "1",
         "OH_GOVERNANCE_DEPLOYMENT_MODE": "team",
         "OH_GOVERNANCE_BRIDGE_TOKEN": secrets.token_urlsafe(24),
-        "OH_GOVERNANCE_CENTRAL_API_BASE_URL": f"http://127.0.0.1:{API_PORT}",
+        "OH_GOVERNANCE_CENTRAL_API_BASE_URL": f"http://127.0.0.1:{PROXY_PORT}",
         "OH_GOVERNANCE_CENTRAL_API_TOKEN_URL": f"http://127.0.0.1:{IDP_PORT}/token",
         "OH_GOVERNANCE_CLIENT_ID": SERVICE_CLIENT,
         "OH_GOVERNANCE_CLIENT_SECRET": "unused",
@@ -993,6 +1055,113 @@ async def main():
                 )
 
             await scenario("PHASE 2: claim_failed -> B abandon, C retry", phase2())
+
+            async def phase3():
+                # Temporary claim failures, made by a proxy in front of central: the
+                # first claim is refused with a 503, so the agent-server cannot tell
+                # whether central claimed. Rule under test: parked once for an
+                # operator retry; if that retry fails again, for a superadmin.
+                check(
+                    "SETUP central up, device binding off",
+                    await start_central(bind=False),
+                )
+
+                async def park_transient(tag: str, claim_faults: int) -> str:
+                    FAULT["claims"] = claim_faults
+                    cid = await start_and_run(tag)
+                    if not await pending_approval(cid, 1):
+                        check(f"SETUP {tag}: approval pending", False, str(rows(cid)))
+                    r = await decide_accept(cid)
+                    check(f"SETUP {tag}: approver accepts", r.status_code == 200)
+                    parked = await wait_for(
+                        lambda: state_of(cid) == "needs_attention", 60
+                    )
+                    ob = outbox_of(cid) or {}
+                    check(
+                        f"{tag}: parked after one temporary claim failure",
+                        bool(parked)
+                        and ob.get("needs_attention_reason") == "claim_transient"
+                        and ob.get("claim_failures") == 1,
+                        f"state={state_of(cid)!r} reason="
+                        f"{ob.get('needs_attention_reason')!r} "
+                        f"failures={ob.get('claim_failures')!r}",
+                    )
+                    check(f"{tag}: the tool did not run", not marker(tag))
+                    item = listed(await attention(), cid) or {}
+                    check(
+                        f"{tag}: listed with retry and dismiss, no abandon "
+                        "(central may have claimed)",
+                        item.get("allowed_actions") == ["retry", "dismiss"],
+                        str(item.get("allowed_actions")),
+                    )
+                    return cid
+
+                # ---- E: fails twice -> retry once -> superadmin
+                cid_e = await park_transient("e1", 2)
+                ob = outbox_of(cid_e) or {}
+                r = await resolve(cid_e, "abandon", ob["request_id"], "e2e")
+                check(
+                    "E abandon is refused for a temporary claim failure",
+                    r.status_code == 409,
+                    f"{r.status_code} {r.text[:120]}",
+                )
+                r = await resolve(cid_e, "retry", ob["request_id"])
+                check("E the operator retry is accepted", r.status_code == 200)
+                parked_again = await wait_for(
+                    lambda: (outbox_of(cid_e) or {}).get("needs_attention_reason")
+                    == "claim_retry_failed",
+                    RELAY_WAIT_SECONDS,
+                )
+                ob = outbox_of(cid_e) or {}
+                check(
+                    "E the retry failed again: parked for a superadmin",
+                    bool(parked_again) and ob.get("claim_failures") == 2,
+                    f"reason={ob.get('needs_attention_reason')!r} "
+                    f"failures={ob.get('claim_failures')!r}",
+                )
+                item = listed(await attention(), cid_e) or {}
+                check(
+                    "E now only dismiss is offered",
+                    item.get("allowed_actions") == ["dismiss"],
+                    str(item.get("allowed_actions")),
+                )
+                r = await resolve(cid_e, "retry", ob["request_id"])
+                check(
+                    "E a second retry is refused",
+                    r.status_code == 409,
+                    f"{r.status_code} {r.text[:120]}",
+                )
+                refused_before = FAULT["refused"]
+                await asyncio.sleep(35)  # more than one relay cycle
+                check(
+                    "E nothing retries it behind anyone's back",
+                    state_of(cid_e) == "needs_attention"
+                    and FAULT["refused"] == refused_before,
+                    f"state={state_of(cid_e)!r}",
+                )
+                check("E the tool never ran", not marker("e1"))
+
+                # ---- F: fails once -> the retry works
+                cid_f = await park_transient("f1", 1)
+                ob = outbox_of(cid_f) or {}
+                r = await resolve(cid_f, "retry", ob["request_id"])
+                check("F the operator retry is accepted", r.status_code == 200)
+                done = await wait_for(
+                    lambda: state_of(cid_f) == "result_reported", RELAY_WAIT_SECONDS
+                )
+                check(
+                    "F the relay repeated the claim and the result was reported",
+                    bool(done),
+                    f"state={state_of(cid_f)!r}",
+                )
+                check("F the tool ran exactly once", marker("f1"))
+                check(
+                    "F central ends the approval as applied",
+                    central_status(cid_f) == "applied",
+                    f"status={central_status(cid_f)!r}",
+                )
+
+            await scenario("PHASE 3: temporary claim failures", phase3())
     finally:
         for proc in [agent, *centrals]:
             if proc is not None:
