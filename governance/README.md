@@ -1,0 +1,15 @@
+# governance/
+
+Documents and operator tooling for this fork's governance layer (team mode: the
+agent-server asks `central-governance-api` to approve actions). Nothing here is imported
+by the `openhands-*` packages; it is not part of what upstream OpenHands ships.
+
+The code itself lives in `openhands-agent-server/openhands/agent_server/governance_*.py`
+and `event_service.py`; its tests are under `tests/agent_server/`.
+
+| Directory | What |
+|---|---|
+| [`needs_attention/`](needs_attention/) | Outbox records parked in `NEEDS_ATTENTION`: how to see and resolve them (operator guide + CLI), the design and its review history, and an end-to-end script against a real central. |
+
+These are permanent files, not temporary PR artifacts: do not move them to `.pr/`
+(which is removed on approval or merge).
