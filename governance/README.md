@@ -10,6 +10,7 @@ and `event_service.py`; its tests are under `tests/agent_server/`.
 | Directory | What |
 |---|---|
 | [`needs_attention/`](needs_attention/) | Outbox records parked in `NEEDS_ATTENTION`: how to see and resolve them (operator guide + CLI), the design and its review history, and an end-to-end script against a real central. |
+| [`recovery/`](recovery/) | Crash recovery: why an approved action is executed at most once after a restart, the three things that guarantee it, the crash scenes pinned by tests, and what opening a replayable action class would have to change. |
 | [`e2e/`](e2e/) | End-to-end scripts: real central on a throwaway Postgres (account requests, device binding, late report, tool permissions, ...). |
 | [`tools/`](tools/) | Throwaway rig for the console sign-in (fake IdP). |
 | [`keycloak/`](keycloak/) | Keycloak setup scripts Roy runs himself (admin password never shared). |
