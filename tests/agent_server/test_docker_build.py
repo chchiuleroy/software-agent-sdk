@@ -3,10 +3,31 @@
 import os
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+
+class _TimeWithMonotonic:
+    """``time`` as the build module sees it, with ``monotonic`` replaced."""
+
+    def __init__(self, values: list[float]) -> None:
+        self._values = iter(values)
+
+    def monotonic(self) -> float:
+        return next(self._values)
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+def _only_build_sees_clock(values: list[float]):
+    # ``patch("...build.time.monotonic")`` replaces ``time.monotonic`` for the whole
+    # process, because ``build.time`` is the time module. A finite list of values is
+    # then also consumed by threads left running by earlier tests in the full suite.
+    return patch("openhands.agent_server.docker.build.time", _TimeWithMonotonic(values))
 
 
 BUILDKIT_STDERR_SAMPLE = "\n".join(
@@ -1077,10 +1098,7 @@ def test_build_with_telemetry_returns_parsed_buildkit_fields(tmp_path: Path):
             "openhands.agent_server.docker.build._make_build_context", return_value=ctx
         ),
         patch("openhands.agent_server.docker.build._run", side_effect=fake_run),
-        patch(
-            "openhands.agent_server.docker.build.time.monotonic",
-            side_effect=[10.0, 13.25, 20.0, 45.5, 46.0, 46.2],
-        ),
+        _only_build_sees_clock([10.0, 13.25, 20.0, 45.5, 46.0, 46.2]),
         patch("openhands.agent_server.docker.build.shutil.rmtree"),
     ):
         result = build_with_telemetry(opts)
@@ -1137,10 +1155,7 @@ def test_build_with_telemetry_preserves_telemetry_on_failure(tmp_path: Path):
             "openhands.agent_server.docker.build._make_build_context", return_value=ctx
         ),
         patch("openhands.agent_server.docker.build._run", side_effect=fake_run),
-        patch(
-            "openhands.agent_server.docker.build.time.monotonic",
-            side_effect=[10.0, 13.25, 20.0, 45.5, 46.0, 46.2],
-        ),
+        _only_build_sees_clock([10.0, 13.25, 20.0, 45.5, 46.0, 46.2]),
         patch("openhands.agent_server.docker.build.shutil.rmtree"),
         pytest.raises(BuildCommandError) as excinfo,
     ):
