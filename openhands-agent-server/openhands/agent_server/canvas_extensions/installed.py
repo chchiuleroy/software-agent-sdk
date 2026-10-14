@@ -283,7 +283,10 @@ def _is_safe_relative_ref(ref: str) -> bool:
         pure = flavour(ref)
         if pure.is_absolute() or pure.anchor or pure.drive or ".." in pure.parts:
             return False
-    return True
+    # Windows ignores trailing dots and spaces in a path component, so "<sha>." names
+    # the same directory as "<sha>": it would pass an exact-match check on the string
+    # and then be recorded as the resolved ref. Git ref names cannot end that way.
+    return all(part == part.rstrip(". ") for part in PureWindowsPath(ref).parts)
 
 
 def _staged_path(installed_dir: Path, name: str, resolved_ref: str | None) -> Path:

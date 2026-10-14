@@ -340,6 +340,9 @@ def test_staged_path_rejects_traversal_and_absolute_refs(installed_dir: Path):
         "C:evil",  # drive-relative
         r"..\escape",  # Windows traversal
         r"sub\..\..\escape",
+        "0123456789abcdef.",  # Windows treats a trailing dot or space as absent
+        "0123456789abcdef ",
+        "feature/x.",
     ],
 )
 def test_staged_path_rejects_windows_shaped_refs_on_any_host(
