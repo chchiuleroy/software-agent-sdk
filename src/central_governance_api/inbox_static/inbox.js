@@ -322,10 +322,14 @@ export function revokeConfirmText(view) {
 // The event types the server writes today. Only a filter convenience: an event
 // of a type not listed here still shows up under "All".
 export const AUDIT_EVENT_TYPES = [
+  "account_request_approved",
+  "account_request_rejected",
   "approval_cancelled",
   "approval_claim_commitment_mismatch",
   "approval_executed_commitment_mismatch",
   "approval_pre_claim_abort",
+  "department_created",
+  "department_disabled",
   "department_principal_assigned",
   "department_principal_unassigned",
   "department_tools_set",
