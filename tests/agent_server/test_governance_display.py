@@ -34,7 +34,10 @@ from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.tool import Action
 from openhands.sdk.tool.builtins.invoke_skill import InvokeSkillAction
 from openhands.sdk.tool.builtins.switch_llm import SwitchLLMAction
-from openhands.sdk.tool.builtins.vision_inspect import VisionInspectAction
+from openhands.sdk.tool.builtins.vision_inspect import (
+    VISION_INSPECT_TOOL_NAME,
+    VisionInspectAction,
+)
 from openhands.tools.apply_patch.definition import ApplyPatchAction
 from openhands.tools.ask_oracle.definition import AskOracleAction
 from openhands.tools.browser_use.definition import (
@@ -495,6 +498,25 @@ def test_browser_type_shows_the_length_of_the_text_never_the_text():
     assert projection.is_unprojected is False
 
 
+def test_the_vision_tool_is_shown_under_the_name_it_registers_with():
+    # The tool arrives as ActionEvent.tool_name == VISION_INSPECT_TOOL_NAME. The
+    # table once listed it under another name, so it was never matched, the
+    # action had no projection and team mode refused it before any approver
+    # saw it. _TOOL_ACTION_CLASSES below had the same wrong name, which is why
+    # the drift test next to it could not notice.
+    projection = build_display(
+        _event(
+            VISION_INSPECT_TOOL_NAME,
+            VisionInspectAction(image_index=2, question="what colour is the car?"),
+        )
+    )
+
+    assert projection.payload["kind"] == "tool_args"
+    assert projection.payload["arg_image_index"] == 2
+    assert "what colour is the car?" in _shown(projection)
+    assert projection.is_unprojected is False
+
+
 def test_browser_set_storage_shows_names_and_counts_never_values():
     state = {
         "cookies": [
@@ -746,7 +768,7 @@ _TOOL_ACTION_CLASSES = {
     "task_tracker": TaskTrackerAction,
     "invoke_skill": InvokeSkillAction,
     "switch_llm": SwitchLLMAction,
-    "vision_inspect": VisionInspectAction,
+    VISION_INSPECT_TOOL_NAME: VisionInspectAction,
 }
 
 

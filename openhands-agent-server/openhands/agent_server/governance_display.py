@@ -37,6 +37,7 @@ from urllib.parse import urlsplit
 from openhands.agent_server.governance_redaction import REDACTION_VERSION, redact
 from openhands.sdk.event import ActionEvent
 from openhands.sdk.security.roy_governance import is_builtin_action
+from openhands.sdk.tool.builtins.vision_inspect import VISION_INSPECT_TOOL_NAME
 
 
 PROJECTION_VERSION = 1
@@ -456,7 +457,10 @@ _TOOL_ARGS: dict[str, dict[str, str]] = {
     "task_tracker": {"command": _SHOW, "task_list": _COUNT},
     "invoke_skill": {"name": _SHOW},
     "switch_llm": {"profile_name": _SHOW, "reason": _SHOW},
-    "vision_inspect": {
+    # Keyed by the constant the tool registers under: a spelled-out name here was
+    # once "vision_inspect", which never matched, so the tool was refused as
+    # unprojected instead of shown for approval.
+    VISION_INSPECT_TOOL_NAME: {
         "image_index": _SHOW,
         "question": _TEXT,
         "profile_name": _SHOW,

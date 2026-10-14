@@ -22,6 +22,7 @@ import ast
 import importlib
 import inspect
 import pkgutil
+import sys
 import textwrap
 from collections.abc import Callable
 from pathlib import Path
@@ -356,6 +357,24 @@ def _event(tool_name: str, action: Action) -> ActionEvent:
     )
 
 
+_BUILTIN_PREFIXES = ("openhands.tools.", "openhands.sdk.tool.builtins.")
+
+
+def _defined_in_a_built_in_module(cls: type) -> bool:
+    """True for a class that really is a module-level class of a built-in package.
+
+    ``__module__`` is only a string: another test makes a class that claims a built-in
+    module (and a function-local class has the module of the function). Such a class
+    lingers in ``__subclasses__()`` until it is garbage collected, so a test run in
+    the same process would see it or not depending on timing. The class must also be
+    the one that module holds under that name, as ``is_builtin_action`` requires.
+    """
+    if not cls.__module__.startswith(_BUILTIN_PREFIXES):
+        return False
+    module = sys.modules.get(cls.__module__)
+    return getattr(module, cls.__qualname__, None) is cls
+
+
 def _builtin_action_classes() -> set[type[Action]]:
     """Every Action class the built-in packages define.
 
@@ -374,13 +393,7 @@ def _builtin_action_classes() -> set[type[Action]]:
             found |= subclasses(sub)
         return found
 
-    return {
-        cls
-        for cls in subclasses(Action)
-        if cls.__module__.startswith(
-            ("openhands.tools.", "openhands.sdk.tool.builtins.")
-        )
-    }
+    return {cls for cls in subclasses(Action) if _defined_in_a_built_in_module(cls)}
 
 
 @pytest.fixture
@@ -420,12 +433,16 @@ def test_every_built_in_action_class_has_exactly_one_row():
     assert not unknown, f"row(s) for class(es) that are not built-in Actions: {unknown}"
 
 
-# KNOWN DEFECT, not fixed here (1.14 changes no behaviour): the agent-server's
-# display table lists the vision tool as "vision_inspect", but it registers (and so
-# arrives in ActionEvent.tool_name) as VISION_INSPECT_TOOL_NAME. In team mode that
-# action therefore has no projection and is refused instead of shown for approval.
-# Fixing the display table's key removes the need for this entry.
-_DISPLAY_NAME_DEFECTS = {"vision_inspect": VISION_INSPECT_TOOL_NAME}
+def test_a_class_that_only_claims_a_built_in_module_is_not_a_built_in_action():
+    """``__module__`` is a string anyone can set (another test does). Such a class
+    must not make the completeness test depend on whether it has been garbage
+    collected yet, so discovery counts only classes the module really holds."""
+
+    class _Forged(Action):
+        __module__ = "openhands.tools.imaginary.definition"
+
+    forged = _Forged  # alive for the whole test, not left to the collector
+    assert forged not in _builtin_action_classes()
 
 
 def test_the_display_tables_and_the_risk_table_name_the_same_tools():
@@ -433,13 +450,8 @@ def test_the_display_tables_and_the_risk_table_name_the_same_tools():
     tables list; the risk table is keyed by the same tool names. A name in one and
     not the other is either a tool nobody classified or a stale row."""
     display = set(_PATH_TOOLS) | set(_PROJECTORS) | set(_TOOL_ARGS)
-    assert set(_DISPLAY_NAME_DEFECTS) <= display, (
-        "the display table no longer has the wrong vision name: drop "
-        "_DISPLAY_NAME_DEFECTS"
-    )
-    corrected = {_DISPLAY_NAME_DEFECTS.get(name, name) for name in display}
     # finish and think are never shown for approval (the SDK does not ask for them).
-    assert corrected | {"finish", "think"} == set(_TABLE)
+    assert display | {"finish", "think"} == set(_TABLE)
 
 
 def test_the_table_is_keyed_by_the_names_tools_really_register():
@@ -459,9 +471,7 @@ def test_the_table_is_keyed_by_the_names_tools_really_register():
     registered = {
         cls.name
         for cls in tools(ToolDefinition)
-        if cls.__module__.startswith(
-            ("openhands.tools.", "openhands.sdk.tool.builtins.")
-        )
+        if _defined_in_a_built_in_module(cls)
         and isinstance(getattr(cls, "name", None), str)
         and not cls.name.endswith("_tool_set")
     }
