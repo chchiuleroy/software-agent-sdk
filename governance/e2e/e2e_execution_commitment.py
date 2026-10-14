@@ -19,9 +19,12 @@ Then the database is read (psql) for what the API cannot show: `commitment_match
 case and the mismatch audit event.
 
 Both enforcement switches (CGA_DEVICE_BINDING_ENFORCED, CGA_REQUIRE_EXECUTION_COMMITMENT)
-are left at their defaults (off). Run with the SDK venv python (cwd = the repository
-root); it creates and drops its own database `central_e2e_commit`. It does not read
-central's .env and never touches the real database.
+are forced off for the run. Run with the SDK venv python (cwd = the repository
+root); it creates and drops its own randomly named database `central_e2e_commit_<hex>`.
+Central still loads its own .env (its Settings read `.env` from the working directory),
+but every key that matters here is set explicitly in the subprocess environment, which
+wins over `.env`: the database URL, the four OIDC settings and both enforcement switches.
+The real database is never touched.
 
 Limits: HTTP layer only; the agent-server's own use of the commitment (EventService,
 real conversations) is not covered here.
@@ -48,7 +51,7 @@ from ohs_env import CENTRAL, CPY, pg_tool
 
 
 PG = ["-h", "127.0.0.1", "-p", "54329", "-U", "cga"]
-DB = "central_e2e_commit"
+DB = f"central_e2e_commit_{uuid.uuid4().hex[:8]}"
 IDP_PORT, API_PORT = 18794, 8894
 ISSUER = f"http://127.0.0.1:{IDP_PORT}/realms/e2e"
 AUDIENCE = "central-governance-api"
@@ -166,8 +169,6 @@ async def main():
         target=ThreadingHTTPServer(("127.0.0.1", IDP_PORT), _Idp).serve_forever,
         daemon=True,
     ).start()
-    subprocess.run([pg_tool("dropdb"), *PG, "--if-exists", DB], check=True)
-    subprocess.run([pg_tool("createdb"), *PG, DB], check=True)
     env = {
         **os.environ,
         "PYTHONUTF8": "1",
@@ -177,30 +178,33 @@ async def main():
         "CGA_OIDC_AUDIENCE": AUDIENCE,
         "CGA_OIDC_REQUIRE_HTTPS": "false",
         "CGA_PORT": str(API_PORT),
+        # Set explicitly (not just removed): the environment wins over central's .env,
+        # and the cases below only mean what they say with both switches off.
+        "CGA_DEVICE_BINDING_ENFORCED": "false",
+        "CGA_REQUIRE_EXECUTION_COMMITMENT": "false",
     }
-    # The two switches must be off for this script to mean what it says.
-    env.pop("CGA_DEVICE_BINDING_ENFORCED", None)
-    env.pop("CGA_REQUIRE_EXECUTION_COMMITMENT", None)
-    subprocess.run(
-        [CPY, "-m", "alembic", "upgrade", "head"],
-        cwd=CENTRAL,
-        env=env,
-        check=True,
-        capture_output=True,
-    )
-    logpath = os.path.join(tempfile.mkdtemp(prefix="commit_logs_"), "central.log")
-    logfile = open(logpath, "w", encoding="utf-8")
-    server = subprocess.Popen(
-        [CPY, "-c", "from central_governance_api.main import main; main()"],
-        cwd=CENTRAL,
-        env=env,
-        stdout=logfile,
-        stderr=subprocess.STDOUT,
-    )
     base = f"http://127.0.0.1:{API_PORT}"
     op = token("operator-1", ["agent.operator"])
     ap = token("approver-1", ["agent.approver"])
+    logpath = os.path.join(tempfile.mkdtemp(prefix="commit_logs_"), "central.log")
+    logfile = server = None
     try:
+        subprocess.run([pg_tool("createdb"), *PG, DB], check=True)
+        subprocess.run(
+            [CPY, "-m", "alembic", "upgrade", "head"],
+            cwd=CENTRAL,
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        logfile = open(logpath, "w", encoding="utf-8")
+        server = subprocess.Popen(
+            [CPY, "-c", "from central_governance_api.main import main; main()"],
+            cwd=CENTRAL,
+            env=env,
+            stdout=logfile,
+            stderr=subprocess.STDOUT,
+        )
         async with httpx.AsyncClient(base_url=base, timeout=30) as c:
             for _ in range(60):
                 try:
@@ -414,17 +418,19 @@ async def main():
             f"count={n}",
         )
     finally:
-        server.terminate()
-        try:
-            server.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            server.kill()
-        logfile.close()
-        log_text = open(logpath, encoding="utf-8", errors="replace").read()
-        check(
-            "no traceback or 5xx in the central log",
-            "Traceback" not in log_text and '" 500 ' not in log_text,
-        )
+        if server is not None:
+            server.terminate()
+            try:
+                server.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                server.kill()
+        if logfile is not None:
+            logfile.close()
+            log_text = open(logpath, encoding="utf-8", errors="replace").read()
+            check(
+                "no traceback or 5xx in the central log",
+                "Traceback" not in log_text and '" 500 ' not in log_text,
+            )
         subprocess.run([pg_tool("dropdb"), *PG, "--if-exists", DB], check=False)
     print(f"\n{sum(RESULTS)}/{len(RESULTS)} checks passed")
     sys.exit(0 if all(RESULTS) else 1)
