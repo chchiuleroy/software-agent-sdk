@@ -19,6 +19,7 @@ const STORAGE_VERIFIER = "inbox_verifier";
 const STORAGE_HASH = "inbox_hash";
 const DEVICES_PAGE = 50;
 const DEVICES_MAX = 200; // GET /api/v1/devices rejects a larger limit
+const AUDIT_PAGE = 50;
 
 // ---------------------------------------------------------------- pure helpers
 // (exported so tests/js/inbox.test.mjs can run them under Node)
@@ -151,8 +152,9 @@ export function describeItem(item) {
 // never a security control.
 //
 // The roles are deliberately separate, not a hierarchy: governance.superadmin
-// is not a superset of agent.approver, and governance.admin unlocks nothing
-// here. "planned" sections have no page yet and are shown inert.
+// is not a superset of agent.approver. governance.admin unlocks nothing here
+// EXCEPT the Audit trail, which the audit-events endpoint also opens to it
+// (2026-10-14). "planned" sections have no page yet and are shown inert.
 
 export const SECTIONS = [
   { id: "profile", title: "Profile", audience: "user", requiredRoles: [], status: "live" },
@@ -176,6 +178,13 @@ export const SECTIONS = [
     requiredRoles: ["governance.superadmin"],
     status,
   })),
+  {
+    id: "audit",
+    title: "Audit",
+    audience: "admin",
+    requiredRoles: ["governance.admin", "governance.superadmin"],
+    status: "live",
+  },
 ];
 
 export function visibleSections(roles) {
@@ -306,6 +315,74 @@ export function revokeConfirmText(view) {
   ].join("\n");
 }
 
+// ---------------------------------------------------------------- audit trail
+// Rows of GET /api/v1/audit-events. Every value is untrusted text: device ids
+// are chosen by the registering client and payloads are free-form JSON.
+
+// The event types the server writes today. Only a filter convenience: an event
+// of a type not listed here still shows up under "All".
+export const AUDIT_EVENT_TYPES = [
+  "approval_cancelled",
+  "approval_claim_commitment_mismatch",
+  "approval_executed_commitment_mismatch",
+  "approval_pre_claim_abort",
+  "department_principal_assigned",
+  "department_principal_unassigned",
+  "department_tools_set",
+  "device_revoked",
+  "membership_bound",
+];
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function looksLikeUuid(text) {
+  return UUID_PATTERN.test(String(text ?? "").trim());
+}
+
+// The URL of one page. `cursor` is the opaque value of the previous page's
+// next_cursor, passed back untouched (only URL-encoded).
+export function auditPath(filters, cursor, limit = AUDIT_PAGE) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const eventType = String(filters?.eventType ?? "").trim();
+  const approvalId = String(filters?.approvalId ?? "").trim();
+  if (eventType) params.set("event_type", eventType);
+  if (approvalId) params.set("approval_request_id", approvalId);
+  if (cursor) params.set("cursor", String(cursor));
+  return `/api/v1/audit-events?${params.toString()}`;
+}
+
+export function payloadText(payload) {
+  if (payload === null || payload === undefined) return "";
+  try {
+    return truncate(JSON.stringify(payload, null, 2));
+  } catch {
+    return "(payload could not be shown)";
+  }
+}
+
+export function describeAuditEvent(item, me) {
+  const approval =
+    item.approval_request_id === null || item.approval_request_id === undefined
+      ? null
+      : String(item.approval_request_id);
+  return {
+    id: String(item.id),
+    type: truncate(item.event_type ?? "", 80),
+    actor: ownerLabel(item.actor_subject, me),
+    device:
+      item.origin_device_id === null || item.origin_device_id === undefined
+        ? null
+        : truncate(item.origin_device_id, 80),
+    approval:
+      approval === null
+        ? null
+        : { short: truncate(approval.slice(0, 8), 8), full: truncate(approval, 80) },
+    when: formatUtc(item.occurred_at),
+    payload: payloadText(item.payload),
+  };
+}
+
 // ------------------------------------------------------------------- rendering
 // `doc` is a Document (or a test double): no innerHTML, only text nodes.
 
@@ -382,6 +459,40 @@ export function renderIdentity(doc, view) {
   }
   card.appendChild(facts);
   return card;
+}
+
+export function renderAuditEvent(doc, view) {
+  const li = el(doc, "li", undefined, "item audit");
+  li.appendChild(el(doc, "h2", view.type));
+  const facts = el(doc, "dl");
+  facts.appendChild(el(doc, "dt", "When"));
+  facts.appendChild(el(doc, "dd", view.when));
+  facts.appendChild(el(doc, "dt", "Actor"));
+  const actor = el(
+    doc,
+    "dd",
+    view.actor.mine ? `${view.actor.short} (you)` : view.actor.short,
+  );
+  actor.title = view.actor.full;
+  facts.appendChild(actor);
+  if (view.device !== null) {
+    facts.appendChild(el(doc, "dt", "Device"));
+    facts.appendChild(el(doc, "dd", view.device));
+  }
+  if (view.approval !== null) {
+    facts.appendChild(el(doc, "dt", "Approval"));
+    const approval = el(doc, "dd", view.approval.short);
+    approval.title = view.approval.full;
+    facts.appendChild(approval);
+  }
+  li.appendChild(facts);
+  if (view.payload) {
+    const details = el(doc, "details");
+    details.appendChild(el(doc, "summary", "Payload"));
+    details.appendChild(el(doc, "pre", view.payload));
+    li.appendChild(details);
+  }
+  return li;
 }
 
 export function renderDevice(doc, view, onRevoke) {
@@ -465,6 +576,13 @@ async function main() {
   const devicesListEl = document.getElementById("devices-list");
   const devicesMoreEl = document.getElementById("devices-more");
   const devicesRefreshEl = document.getElementById("devices-refresh");
+  const auditEl = document.getElementById("audit");
+  const auditListEl = document.getElementById("audit-list");
+  const auditMoreEl = document.getElementById("audit-more");
+  const auditRefreshEl = document.getElementById("audit-refresh");
+  const auditApplyEl = document.getElementById("audit-apply");
+  const auditTypeEl = document.getElementById("audit-type");
+  const auditApprovalEl = document.getElementById("audit-approval");
   const whoEl = document.getElementById("who");
   const signoutEl = document.getElementById("signout");
   const say = (message) => {
@@ -513,6 +631,13 @@ async function main() {
   let devices = [];
   let devicesNextOffset = null;
   let devicesSeq = 0;
+  // The Audit screen: rows shown, the cursor of the next page, the filters the
+  // first page was fetched with (every later page must use the same ones) and
+  // the same drop-the-stale-response counter.
+  let audit = [];
+  let auditNextCursor = null;
+  let auditFilters = { eventType: "", approvalId: "" };
+  let auditSeq = 0;
 
   function signOut(message) {
     token = null;
@@ -524,6 +649,12 @@ async function main() {
     devicesListEl.replaceChildren();
     devicesMoreEl.hidden = true;
     devicesEl.hidden = true;
+    audit = [];
+    auditNextCursor = null;
+    auditSeq += 1;
+    auditListEl.replaceChildren();
+    auditMoreEl.hidden = true;
+    auditEl.hidden = true;
     listEl.replaceChildren();
     navEl.replaceChildren();
     navEl.hidden = true;
@@ -689,12 +820,69 @@ async function main() {
     }
   }
 
+  function renderAudit() {
+    auditListEl.replaceChildren(
+      ...audit.map((item) =>
+        renderAuditEvent(document, describeAuditEvent(item, meInfo)),
+      ),
+    );
+    auditMoreEl.hidden = auditNextCursor === null;
+  }
+
+  // reset: start again from the first page, with the filters now in the form;
+  // otherwise append the next page of the same walk.
+  async function loadAudit(reset) {
+    if (!token) return;
+    if (!reset && auditNextCursor === null) return;
+    if (Date.now() >= expiresAtMs) {
+      signOut("Your session expired. Sign in again.");
+      return;
+    }
+    if (reset) {
+      const approvalId = auditApprovalEl.value.trim();
+      if (approvalId && !looksLikeUuid(approvalId)) {
+        say("The approval ID must be a UUID.");
+        return;
+      }
+      auditFilters = { eventType: auditTypeEl.value, approvalId };
+    }
+    const seq = (auditSeq += 1);
+    let response;
+    try {
+      response = await api(
+        auditPath(auditFilters, reset ? null : auditNextCursor),
+      );
+    } catch {
+      if (token && seq === auditSeq && active === "audit") {
+        say("Could not reach the server.");
+      }
+      return;
+    }
+    // A newer request, or another section, now owns the status line.
+    if (seq !== auditSeq || active !== "audit") return;
+    if (!response.ok) {
+      say(`Could not load the audit trail (HTTP ${response.status}).`);
+      return;
+    }
+    const body = await response.json();
+    if (seq !== auditSeq) return;
+    audit = reset ? body.items : [...audit, ...body.items];
+    auditNextCursor = body.next_cursor ?? null;
+    renderAudit();
+    say(
+      audit.length === 0
+        ? "No audit events match."
+        : `${audit.length} event(s), newest first${auditNextCursor === null ? "" : " (more available)"}.`,
+    );
+  }
+
   // What each live section shows and what it does when opened. A section in
   // SECTIONS only works if it has an entry here.
   const PANELS = {
     profile: { el: profileEl },
     approvals: { el: approvalsEl, open: refresh },
     devices: { el: devicesEl, open: () => loadDevices(true) },
+    audit: { el: auditEl, open: () => loadAudit(true) },
   };
 
   function showSection() {
@@ -791,6 +979,15 @@ async function main() {
 
   devicesRefreshEl.addEventListener("click", () => loadDevices(true));
   devicesMoreEl.addEventListener("click", () => loadDevices(false));
+  auditRefreshEl.addEventListener("click", () => loadAudit(true));
+  auditApplyEl.addEventListener("click", () => loadAudit(true));
+  auditMoreEl.addEventListener("click", () => loadAudit(false));
+  for (const type of AUDIT_EVENT_TYPES) {
+    const option = document.createElement("option");
+    option.value = type;
+    option.textContent = type;
+    auditTypeEl.appendChild(option);
+  }
   document.getElementById("signin").addEventListener("click", signIn);
   signoutEl.addEventListener("click", () => signOut());
 

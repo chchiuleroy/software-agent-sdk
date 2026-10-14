@@ -3,19 +3,25 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  AUDIT_EVENT_TYPES,
+  auditPath,
   base64url,
   buildAuthUrl,
   decodeJwtPayload,
+  describeAuditEvent,
   describeDevice,
   describeIdentity,
   describeItem,
   formatRemaining,
+  looksLikeUuid,
   mergeDevices,
   ownerLabel,
   pageLimit,
   parseCallback,
+  payloadText,
   pkceChallenge,
   randomString,
+  renderAuditEvent,
   renderDevice,
   renderIdentity,
   renderItem,
@@ -243,7 +249,7 @@ test("an approver sees the approvals inbox, nothing of the admin area", () => {
 
 test("superadmin gets the admin area but NOT approvals: the roles are separate", () => {
   const sections = visibleSections(["governance.superadmin"]);
-  assert.deepEqual(ids(sections), ["profile", ...SUPERADMIN_IDS]);
+  assert.deepEqual(ids(sections), ["profile", ...SUPERADMIN_IDS, "audit"]);
   assert.ok(sections.filter((s) => s.audience === "superadmin").length > 0);
   const live = sections
     .filter((s) => s.audience === "superadmin" && s.status === "live")
@@ -257,11 +263,12 @@ test("superadmin gets the admin area but NOT approvals: the roles are separate",
   );
 });
 
-test("governance.admin and agent.operator do not unlock the admin area", () => {
+test("governance.admin unlocks the Audit trail and nothing else of the admin area", () => {
   assert.deepEqual(
     ids(visibleSections(["governance.admin", "agent.operator"])),
-    ["profile"],
+    ["profile", "audit"],
   );
+  assert.deepEqual(ids(visibleSections(["agent.operator"])), ["profile"]);
 });
 
 test("every admin-area section needs exactly governance.superadmin", () => {
@@ -559,4 +566,147 @@ test("a reload keeps what was already loaded, within the server's page limit", (
   assert.equal(pageLimit(150), 150);
   assert.equal(pageLimit(200), 200);
   assert.equal(pageLimit(999), 200, "the API accepts at most 200 per request");
+});
+
+// ------------------------------------------------------------------ audit trail
+
+const AUDIT_ME = { issuer: "http://kc/realms/x", sub: "me-1111-2222-3333-4444" };
+
+function auditItem(overrides = {}) {
+  return {
+    id: "evt-1",
+    event_type: "device_revoked",
+    actor_subject: "http://kc/realms/x#alice-1111-2222-3333-4444",
+    origin_device_id: "laptop-7",
+    approval_request_id: "0f8fad5b-d9cb-469f-a165-70867728950e",
+    occurred_at: "2026-10-14T12:00:00.123456+00:00",
+    payload: { reason: "lost", count: 2 },
+    ...overrides,
+  };
+}
+
+test("Audit is a live section for governance.admin and governance.superadmin only", () => {
+  const audit = SECTIONS.find((section) => section.id === "audit");
+  assert.equal(audit.status, "live");
+  assert.deepEqual(audit.requiredRoles, ["governance.admin", "governance.superadmin"]);
+  for (const roles of [["governance.admin"], ["governance.superadmin"]]) {
+    assert.ok(ids(visibleSections(roles)).includes("audit"), roles.join());
+  }
+  for (const roles of [[], ["agent.approver"], ["agent.operator"]]) {
+    assert.ok(!ids(visibleSections(roles)).includes("audit"), roles.join());
+  }
+  assert.deepEqual(resolveSection("#audit", ["governance.admin"]), {
+    id: "audit",
+    denied: false,
+  });
+  assert.deepEqual(resolveSection("#audit", ["agent.approver"]), {
+    id: "profile",
+    denied: true,
+  });
+});
+
+test("auditPath carries only the filters that are set, and URL-encodes the cursor", () => {
+  assert.equal(auditPath({ eventType: "", approvalId: "" }, null), "/api/v1/audit-events?limit=50");
+  const url = new URL(
+    auditPath(
+      { eventType: "device_revoked", approvalId: "  0f8fad5b-d9cb-469f-a165-70867728950e " },
+      "ab+/=c d",
+      20,
+    ),
+    "http://x",
+  );
+  assert.equal(url.pathname, "/api/v1/audit-events");
+  assert.equal(url.searchParams.get("limit"), "20");
+  assert.equal(url.searchParams.get("event_type"), "device_revoked");
+  assert.equal(url.searchParams.get("approval_request_id"), "0f8fad5b-d9cb-469f-a165-70867728950e");
+  assert.equal(url.searchParams.get("cursor"), "ab+/=c d", "the cursor survives the round trip untouched");
+  assert.ok(!auditPath({}, "x").includes("event_type"));
+});
+
+test("looksLikeUuid accepts a UUID and rejects look-alikes", () => {
+  assert.ok(looksLikeUuid("0f8fad5b-d9cb-469f-a165-70867728950e"));
+  assert.ok(looksLikeUuid(" 0F8FAD5B-D9CB-469F-A165-70867728950E "));
+  for (const bad of ["", "abc", "0f8fad5b-d9cb-469f-a165-70867728950", "0f8fad5b-d9cb-469f-a165-70867728950e-1", "zf8fad5b-d9cb-469f-a165-70867728950e", null, undefined]) {
+    assert.ok(!looksLikeUuid(bad), String(bad));
+  }
+});
+
+test("describeAuditEvent reads a row and keeps the full values for tooltips", () => {
+  const view = describeAuditEvent(auditItem(), AUDIT_ME);
+  assert.equal(view.type, "device_revoked");
+  assert.equal(view.when, "2026-10-14 12:00 UTC");
+  assert.equal(view.actor.short, "alice-11…");
+  assert.equal(view.actor.full, "http://kc/realms/x#alice-1111-2222-3333-4444");
+  assert.equal(view.actor.mine, false);
+  assert.equal(view.device, "laptop-7");
+  assert.deepEqual(view.approval, { short: "0f8fad5b", full: "0f8fad5b-d9cb-469f-a165-70867728950e" });
+  assert.match(view.payload, /"reason": "lost"/);
+});
+
+test("describeAuditEvent: a row with no device or approval, my own action, a bad date", () => {
+  const view = describeAuditEvent(
+    auditItem({
+      origin_device_id: null,
+      approval_request_id: null,
+      actor_subject: `${AUDIT_ME.issuer}#${AUDIT_ME.sub}`,
+      occurred_at: "not a date",
+      payload: null,
+    }),
+    AUDIT_ME,
+  );
+  assert.equal(view.device, null);
+  assert.equal(view.approval, null);
+  assert.equal(view.actor.mine, true);
+  assert.equal(view.when, "unknown");
+  assert.equal(view.payload, "");
+});
+
+test("describeAuditEvent bounds huge values and survives a payload JSON cannot print", () => {
+  const huge = "x".repeat(50000);
+  const view = describeAuditEvent(
+    auditItem({ event_type: huge, origin_device_id: huge, payload: { blob: huge } }),
+    AUDIT_ME,
+  );
+  assert.ok(view.type.length < 200);
+  assert.ok(view.device.length < 200);
+  assert.ok(view.payload.length < 5000);
+  assert.equal(payloadText({ n: 10n }), "(payload could not be shown)");
+});
+
+test("an audit row renders hostile values as text, and the payload sits in a details block", () => {
+  const hostile = '<img src=x onerror="alert(1)">';
+  const view = describeAuditEvent(
+    auditItem({
+      event_type: hostile,
+      origin_device_id: hostile,
+      actor_subject: `i#${hostile}`,
+      payload: { note: hostile },
+    }),
+    AUDIT_ME,
+  );
+  const li = renderAuditEvent(fakeDocument(), view);
+  const text = allText(li);
+  assert.ok(text.includes(hostile));
+  assert.match(li.className, /audit/);
+  const details = li.children.find((child) => child.tag === "details");
+  assert.ok(details, "the payload is tucked into <details>");
+  assert.equal(details.children[0].tag, "summary");
+  assert.equal(details.children[1].tag, "pre");
+});
+
+test("an audit row without a payload has no details block, and my own action says (you)", () => {
+  const mine = describeAuditEvent(
+    auditItem({ payload: null, actor_subject: `${AUDIT_ME.issuer}#${AUDIT_ME.sub}` }),
+    AUDIT_ME,
+  );
+  const li = renderAuditEvent(fakeDocument(), mine);
+  assert.ok(!li.children.some((child) => child.tag === "details"));
+  assert.match(allText(li), /\(you\)/);
+  const theirs = renderAuditEvent(fakeDocument(), describeAuditEvent(auditItem(), AUDIT_ME));
+  assert.doesNotMatch(allText(theirs), /\(you\)/);
+});
+
+test("the event type filter list has no duplicates and is sorted", () => {
+  assert.equal(new Set(AUDIT_EVENT_TYPES).size, AUDIT_EVENT_TYPES.length);
+  assert.deepEqual([...AUDIT_EVENT_TYPES].sort(), AUDIT_EVENT_TYPES);
 });
