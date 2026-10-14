@@ -44,17 +44,53 @@ def _current_host() -> str:
         return ""
 
 
+def _is_pid_alive_windows(pid: int) -> bool:
+    """Windows liveness probe.
+
+    ``os.kill(pid, 0)`` is not a probe on Windows: signal 0 is
+    ``CTRL_C_EVENT``, and an unknown pid fails with ``WinError 87``, which the
+    POSIX branch would read as "alive" -- so an orphaned lease could never be
+    taken over before its TTL. Ask the OS for the process instead.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    error_access_denied = 5
+    still_active = 259
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        # Access denied means the process exists; any other failure (notably
+        # ERROR_INVALID_PARAMETER for a pid that does not exist) means it does not.
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # cannot tell: stay conservative
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Best-effort check for whether ``pid`` is a live process on this host.
 
-    Uses ``os.kill(pid, 0)`` which is portable across POSIX platforms and
-    available on Windows since Python 3.2. When liveness cannot be
-    determined (permission errors, unsupported platforms, etc.) we
-    conservatively report the process as alive so we never steal a lease
-    that might still be in use.
+    Uses ``os.kill(pid, 0)`` on POSIX and the Win32 process API on Windows.
+    When liveness cannot be determined (permission errors, unsupported
+    platforms, etc.) we conservatively report the process as alive so we never
+    steal a lease that might still be in use.
     """
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _is_pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

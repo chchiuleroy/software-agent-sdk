@@ -304,3 +304,30 @@ def test_claim_self_pid_match_is_not_treated_as_dead(tmp_path: Path) -> None:
     )
     with pytest.raises(ConversationLeaseHeldError):
         secondary.claim()
+
+
+def test_is_pid_alive_reports_own_pid_alive():
+    assert conversation_lease_module._is_pid_alive(os.getpid()) is True
+
+
+def test_is_pid_alive_reports_exited_process_dead():
+    # A real process that has exited, not an invented pid: on Windows an
+    # ``os.kill(pid, 0)`` probe cannot tell this apart from a live one.
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=60)
+    assert conversation_lease_module._is_pid_alive(child.pid) is False
+
+
+def test_is_pid_alive_reports_running_child_alive():
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        assert conversation_lease_module._is_pid_alive(child.pid) is True
+    finally:
+        child.kill()
+        child.wait(timeout=60)
