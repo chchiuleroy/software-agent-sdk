@@ -34,10 +34,14 @@ def _drop_site_packages_subdir_paths():
     with a ``mcp`` <-> ``browser_use.mcp`` circular import. Dropping such
     entries restores normal top-level resolution.
     """
+    # Only a stray *package* directory shadows anything. Keep plain site-packages
+    # subdirectories such as pywin32's ``win32`` and ``win32/lib`` (added by its .pth
+    # file): ``import pywintypes`` needs them, and mcp imports it on Windows.
     cleaned = [
         entry
         for entry in sys.path
         if os.path.basename(os.path.dirname(entry.rstrip(os.sep))) != "site-packages"
+        or not os.path.exists(os.path.join(entry, "__init__.py"))
     ]
     sys.path[:] = cleaned
 
