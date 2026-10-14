@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 from collections.abc import Generator
@@ -42,6 +43,34 @@ from openhands.sdk.credential import (
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+
+
+class _AsyncioWithSleep:
+    """``asyncio`` as credential_binding sees it, with only ``sleep`` replaced."""
+
+    def __init__(self, sleep: AsyncMock) -> None:
+        self.sleep = sleep
+
+    def __getattr__(self, name: str):
+        return getattr(asyncio, name)
+
+
+def _only_binding_sees(sleep: AsyncMock):
+    # ``patch("...credential_binding.asyncio.sleep")`` replaces ``asyncio.sleep`` for
+    # the whole process, because ``credential_binding.asyncio`` is the asyncio module.
+    # In the full suite, tasks left running by earlier tests then call the mock too and
+    # corrupt ``await_args_list``. Swapping the module's ``asyncio`` name keeps the
+    # fake out of everyone else's reach.
+    return patch(
+        "openhands.agent_server.credential_binding.asyncio", _AsyncioWithSleep(sleep)
+    )
+
+
+def test_binding_sleep_fake_does_not_reach_other_asyncio_users() -> None:
+    sleep = AsyncMock()
+    with _only_binding_sees(sleep):
+        asyncio.run(asyncio.sleep(0))  # someone else's sleep, as a leaked task would do
+    assert sleep.await_count == 0
 
 
 @dataclass
@@ -236,7 +265,7 @@ def test_activation_route_rejects_unavailable_binding(
     callback.responses.extend([(503, "{}")] * 3)
 
     sleep = AsyncMock()
-    with patch("openhands.agent_server.credential_binding.asyncio.sleep", sleep):
+    with _only_binding_sees(sleep):
         response = TestClient(app).put(
             f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
             json={
@@ -269,7 +298,7 @@ def test_activation_route_retries_transient_binding_failure(
     )
     sleep = AsyncMock()
 
-    with patch("openhands.agent_server.credential_binding.asyncio.sleep", sleep):
+    with _only_binding_sees(sleep):
         response = TestClient(app).put(
             f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
             json={
@@ -341,7 +370,7 @@ def test_activation_route_rejects_invalid_binding_url(
     conversation_id = uuid4()
 
     sleep = AsyncMock()
-    with patch("openhands.agent_server.credential_binding.asyncio.sleep", sleep):
+    with _only_binding_sees(sleep):
         response = TestClient(app).put(
             f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
             json={
