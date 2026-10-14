@@ -332,6 +332,33 @@ def test_staged_path_rejects_traversal_and_absolute_refs(installed_dir: Path):
         _staged_path(installed_dir, "my-extension", "/etc/passwd")
 
 
+@pytest.mark.parametrize(
+    "ref",
+    [
+        r"C:\evil\dir",  # Windows drive path
+        r"\evil",  # leading backslash
+        "C:evil",  # drive-relative
+        r"..\escape",  # Windows traversal
+        r"sub\..\..\escape",
+    ],
+)
+def test_staged_path_rejects_windows_shaped_refs_on_any_host(
+    installed_dir: Path, ref: str
+):
+    """Path's "/" discards its left side for these on Windows, and none of them
+    starts with "/", so the textual check has to know both path flavours."""
+    with pytest.raises(ValueError, match="Invalid resolved_ref"):
+        _staged_path(installed_dir, "my-extension", ref)
+
+
+@pytest.mark.parametrize("ref", ["v1.0.0", "feature/x", "0123456789abcdef", None])
+def test_staged_path_keeps_ordinary_refs_inside_the_staging_slot(
+    installed_dir: Path, ref: str | None
+):
+    staged = _staged_path(installed_dir, "my-extension", ref)
+    assert staged.is_relative_to(installed_dir / ".staging" / "my-extension")
+
+
 def test_staged_path_rejects_empty_string_ref(installed_dir: Path):
     """ "" must not silently alias the None/"local" slot -- a caller that
     serializes None as "" would otherwise get a false-positive match."""
