@@ -56,7 +56,7 @@ def _is_pid_alive_windows(pid: int) -> bool:
     from ctypes import wintypes
 
     process_query_limited_information = 0x1000
-    error_access_denied = 5
+    error_invalid_parameter = 87
     still_active = 259
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -67,9 +67,10 @@ def _is_pid_alive_windows(pid: int) -> bool:
 
     handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
     if not handle:
-        # Access denied means the process exists; any other failure (notably
-        # ERROR_INVALID_PARAMETER for a pid that does not exist) means it does not.
-        return ctypes.get_last_error() == error_access_denied
+        # ERROR_INVALID_PARAMETER is how Windows reports a pid that does not exist.
+        # Access denied (a process of another user, e.g. System) and any error we
+        # do not recognise stay "alive": never take over a lease that may be in use.
+        return ctypes.get_last_error() != error_invalid_parameter
     try:
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):

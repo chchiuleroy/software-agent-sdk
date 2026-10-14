@@ -331,3 +331,10 @@ def test_is_pid_alive_reports_running_child_alive():
     finally:
         child.kill()
         child.wait(timeout=60)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows System process, pid 4")
+def test_is_pid_alive_keeps_a_process_it_cannot_open_alive():
+    # OpenProcess is refused for the System process (pid 4) with access denied: the
+    # probe cannot tell, so the lease must not look orphaned.
+    assert conversation_lease_module._is_pid_alive(4) is True
