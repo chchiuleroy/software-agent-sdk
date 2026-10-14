@@ -109,7 +109,8 @@ def get_git_diff(relative_file_path: str | Path, ref: str | None = None) -> GitD
     # Get old content (from the ref)
     try:
         original = run_git_command(
-            ["git", "show", f"{current_rev}:{relative_path_from_repo}"], validated_repo
+            ["git", "show", f"{current_rev}:{relative_path_from_repo.as_posix()}"],
+            validated_repo,
         )
     except GitCommandError:
         logger.debug(f"No old content found for {path} at ref {current_rev}")

@@ -144,6 +144,14 @@ def _check_snapshot(name: str, content: str) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _render_for_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    # refine() reads sys.platform at render time and the committed snapshots are the
+    # Linux rendering; without this they fail on a Windows host. The win32 test below
+    # patches it again, after this fixture.
+    monkeypatch.setattr(sys, "platform", "linux")
+
+
 @pytest.mark.parametrize("cell", MATRIX, ids=[c.id for c in MATRIX])
 def test_prompt_snapshot(cell: Cell) -> None:
     _check_snapshot(cell.id, _rendered(cell))

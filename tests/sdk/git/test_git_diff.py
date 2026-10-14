@@ -13,6 +13,9 @@ from openhands.sdk.git.models import GitDiff
 
 def run_bash_command(command: str, cwd: str) -> subprocess.CompletedProcess:
     """Run a bash command in the specified directory."""
+    if os.name == "nt":
+        # cmd.exe does not treat single quotes as quotes.
+        command = command.replace("'", '"')
     return subprocess.run(
         command,
         shell=True,

@@ -14,6 +14,9 @@ from openhands.sdk.git.models import GitChange, GitChangeStatus
 
 def run_bash_command(command: str, cwd: str) -> subprocess.CompletedProcess:
     """Run a bash command in the specified directory."""
+    if os.name == "nt":
+        # cmd.exe does not treat single quotes as quotes.
+        command = command.replace("'", '"')
     return subprocess.run(
         command,
         shell=True,
@@ -744,7 +747,7 @@ def test_get_git_changes_keeps_paths_that_merely_share_a_nested_repo_prefix():
         (Path(temp_dir) / "foo-config.yaml").write_text("changed\n")
         (Path(temp_dir) / "README.md").write_text("changed\n")
 
-        paths = {str(change.path) for change in get_git_changes(temp_dir)}
+        paths = {change.path.as_posix() for change in get_git_changes(temp_dir)}
 
         assert "foobar/file.py" in paths
         assert "foo-config.yaml" in paths
@@ -766,7 +769,7 @@ def test_get_git_changes_still_excludes_paths_inside_a_nested_repo():
         (nested / "nested.txt").write_text("changed in nested\n")
 
         changes = get_git_changes(temp_dir)
-        nested_entries = [c for c in changes if str(c.path) == "foo/nested.txt"]
+        nested_entries = [c for c in changes if c.path.as_posix() == "foo/nested.txt"]
 
         # Reported once, by the nested repository, not by the parent.
         assert len(nested_entries) == 1
