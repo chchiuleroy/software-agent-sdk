@@ -117,3 +117,25 @@ def test_script_never_uses_an_html_or_code_injection_api(needle):
     # Strip // comments: the header comment names some of these on purpose.
     code = re.sub(r"//[^\n]*", "", source)
     assert needle not in code
+
+
+def test_audit_event_type_filter_matches_what_the_server_writes():
+    """The Audit screen's filter lists the event types by name. A type the server
+    starts writing but the list lacks is still shown under "All", but not
+    filterable; this keeps the two from drifting apart unnoticed."""
+    src = Path(__file__).resolve().parent.parent / "src" / "central_governance_api"
+    # Two ways the server names an event: event_type="..." on the model, and the
+    # admin_accounts helper _audit(principal, "...", payload).
+    patterns = (r'event_type="([a-z_]+)"', r'_audit\(\s*\w+,\s*"([a-z_]+)"')
+    written = {
+        match
+        for path in src.rglob("*.py")
+        for pattern in patterns
+        for match in re.findall(pattern, path.read_text("utf-8"))
+    }
+    script = (src / "inbox_static" / "inbox.js").read_text("utf-8")
+    block = re.search(r"AUDIT_EVENT_TYPES = \[(.*?)\];", script, re.S)
+    assert block, "AUDIT_EVENT_TYPES not found in inbox.js"
+    listed = set(re.findall(r'"([a-z_]+)"', block.group(1)))
+    assert written, "found no event_type literals; the pattern needs updating"
+    assert listed == written

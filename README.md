@@ -129,11 +129,22 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
   擁有的註冊（擁有者以 `(issuer, sub)` 成對比對，不只看 `sub`），
   `governance.admin` 與 `governance.superadmin` 看全部。`include_revoked`（預設 true，因為已撤銷的裝置
   仍計入註冊配額）、`limit` 1–200（預設 50）、`offset`，新到舊排序，多取
-  1 筆判斷 `next_offset`；offset 分頁的「新資料進來時頁面會位移」限制與稽核
-  端點相同。回傳含 `revoked_at`／`revoked_by_subject`
-- `GET /api/v1/audit-events`：`governance.admin` 限定，支援
-  `event_type`／`approval_request_id` 篩選 + offset/limit 分頁（多取 1
-  筆判斷 `next_offset`，不用額外 `COUNT(*)`）
+  1 筆判斷 `next_offset`；offset 分頁的「新資料進來時頁面會位移」限制仍在
+  （稽核端點已於 2026-10-14 改用 cursor，這個端點沒改）。回傳含
+  `revoked_at`／`revoked_by_subject`
+- `GET /api/v1/audit-events`：`governance.admin` 與 `governance.superadmin`
+  可讀（2026-10-14 起後者也可，供主控台 Audit 畫面；superadmin 在其他處仍不是
+  admin 的超集）。支援 `event_type`／`approval_request_id` 篩選，**keyset 分頁**：
+  新到舊，位置是 `(occurred_at, id)`，回應的 `next_cursor` 原樣帶回 `cursor`
+  參數即得下一頁（多取 1 筆判斷有無下一頁，不用 `COUNT(*)`）。游標是不透明的
+  位置、**未簽章、不是祕密**，不含篩選條件；不合法的游標回 400
+  `invalid_cursor`。**`offset` 參數已移除**，帶了會回 400 `offset_not_supported`
+  （不是默默忽略）；回應欄位 `next_offset` 改為 `next_cursor`。已知限度：
+  `occurred_at` 是資料庫的交易開始時間而非提交時間，長交易可能提交一筆比已服務
+  過的列更舊的事件，進行中的走訪看不到它、重新走訪才看得到。這張表是唯一的
+  稽核來源（Roy，2026-10-14）：agent-server 本機的 JSONL 只是該裝置的診斷，
+  不匯入（那是裝置對自己的陳述，central 無法驗證）。新增索引
+  `ix_admin_audit_events_occurred_at_id`（migration `e6f0b3c8d4a2`）
 - `GET /api/v1/approvals/pending`（核准者收件匣，2026-10-01）：限
   `agent.approver`／`governance.admin`（與 `decide` 同角色，測試鎖定兩者
   不會飄移）。只列「`pending`、未過 `expires_at`（sweep 尚未翻狀態也算過期）、
@@ -190,7 +201,7 @@ High + 2 個 Medium + 2 個 Low，全部已修正**：
 5. **[Low]** audit-events 分頁本身「多取 1 筆判斷 next_offset」邏輯沒有
    off-by-one，但 offset-based 分頁在有新事件持續寫入時天生不穩定（不是
    這次的 bug，是這個分頁方式的固有限制，已在 `audit.py` docstring 明講
-   取捨、未改用 cursor-based 分頁）；原本的分頁測試只驗證第一頁形狀、從
+   取捨）——**已於 2026-10-14 改用 cursor-based 分頁**，見上方端點說明；原本的分頁測試只驗證第一頁形狀、從
    沒真的走訪下一頁，已改寫成真正走訪到 `next_offset is None` 為止並驗
    證總數不重複不遺漏
 

@@ -35,6 +35,31 @@
         <ul id="devices-list" aria-live="polite"></ul>
         <button id="devices-more" type="button" hidden>Load more</button>
       </section>
+      <section id="audit" aria-label="Audit" hidden>
+        <p class="note">
+          Administrative events recorded by this server (device revocations,
+          cancelled or aborted approvals, department changes), newest first.
+          This is the server's own record; logs an agent-server keeps locally
+          are not part of it.
+        </p>
+        <div class="toolbar">
+          <label>
+            Event type
+            <select id="audit-type">
+              <option value="">All</option>
+            </select>
+          </label>
+          <label>
+            Approval ID
+            <input id="audit-approval" type="text" size="38" maxlength="36"
+              autocomplete="off" spellcheck="false" />
+          </label>
+          <button id="audit-apply" type="button">Apply</button>
+          <button id="audit-refresh" type="button">Refresh</button>
+        </div>
+        <ul id="audit-list" aria-live="polite"></ul>
+        <button id="audit-more" type="button" hidden>Load more</button>
+      </section>
     </main>
     <script type="module" src="/inbox/inbox.js"></script>
   </body>

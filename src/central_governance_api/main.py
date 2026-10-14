@@ -65,6 +65,10 @@ from central_governance_api.routers.admin_accounts import (
     router as admin_accounts_router,
 )
 from central_governance_api.routers.approvals import router as approvals_router
+from central_governance_api.routers.audit import (
+    InvalidCursorError,
+    OffsetNotSupportedError,
+)
 from central_governance_api.routers.audit import router as audit_router
 from central_governance_api.routers.devices import (
     DeviceAlreadyRegisteredError,
@@ -106,6 +110,8 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     LateReportNotApplicableError: (409, "late_report_not_applicable"),
     RecordNotFoundError: (404, "record_not_found"),
     DigestMismatchError: (400, "digest_mismatch"),
+    InvalidCursorError: (400, "invalid_cursor"),
+    OffsetNotSupportedError: (400, "offset_not_supported"),
     IdempotencyKeyReusedError: (422, "idempotency_key_reused"),
     DeviceNotFoundError: (404, "device_not_found"),
     DeviceNotBoundError: (403, "device_not_bound"),

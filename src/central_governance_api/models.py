@@ -327,6 +327,15 @@ class AdminAuditEvent(Base):
     """
 
     __tablename__ = "admin_audit_events"
+    # The audit list pages newest-first by (occurred_at, id): without this index
+    # every page is a sort of the whole table.
+    __table_args__ = (
+        Index(
+            "ix_admin_audit_events_occurred_at_id",
+            text("occurred_at DESC"),
+            text("id DESC"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     event_type: Mapped[str] = mapped_column(String(64), index=True)
