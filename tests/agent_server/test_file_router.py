@@ -248,6 +248,7 @@ def test_create_directory_existing_file_fails(client, tmp_path):
     getattr(os, "geteuid", lambda: -1)() == 0,
     reason="root bypasses directory write permissions",
 )
+@pytest.mark.skipif(os.name == "nt", reason="chmod does not deny writes on Windows")
 def test_create_directory_permission_denied(client, tmp_path):
     """Test that an unwritable parent returns 403."""
     parent = tmp_path / "readonly"
@@ -617,6 +618,7 @@ def test_get_home_returns_dynamic_favorites_and_locations(
     # visible dirs, a hidden dir, and a file. Favorites should include only
     # the visible dirs, alphabetised. Locations should report the POSIX root.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home
     (tmp_path / "projects").mkdir()
     (tmp_path / "Documents").mkdir()
     (tmp_path / ".cache").mkdir()
@@ -633,13 +635,19 @@ def test_get_home_returns_dynamic_favorites_and_locations(
         {"label": "Documents", "path": str(tmp_path / "Documents")},
         {"label": "projects", "path": str(tmp_path / "projects")},
     ]
-    assert body["locations"] == [{"label": "/", "path": "/"}]
+    if os.name == "nt":
+        # Roots are the present drives there, not '/'.
+        assert body["locations"]
+        assert all(loc["label"].endswith(":") for loc in body["locations"])
+    else:
+        assert body["locations"] == [{"label": "/", "path": "/"}]
 
 
 def test_get_home_include_hidden_lists_hidden_favorites(client, tmp_path, monkeypatch):
     # With include_hidden=true, hidden top-level directories appear in favorites
     # (files are still excluded).
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home
     (tmp_path / "projects").mkdir()
     (tmp_path / ".cache").mkdir()
     (tmp_path / "readme.txt").write_text("ignored")

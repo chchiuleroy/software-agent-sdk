@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import os
 import threading
 import time
 import uuid
@@ -84,6 +85,12 @@ from openhands.sdk.workspace.local import LocalWorkspace
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _assert_mode(path: Path, expected: int) -> None:
+    """POSIX permission bits; Windows does not keep them, so only check elsewhere."""
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == expected
 
 
 class _FakeLookupSecret(SecretSource):
@@ -8702,9 +8709,9 @@ class TestACPFileSecretMaterialisation:
         auth_file = codex_home / "auth.json"
         assert auth_file.read_text(encoding="utf-8") == '{"tokens": "x"}'
         # 0600 file inside a 0700 dir, and the shared acp/ parent is 0700 too.
-        assert auth_file.stat().st_mode & 0o777 == 0o600
-        assert codex_home.stat().st_mode & 0o777 == 0o700
-        assert codex_home.parent.stat().st_mode & 0o777 == 0o700
+        _assert_mode(auth_file, 0o600)
+        _assert_mode(codex_home, 0o700)
+        _assert_mode(codex_home.parent, 0o700)
         # The blob is not exported as an env var.
         assert "CODEX_AUTH_JSON" not in env
 
@@ -8755,8 +8762,8 @@ class TestACPFileSecretMaterialisation:
         assert gac == Path(persist) / "acp" / "gemini-cli" / "gcloud-credentials.json"
         assert gac.read_text(encoding="utf-8") == '{"type": "service_account"}'
         # 0600 file inside a 0700 dir (symmetry with the Codex test).
-        assert gac.stat().st_mode & 0o777 == 0o600
-        assert gac.parent.stat().st_mode & 0o777 == 0o700
+        _assert_mode(gac, 0o600)
+        _assert_mode(gac.parent, 0o700)
         assert "GOOGLE_APPLICATION_CREDENTIALS_JSON" not in env
 
     def test_seed_if_absent_does_not_clobber_existing_file(self, tmp_path):
@@ -8785,7 +8792,7 @@ class TestACPFileSecretMaterialisation:
         assert refreshed.read_text(encoding="utf-8") == '{"refreshed": true}'
         # ...but perms are still clamped to 0600 (regression: QA found a
         # preserved 0644 file staying world-readable).
-        assert refreshed.stat().st_mode & 0o777 == 0o600
+        _assert_mode(refreshed, 0o600)
 
     def test_updated_credential_replaces_existing_file_once(self, tmp_path):
         from openhands.sdk.secret import StaticSecret
@@ -9037,7 +9044,7 @@ class TestACPDataDirIsolation:
         data_dir = Path(env["CODEX_HOME"])
         assert data_dir == Path(persist) / "acp" / "codex"
         assert data_dir.is_dir()
-        assert data_dir.stat().st_mode & 0o777 == 0o700
+        _assert_mode(data_dir, 0o700)
 
     def test_gemini_sets_home_to_conversation_root(self, tmp_path):
         agent = self._agent(["npx", "-y", "@google/gemini-cli", "--acp"])
