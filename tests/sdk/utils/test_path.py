@@ -50,11 +50,13 @@ def test_is_absolute_path_source_detects_posix_and_windows_paths():
 
 
 def test_is_host_absolute_path_uses_current_platform_semantics():
-    assert is_host_absolute_path("/workspace/file.py")
     assert not is_host_absolute_path("relative/file.py")
-    assert is_host_absolute_path(Path("/workspace") / "file.py")
 
     if os.name == "nt":
+        # Only the drive form: since Python 3.13 a root without a drive is not
+        # absolute on Windows (it was on 3.12 and earlier).
         assert is_host_absolute_path(r"C:\workspace\file.py")
     else:
+        assert is_host_absolute_path("/workspace/file.py")
+        assert is_host_absolute_path(Path("/workspace") / "file.py")
         assert not is_host_absolute_path(r"C:\workspace\file.py")

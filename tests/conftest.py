@@ -1,5 +1,6 @@
 """Common test fixtures and utilities."""
 
+import os
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -170,6 +171,31 @@ def create_mock_litellm_response(
     )
 
     return response
+
+
+@pytest.fixture(autouse=True)
+def skip_when_symlinks_need_privilege(monkeypatch):
+    """Skip, rather than fail, a test that cannot create a symlink on Windows.
+
+    Creating one needs Developer Mode or an elevated shell there (``WinError 1314``).
+    With the privilege the tests run as written; without it they are reported as
+    skipped with the reason, so the result is not mistaken for a pass.
+    """
+    if os.name != "nt":
+        return
+    real_symlink = os.symlink
+
+    def symlink(*args, **kwargs):
+        try:
+            return real_symlink(*args, **kwargs)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip(
+                    "creating symlinks needs Developer Mode or an elevated shell"
+                )
+            raise
+
+    monkeypatch.setattr(os, "symlink", symlink)
 
 
 @pytest.fixture(autouse=True)

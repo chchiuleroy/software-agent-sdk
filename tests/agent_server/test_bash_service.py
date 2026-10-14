@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -46,6 +47,9 @@ async def client(bash_service: BashEventService) -> AsyncIterator[httpx.AsyncCli
         yield ac
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows ends the process without running a TERM trap"
+)
 @pytest.mark.timeout(30)
 async def test_bash_timeout_runs_sigterm_trap(
     client: httpx.AsyncClient,

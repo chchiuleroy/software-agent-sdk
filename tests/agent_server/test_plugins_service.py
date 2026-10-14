@@ -84,7 +84,7 @@ def test_catalog_returns_only_true_plugins(tmp_path: Path, monkeypatch):
 
     # Assert: only the ./plugins/ entry, resolved to local PluginSource coords.
     assert [p.name for p in catalog] == ["local-plugin"]
-    assert catalog[0].source.endswith("plugins/local-plugin")
+    assert Path(catalog[0].source).as_posix().endswith("plugins/local-plugin")
     assert catalog[0].ref is None
     assert catalog[0].repo_path is None
 
@@ -113,7 +113,7 @@ def test_catalog_loads_from_plugin_manifest_layout(tmp_path: Path, monkeypatch):
 
     # Assert: the true plugin is returned (not an empty catalog), skill excluded.
     assert [p.name for p in catalog] == ["city-weather"]
-    assert catalog[0].source.endswith("plugins/city-weather")
+    assert Path(catalog[0].source).as_posix().endswith("plugins/city-weather")
 
 
 def test_catalog_resolves_structured_source_and_excludes_structured_skills(

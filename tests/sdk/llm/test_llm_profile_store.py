@@ -743,7 +743,9 @@ def test_multiple_profiles(profile_store: LLMProfileStore) -> None:
     assert "gpt4.json" not in profile_store.list()
 
 
-def test_default_provider_store_is_sibling_of_base_dir(tmp_path: Path) -> None:
+def test_default_provider_store_is_sibling_of_base_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A custom-dir profile store resolves connections under its own base_dir.
 
     Regression: the default ProviderConnectionStore must be derived from
@@ -755,6 +757,13 @@ def test_default_provider_store_is_sibling_of_base_dir(tmp_path: Path) -> None:
         ProviderConnection,
         ProviderConnectionStore,
     )
+
+    # pytest's tmp_path can sit below the real home (Windows: AppData\Local\Temp),
+    # which would make the 'not under home' assertion below meaningless.
+    fake_home = tmp_path.parent / f"{tmp_path.name}-home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
 
     store = LLMProfileStore(base_dir=tmp_path)
 
