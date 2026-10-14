@@ -11,6 +11,7 @@ from openhands.sdk.security import roy_tool_permissions as permissions
 from openhands.sdk.security.risk import SecurityRisk
 from openhands.sdk.security.roy_governance import RoyPathPayloadSecurityAnalyzer
 from openhands.sdk.security.roy_tool_permissions import ToolPermissionSnapshot
+from openhands.sdk.tool.builtins.vision_inspect import VISION_INSPECT_TOOL_NAME
 from openhands.tools.file_editor.definition import FileEditorAction
 
 from .test_roy_governance_analyzer import _event
@@ -75,11 +76,11 @@ def test_an_expired_list_permits_nothing_but_the_pure_built_ins():
 
 
 def test_the_always_permitted_set_is_exactly_the_side_effect_free_built_ins():
-    # Why: invoke_skill / switch_llm / vision_inspect read files, change the
+    # Why: invoke_skill / switch_llm / inspect_image_with_vision read files, change the
     # model or load content; they must need an explicit grant.
     assert permissions.ALWAYS_PERMITTED == frozenset({"finish", "think"})
     permissions.set_enforcing(True)
-    for name in ("invoke_skill", "switch_llm", "vision_inspect"):
+    for name in ("invoke_skill", "switch_llm", VISION_INSPECT_TOOL_NAME):
         assert permissions.is_permitted(name, now=1.0) is False
 
 

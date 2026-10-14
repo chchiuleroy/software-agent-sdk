@@ -21,8 +21,9 @@ Fail-closed rules, all deliberate:
 * a tool nobody listed is not permitted.
 
 ``ALWAYS_PERMITTED`` is only the two built-ins with no side effect at all.
-``invoke_skill``, ``switch_llm`` and ``vision_inspect`` read files, change the
-model or load content, so they need an explicit grant like any other tool.
+``invoke_skill``, ``switch_llm`` and ``inspect_image_with_vision`` read files,
+change the model or load content, so they need an explicit grant like any other
+tool.
 """
 
 from __future__ import annotations
