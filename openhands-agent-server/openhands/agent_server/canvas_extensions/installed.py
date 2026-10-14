@@ -18,7 +18,7 @@ directory in one rename), rolling back if the second fails.
 
 import os
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -270,6 +270,22 @@ def _staging_root(installed_dir: Path) -> Path:
     return installed_dir / ".staging"
 
 
+def _is_safe_relative_ref(ref: str) -> bool:
+    """True if *ref* stays below the directory it is joined to, on any host.
+
+    Checked with both path flavours: ``Path``'s ``/`` discards its left side when the
+    right side is absolute, and on Windows that includes a drive path, a path with a
+    leading backslash and the drive-relative ``C:x``, none of which start with ``/``.
+    """
+    if not ref:
+        return False
+    for flavour in (PurePosixPath, PureWindowsPath):
+        pure = flavour(ref)
+        if pure.is_absolute() or pure.anchor or pure.drive or ".." in pure.parts:
+            return False
+    return True
+
+
 def _staged_path(installed_dir: Path, name: str, resolved_ref: str | None) -> Path:
     """Path to the staging slot for (*name*, *resolved_ref*).
 
@@ -277,11 +293,7 @@ def _staged_path(installed_dir: Path, name: str, resolved_ref: str | None) -> Pa
     as a caller-supplied argument), so it's rejected if it could escape the
     staging directory -- same check as ``entrypoint`` in manifest.py.
     """
-    if resolved_ref is not None and (
-        not resolved_ref
-        or resolved_ref.startswith("/")
-        or ".." in Path(resolved_ref).parts
-    ):
+    if resolved_ref is not None and not _is_safe_relative_ref(resolved_ref):
         raise ValueError(f"Invalid resolved_ref: {resolved_ref!r}")
     return _staging_root(installed_dir) / name / (resolved_ref or "local")
 
