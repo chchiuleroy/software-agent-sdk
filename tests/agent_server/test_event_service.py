@@ -9183,8 +9183,14 @@ class TestEventServiceGovernanceOrchestration:
         governed_service.governance_client = client
         governed_service._ensure_claim_redispatch_task = MagicMock()
         keys = []
-        for _ in range(2):
-            await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        for n in range(2):
+            if n:  # the retry failed again: the same record is parked once more
+                await governed_service.governance_outbox.mutate(
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.CLAIM_FAILED, error_code="x_code"
+                    )
+                )
             await governed_service.resolve_needs_attention(
                 AttentionAction.RETRY,
                 expected_request_id="req-1",
