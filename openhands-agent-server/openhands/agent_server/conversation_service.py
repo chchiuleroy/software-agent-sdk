@@ -2246,6 +2246,13 @@ class ConversationService:
                     self.device_registration,
                 )
             )
+        elif (
+            self.governance_deployment_mode == "team"
+            and self.governance_origin_device_id
+            == governance_device_registration.UNSET_DEVICE_ID
+        ):
+            # Nothing will ever run: say so, rather than leaving "pending".
+            self.device_registration.state = "not_configured"
         return self
 
     async def _renew_all_leases_loop(self) -> None:

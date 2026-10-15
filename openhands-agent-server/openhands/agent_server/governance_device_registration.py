@@ -18,10 +18,13 @@ registered" can only be this process's own registration):
 - 201, or 409 ``device_already_registered``  -> registered. The second is what
   every restart gets.
 - 409 ``device_revoked``                      -> revoked. Never retried, never
-  renamed: a revocation must not be undone by restarting.
+  renamed: a revocation must not be undone by restarting. The revocation
+  belongs to this service account (central scopes it per owner): the same
+  text registered by a different governance_client_id is a new device.
 - any other permanent answer (quota, 401/403, ...) -> failed, not retried: it
   needs a configuration change and a restart.
-- a transient failure (network, 5xx)          -> retried with backoff.
+- a transient failure (network, 5xx, and an IdP or central answering 408/429
+  without an error_code, i.e. rate limiting)  -> retried with backoff.
 
 Logs carry the error code or the exception class only, never response text.
 """
@@ -47,7 +50,12 @@ logger = get_logger(__name__)
 # identity and is never registered.
 UNSET_DEVICE_ID = "unset-device-id"
 
-RegistrationState = Literal["pending", "registered", "revoked", "failed"]
+RegistrationState = Literal[
+    "pending", "registered", "revoked", "failed", "not_configured"
+]
+
+# HTTP statuses that mean "slow down", not "no".
+_RATE_LIMITED = frozenset({408, 429})
 
 INITIAL_RETRY_SECONDS = 5.0
 MAX_RETRY_SECONDS = 60.0
@@ -75,6 +83,16 @@ async def register_once(
             device_id, idempotency_key=f"device-register-{uuid.uuid4()}"
         )
     except GovernancePermanentError as exc:
+        if exc.error_code is None and exc.status_code in _RATE_LIMITED:
+            # Not one of central's coded answers (the IdP's token endpoint
+            # lands here): a rate limit passes, so treat it like a 5xx.
+            status.error_code = f"http_{exc.status_code}"
+            logger.warning(
+                "registering device %r was rate limited (%s); will retry",
+                device_id,
+                status.error_code,
+            )
+            return False
         if exc.error_code == "device_already_registered":
             status.state, status.error_code = "registered", None
         elif exc.error_code == "device_revoked":

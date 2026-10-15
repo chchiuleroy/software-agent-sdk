@@ -128,6 +128,26 @@ async def test_a_transient_failure_stays_pending_and_asks_for_a_retry():
     assert status.error_code == "GovernanceTransientError"
 
 
+@pytest.mark.parametrize("status", [408, 429])
+async def test_a_rate_limit_that_is_not_one_of_centrals_answers_is_retried(status):
+    # Why: the IdP's token endpoint answers 429/408 as a "permanent" error with no
+    # error_code; a short rate limit must not end the registration for good.
+    client = _client(_permanent(None, status))
+    result = registration.DeviceRegistrationStatus()
+    assert await registration.register_once(client, "d", result) is False
+    assert result.state == "pending"
+    assert result.error_code == f"http_{status}"
+
+
+async def test_a_coded_429_from_central_is_still_final():
+    # Why: central's quota answer is also a 429; it must not be mistaken for a
+    # rate limit and retried for ever.
+    client = _client(_permanent("device_quota_exceeded", 429))
+    result = registration.DeviceRegistrationStatus()
+    assert await registration.register_once(client, "d", result) is True
+    assert result.state == "failed"
+
+
 async def test_an_unexpected_exception_ends_in_failed_not_in_a_dead_task():
     # Why: an escaped exception would kill the background task and leave the
     # state "pending" for ever, which reads as "still trying".
@@ -204,15 +224,15 @@ async def test_a_team_service_registers_its_device_at_startup(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    ("kwargs", "expected_state"),
     [
-        {"device_id": registration.UNSET_DEVICE_ID},
-        {"mode": "personal"},
+        ({"device_id": registration.UNSET_DEVICE_ID}, "not_configured"),
+        ({"mode": "personal"}, "pending"),
     ],
     ids=["placeholder-id", "personal-mode"],
 )
 async def test_nothing_is_registered_when_there_is_nothing_to_register(
-    tmp_path, kwargs
+    tmp_path, kwargs, expected_state
 ):
     # Why: the placeholder is not an identity; registering it would turn it into
     # a legitimate-looking device for every unconfigured server.
@@ -220,7 +240,7 @@ async def test_nothing_is_registered_when_there_is_nothing_to_register(
     service = _service(tmp_path, client, **kwargs)
     async with service:
         assert service._device_registration_task is None
-        assert service.device_registration.state == "pending"
+        assert service.device_registration.state == expected_state
     client.register_device.assert_not_awaited()
 
 

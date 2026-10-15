@@ -52,9 +52,12 @@ class CentralApiStatus(BaseModel):
 
 
 class DeviceRegistrationInfo(BaseModel):
-    state: Literal["pending", "registered", "revoked", "failed"] = Field(
-        description="Whether this server's device id is registered with "
-        "central. 'pending' also covers: no device id configured."
+    state: Literal["pending", "registered", "revoked", "failed", "not_configured"] = (
+        Field(
+            description="Whether this server's device id is registered with "
+            "central. 'not_configured': no device id is set, so nothing is "
+            "registered."
+        )
     )
     error_code: str | None = Field(
         description="A central error_code or exception class name; never "
