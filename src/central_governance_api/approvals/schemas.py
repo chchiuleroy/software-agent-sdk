@@ -7,6 +7,7 @@ have no behavior of their own beyond field validation.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -208,6 +209,18 @@ FINDING_EVIDENCE_MAX_CHARS = 8000
 MAX_FINDINGS_PER_APPROVAL = 100
 
 
+def _contains_non_finite(value: Any) -> bool:
+    """NaN and the infinities parse from a request (Python's JSON reader accepts
+    them) but jsonb cannot hold them."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_contains_non_finite(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_non_finite(v) for v in value)
+    return False
+
+
 def _contains_nul(value: Any) -> bool:
     """PostgreSQL's jsonb cannot hold U+0000 in a key or a string."""
     if isinstance(value, str):
@@ -238,6 +251,10 @@ class ReconciliationFindingRequest(RequestModel):
         if "\x00" in self.note:
             raise ValueError("note holds a NUL character, which cannot be stored")
         if self.evidence is not None:
+            if _contains_non_finite(self.evidence):
+                raise ValueError(
+                    "evidence holds NaN or an infinity, which cannot be stored"
+                )
             if _contains_nul(self.evidence):
                 raise ValueError(
                     "evidence holds a NUL character, which cannot be stored"

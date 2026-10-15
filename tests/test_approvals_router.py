@@ -23,6 +23,7 @@ README's "部署前置條件" section.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1349,3 +1350,85 @@ async def test_a_success_replays_after_the_quota_filled_up_and_a_refusal_does_no
     assert (
         len(await _findings_for(db_session, approval_id)) == MAX_FINDINGS_PER_APPROVAL
     )
+
+
+async def test_nan_and_infinity_in_evidence_are_a_422_not_a_database_error(
+    client, signing_key, db_session
+):
+    """Python's JSON reader accepts NaN/Infinity tokens, so they reach the schema; jsonb
+    cannot store them. httpx will not send them, so the body is written by hand."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    for n, literal in enumerate(["NaN", "Infinity", "-Infinity"]):
+        body = (
+            '{"finding_type": "requester_assertion", '
+            '"evidence": {"outer": [1, {"x": ' + literal + "}]}}"
+        ).encode()
+        resp = await client.post(
+            f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+            content=body,
+            headers={
+                **_auth(token, f"nonfinite-{n}"),
+                "Content-Type": "application/json",
+            },
+        )
+        assert resp.status_code == 422, (literal, resp.text)
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_the_size_asked_of_the_database_is_the_size_that_gets_stored(
+    client, signing_key, db_session
+):
+    """The check measures json.dumps(evidence) cast to jsonb; the row is written by
+    SQLAlchemy's own serializer. They must give the same length for the awkward values
+    (unicode, tiny and huge floats, big integers, nesting, booleans, null)."""
+    from sqlalchemy import text
+
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    documents = [
+        {"u": 'é漢😀 \\ " \n', "nested": {"a": [1, 2.5, None, True, False]}},
+        {"tiny": 1e-300, "huge": 1e300, "third": 1 / 3, "neg": -0.0},
+        {"big": 10**60, "list": [10**30, -(10**30)]},
+        {"k" * 50: {"deep": {"deeper": {"deepest": ["x"] * 20}}}},
+    ]
+    for doc in documents:
+        measured = await db_session.scalar(
+            text("SELECT length(CAST(CAST(:doc AS jsonb) AS text))"),
+            {"doc": json.dumps(doc)},
+        )
+        row = ReconciliationFinding(
+            approval_request_id=uuid.UUID(approval_id),
+            finding_type="requester_assertion",
+            evidence=doc,
+            verifier_issuer=ISSUER,
+            verifier_sub="alice",
+        )
+        db_session.add(row)
+        await db_session.flush()
+        stored = await db_session.scalar(
+            text(
+                "SELECT length(CAST(evidence AS text)) FROM reconciliation_findings "
+                "WHERE id = :id"
+            ),
+            {"id": row.id},
+        )
+        assert stored == measured, doc
+
+
+async def test_a_validation_error_does_not_echo_what_the_caller_sent(
+    client, signing_key
+):
+    """FastAPI's default 422 puts each error's input (a whole body for a model-level
+    check) back into the answer; here only where and what is wrong comes back."""
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    secret = "s3cr3t-value-that-must-not-come-back"
+    resp = await client.post(
+        "/api/v1/approvals",
+        json={"request_id": secret, "unknown_field": secret},
+        headers=_auth(token, "echo-1"),
+    )
+    assert resp.status_code == 422
+    assert secret not in resp.text
+    detail = resp.json()["detail"]
+    assert detail and all(set(item) == {"type", "loc", "msg"} for item in detail)
+    assert any(item["loc"][-1] == "unknown_field" for item in detail)
