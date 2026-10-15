@@ -295,6 +295,7 @@ def test_resolve_passes_the_request_through_and_returns_the_outcome():
         "request_id": "req-1",
         "new_state": "resolved_manually",
         "central_step": "not_applicable",
+        "central_audit": "not_applicable",
         "conversation_still_waiting": False,
     }
     # the operator reaches the service as declared (stripped of padding)

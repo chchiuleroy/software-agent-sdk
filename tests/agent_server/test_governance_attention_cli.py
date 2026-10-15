@@ -696,6 +696,29 @@ def test_central_step_is_reported_for_an_abandon(server, capsys):
     assert "central: aborted" in out
 
 
+@pytest.mark.parametrize(
+    ("audit", "warned"),
+    [
+        ("not_recorded", True),
+        ("recorded", False),
+        ("not_applicable", False),
+        (None, False),
+    ],
+)
+def test_the_missing_audit_entry_is_said_and_only_then(server, capsys, audit, warned):
+    result = {**OK_RESULT, "action": "retry", "new_state": "claim_inflight"}
+    if audit is not None:
+        result["central_audit"] = audit
+    server.routes[("POST", RESOLVE_PATH)] = (200, result)
+
+    _, out, _ = run(
+        capsys, "resolve", CID, "retry", "--request-id", "req-1", "--url", server.url
+    )
+
+    assert ("central was NOT told what you did" in out) is warned
+    assert "the action itself is done" in out or not warned
+
+
 def test_the_operator_defaults_to_the_login_name(server, capsys, monkeypatch):
     server.routes[("POST", RESOLVE_PATH)] = (200, {**OK_RESULT, "action": "retry"})
     monkeypatch.setattr(cli.getpass, "getuser", lambda: "login-name")

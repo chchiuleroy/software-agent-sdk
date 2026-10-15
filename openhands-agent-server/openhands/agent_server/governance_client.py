@@ -461,6 +461,35 @@ class GovernanceClient:
         response = await self._request("GET", "/api/v1/me/tool-permissions")
         return response.json()
 
+    async def attention_resolution(
+        self,
+        approval_id: str,
+        *,
+        idempotency_key: str,
+        action: str,
+        reason: str,
+        operator: str,
+        outcome: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /api/v1/approvals/{id}/attention-resolutions``: audit only. Tells
+        central what this device's operator did with a record that needed attention.
+        The operator name is as typed, not authenticated, and central says so in
+        the event. No free text is sent."""
+        body: dict[str, Any] = {
+            "action": action,
+            "reason": reason,
+            "operator": operator,
+        }
+        if outcome is not None:
+            body["outcome"] = outcome
+        response = await self._request(
+            "POST",
+            f"/api/v1/approvals/{approval_id}/attention-resolutions",
+            json_body=body,
+            idempotency_key=idempotency_key,
+        )
+        return response.json()
+
     async def reconciliation_finding(
         self,
         approval_id: str,

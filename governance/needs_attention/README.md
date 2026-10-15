@@ -19,6 +19,8 @@ python governance_attention_cli.py resolve <對話id> retry|abandon|dismiss [--r
 
 `--operator` 是你宣告的操作者名字（預設為本機登入名），**不是經過驗證的身分**；見下方「已知限度」。
 
+**central 的稽核事件（2026-10-15，方案 B）**：retry、dismiss、abandon 做完之後，agent-server 會再告訴 central 一筆稽核事件（`POST /api/v1/approvals/{id}/attention-resolutions`，central 的 Audit 畫面看得到 `attention_resolved`：動作、原因代碼、你宣告的名字與「自我宣告」旗標、dismiss 的結果）。**盡力而為**：動作已經做完，central 連不上或不收時不會擋你也不會回頭撤銷，回應的 `central_audit` 會是 `not_recorded`（CLI 與畫面都會提示「central 沒有收到這筆」）；紀錄從沒到過 central 時是 `not_applicable`。**備註（`--note`）不會送出**，只留在本機。abandon 與帶 `--outcome` 的 dismiss 原本就是「central 先、本機後」，這筆稽核事件是在它們完成之後另外送的。
+
 設定（環境變數，或 `--url`）：
 
 | 變數 | 說明 |

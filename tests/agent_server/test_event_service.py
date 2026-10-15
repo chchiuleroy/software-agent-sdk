@@ -7534,6 +7534,7 @@ class TestEventServiceGovernanceOrchestration:
     def _central(self, **overrides) -> MagicMock:
         client = MagicMock()
         client.cancel = AsyncMock(return_value={"status": "cancelled"})
+        client.attention_resolution = AsyncMock(return_value={"id": "event-1"})
         client.report_result = AsyncMock(return_value={"status": "ok"})
         client.claim = AsyncMock(
             return_value={
@@ -8966,6 +8967,362 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service.close()
 
         assert governed_service._wait_for_decision_task is None
+
+    # -- the audit event at central (item 1.11, option B) --
+
+    @pytest.mark.asyncio
+    async def test_retry_tells_central_what_the_operator_did(self, governed_service):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY,
+            expected_request_id="req-1",
+            note="a note that must stay on this device",
+            operator="ada",
+        )
+
+        assert result.central_audit == "recorded"
+        client.attention_resolution.assert_awaited_once()
+        args, kwargs = client.attention_resolution.call_args
+        assert args == ("approval-1",)
+        assert kwargs["action"] == "retry"
+        assert kwargs["reason"] == "claim_failed"
+        assert kwargs["operator"] == "ada"
+        assert kwargs["outcome"] is None
+        assert kwargs["idempotency_key"].startswith("attn-")
+        # no free text leaves the device
+        assert "a note that must stay" not in repr(
+            client.attention_resolution.call_args
+        )
+        assert "note" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_a_plain_dismiss_is_recorded_after_the_record_is_closed(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        seen: list[str] = []
+
+        async def _record(*args, **kwargs):
+            seen.append(governed_service.governance_outbox.load().state.value)
+            return {"id": "event-1"}
+
+        client = self._central(attention_resolution=AsyncMock(side_effect=_record))
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="checked at central",
+            operator="bob",
+        )
+
+        assert seen == ["resolved_manually"], "told after the action, not before"
+        assert result.central_audit == "recorded"
+        assert client.attention_resolution.call_args.kwargs["action"] == "dismiss"
+        assert client.attention_resolution.call_args.kwargs["outcome"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_dismiss_with_an_outcome_sends_the_outcome_and_files_the_assertion(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        client = self._asserting_central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="it ran",
+            operator="ada",
+            outcome=AttentionOutcome.CONFIRMED_EXECUTED,
+        )
+
+        assert result.central_step == "assertion_filed"
+        assert result.central_audit == "recorded"
+        kwargs = client.attention_resolution.call_args.kwargs
+        assert kwargs["action"] == "dismiss"
+        assert kwargs["outcome"] == "confirmed_executed"
+
+    @pytest.mark.asyncio
+    async def test_abandon_is_recorded_after_central_and_the_record_agree(
+        self, governed_service
+    ):
+        action = _governance_pending_action()
+        await self._park(
+            governed_service, NeedsAttentionReason.CLAIM_FAILED, action=action
+        )
+        client = self._central()
+        governed_service.governance_client = client
+        self._waiting_on(governed_service, action)
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note="not wanted",
+            operator="bob",
+        )
+
+        assert result.central_step == "cancelled"
+        assert result.central_audit == "recorded"
+        assert client.attention_resolution.call_args.kwargs["action"] == "abandon"
+        assert governed_service.governance_outbox.load().state == OutboxState.CANCELLED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("central down"),
+            ConnectionError("no route"),
+            GovernancePermanentError(
+                "refused", error_code="record_not_found", status_code=404
+            ),
+        ],
+    )
+    async def test_when_central_cannot_take_the_event_the_action_still_stands(
+        self, governed_service, failure
+    ):
+        """Decision A: central being unreachable is exactly when a record needs
+        attention, so the action is not held up by the audit: it is done, and the
+        answer says the audit was not recorded."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central(attention_resolution=AsyncMock(side_effect=failure))
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
+        )
+
+        assert result.central_audit == "not_recorded"
+        assert result.new_state == "claim_inflight"
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.CLAIM_INFLIGHT
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_slow_central_does_not_hold_the_operator(
+        self, governed_service, monkeypatch
+    ):
+        import openhands.agent_server.event_service as module
+
+        monkeypatch.setattr(module, "_ATTENTION_AUDIT_TIMEOUT_SECONDS", 0.05)
+
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(30)
+
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        governed_service.governance_client = self._central(
+            attention_resolution=AsyncMock(side_effect=_hang)
+        )
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+
+        result = await asyncio.wait_for(
+            governed_service.resolve_needs_attention(
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
+            ),
+            timeout=5,
+        )
+
+        assert result.central_audit == "not_recorded"
+        assert result.new_state == "claim_inflight"
+
+    @pytest.mark.asyncio
+    async def test_a_record_that_never_reached_central_has_nothing_to_tell(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+
+        def _unset(r: OutboxRecord) -> OutboxRecord:
+            r.central_approval_id = None
+            return r
+
+        await governed_service.governance_outbox.mutate(_unset)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="never reached central",
+            operator="op",
+        )
+
+        assert result.central_audit == "not_applicable"
+        client.attention_resolution.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_resolve_tells_central_nothing(self, governed_service):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._central()
+        governed_service.governance_client = client
+
+        with pytest.raises(ResolveError):
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY,
+                expected_request_id="some-other-request",
+                note=None,
+                operator="op",
+            )
+
+        client.attention_resolution.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_retries_of_one_record_are_two_events(self, governed_service):
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+        keys = []
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        for n in range(2):
+            if n:  # the retry failed again: the same record is parked once more
+                await governed_service.governance_outbox.mutate(
+                    lambda r: mark_needs_attention(
+                        r, NeedsAttentionReason.CLAIM_FAILED, error_code="x_code"
+                    )
+                )
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
+            )
+            keys.append(client.attention_resolution.call_args.kwargs["idempotency_key"])
+
+        assert client.attention_resolution.await_count == 2
+        assert keys[0] != keys[1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", [r.value for r in NeedsAttentionReason])
+    async def test_every_known_reason_is_sent_as_itself(self, governed_service, reason):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+
+        def _set(r: OutboxRecord) -> OutboxRecord:
+            r.needs_attention_reason = reason
+            return r
+
+        await governed_service.governance_outbox.mutate(_set)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="x",
+            operator="op",
+        )
+
+        assert client.attention_resolution.call_args.kwargs["reason"] == reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "odd",
+        [
+            "some new reason: with spaces" + "x" * 100,
+            "internal-id-1234 and a path C:/somewhere",
+            "",
+            "claim_failed ",
+            "CLAIM_FAILED",
+        ],
+    )
+    async def test_a_reason_this_code_does_not_know_is_sent_as_unknown(
+        self, governed_service, odd
+    ):
+        """A reason is mapped, not cleaned: text that is not one of ours never
+        leaves the device in any form, and different texts do not collapse into
+        look-alike codes."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+
+        def _odd(r: OutboxRecord) -> OutboxRecord:
+            r.needs_attention_reason = odd
+            return r
+
+        await governed_service.governance_outbox.mutate(_odd)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="x",
+            operator="op",
+        )
+
+        sent = client.attention_resolution.call_args
+        assert sent.kwargs["reason"] == "unknown"
+        assert "internal-id" not in repr(sent) and "somewhere" not in repr(sent)
+
+    @pytest.mark.asyncio
+    async def test_a_slow_central_audit_does_not_hold_the_next_resolve(
+        self, governed_service
+    ):
+        """The audit is sent after the resolve lock is released: while it is still
+        waiting on central, another resolve of the same conversation is checked and
+        answered at once (here refused, the record having moved on)."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {"id": "event-1"}
+
+        client = self._central(attention_resolution=AsyncMock(side_effect=_slow))
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+
+        first = asyncio.ensure_future(
+            governed_service.resolve_needs_attention(
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        try:
+            with pytest.raises(ResolveError) as exc:
+                await asyncio.wait_for(
+                    governed_service.resolve_needs_attention(
+                        AttentionAction.RETRY,
+                        expected_request_id="req-1",
+                        note=None,
+                        operator="op",
+                    ),
+                    timeout=2,
+                )
+            assert exc.value.error_code == "state_changed"
+        finally:
+            release.set()
+        result = await asyncio.wait_for(first, timeout=5)
+        assert result.central_audit == "recorded"
+
+    @pytest.mark.asyncio
+    async def test_without_a_central_client_there_is_nothing_to_tell(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+        governed_service.governance_client = None
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
+        )
+
+        assert result.central_audit == "not_applicable"
 
 
 # Module-level on purpose: a function-local SecretSource subclass auto-registers

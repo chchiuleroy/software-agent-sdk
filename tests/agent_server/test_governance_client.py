@@ -573,3 +573,73 @@ async def test_check_health_token_endpoint_unreachable():
     assert result["credentials_ok"] is False
     assert "token endpoint unreachable" in result["error"]
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_attention_resolution_posts_the_audit_event_without_free_text():
+    seen: list[tuple[str, str, dict, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        seen.append(
+            (
+                request.method,
+                request.url.path,
+                json.loads(request.content),
+                request.headers.get("Idempotency-Key"),
+            )
+        )
+        return httpx.Response(201, json={"id": "e1"})
+
+    client = _make_client(handler)
+    await client.attention_resolution(
+        "a1",
+        idempotency_key="k1",
+        action="dismiss",
+        reason="report_failed",
+        operator="ada",
+        outcome="confirmed_executed",
+    )
+    await client.attention_resolution(
+        "a1",
+        idempotency_key="k2",
+        action="retry",
+        reason="claim_failed",
+        operator="bob",
+    )
+
+    assert seen[0][:2] == ("POST", "/api/v1/approvals/a1/attention-resolutions")
+    assert seen[0][2] == {
+        "action": "dismiss",
+        "reason": "report_failed",
+        "operator": "ada",
+        "outcome": "confirmed_executed",
+    }
+    assert seen[0][3] == "k1"
+    # no outcome -> the key is absent, not null (central refuses an outcome on a
+    # retry or an abandon, and an absent one is the honest "none")
+    assert seen[1][2] == {
+        "action": "retry",
+        "reason": "claim_failed",
+        "operator": "bob",
+    }
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_attention_resolution_surfaces_a_refusal_as_a_permanent_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://keycloak.example/token":
+            return _token_response(request)
+        return httpx.Response(
+            404, json={"error_code": "record_not_found", "detail": "no such approval"}
+        )
+
+    client = _make_client(handler)
+    with pytest.raises(GovernancePermanentError) as exc_info:
+        await client.attention_resolution(
+            "a1", idempotency_key="k1", action="retry", reason="x", operator="o"
+        )
+    assert exc_info.value.error_code == "record_not_found"
+    await client.aclose()

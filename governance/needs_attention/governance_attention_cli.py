@@ -364,6 +364,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     print(f"{result['action']}: record is now {result['new_state']}")
     if result.get("central_step") not in (None, "not_applicable"):
         print(f"  central: {result['central_step']}")
+    if result.get("central_audit") == "not_recorded":
+        print(
+            "  NOTE: central was NOT told what you did (its audit trail has no "
+            "entry for this); the action itself is done"
+        )
     if result.get("conversation_still_waiting"):
         print(
             "  the conversation is STILL waiting for confirmation of this action; "
