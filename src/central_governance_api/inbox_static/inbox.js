@@ -341,6 +341,7 @@ export const AUDIT_EVENT_TYPES = [
   "approval_claim_commitment_mismatch",
   "approval_executed_commitment_mismatch",
   "approval_pre_claim_abort",
+  "attention_resolved",
   "department_created",
   "department_disabled",
   "department_principal_assigned",

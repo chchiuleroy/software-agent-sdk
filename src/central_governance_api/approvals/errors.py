@@ -154,6 +154,21 @@ class TooManyFindingsError(Exception):
         )
 
 
+class TooManyAttentionEventsError(Exception):
+    """ATTENTION-RESOLUTIONS only: one approval may hold at most
+    ``MAX_ATTENTION_EVENTS_PER_APPROVAL`` attention_resolved events. The count is read
+    under a lock on the approval's row, so the limit is exact. Maps to HTTP 409. The
+    message is safe to show."""
+
+    def __init__(self, *, approval_id: uuid.UUID, limit: int) -> None:
+        self.approval_id = approval_id
+        self.limit = limit
+        super().__init__(
+            f"approval {approval_id} already has {limit} attention events; "
+            "no more are accepted"
+        )
+
+
 class SelfVerificationNotAllowedError(Exception):
     """RECONCILIATION-FINDINGS only: an ``admin_verified`` finding says an
     administrator checked what really happened. The principal who made the request
