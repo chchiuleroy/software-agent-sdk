@@ -15,7 +15,10 @@ from weakref import WeakValueDictionary
 import httpx
 from pydantic import BaseModel
 
-from openhands.agent_server import governance_tool_permissions
+from openhands.agent_server import (
+    governance_device_registration,
+    governance_tool_permissions,
+)
 from openhands.agent_server.config import ACPSkillSourcing, Config, WebhookSpec
 from openhands.agent_server.conversation_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -729,11 +732,18 @@ class ConversationService:
     # process" commitment) rather than re-read on every call.
     governance_deployment_mode: Literal["personal", "team"] = "personal"
     governance_client: GovernanceClient | None = None
-    governance_origin_device_id: str = "unset-device-id"
+    governance_origin_device_id: str = governance_device_registration.UNSET_DEVICE_ID
     governance_refuse_truncated_actions: bool = True
     governance_refuse_unprojected_actions: bool = True
     governance_enforce_tool_permissions: bool = False
     _tool_permissions_started: bool = field(default=False, init=False)
+    # Whether this process's device id is registered with central (team mode).
+    device_registration: governance_device_registration.DeviceRegistrationStatus = (
+        field(default_factory=governance_device_registration.DeviceRegistrationStatus)
+    )
+    _device_registration_task: asyncio.Task[None] | None = field(
+        default=None, init=False
+    )
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
     _conversation_records: dict[UUID, _ConversationRecord] = field(
         default_factory=dict, init=False
@@ -2221,6 +2231,21 @@ class ConversationService:
         ):
             governance_tool_permissions.start(self.governance_client)
             self._tool_permissions_started = True
+        # Also last, for the same reason. Never blocks startup: see
+        # governance_device_registration. A placeholder id is not registered.
+        if (
+            self.governance_deployment_mode == "team"
+            and self.governance_client is not None
+            and self.governance_origin_device_id
+            != governance_device_registration.UNSET_DEVICE_ID
+        ):
+            self._device_registration_task = asyncio.create_task(
+                governance_device_registration.run(
+                    self.governance_client,
+                    self.governance_origin_device_id,
+                    self.device_registration,
+                )
+            )
         return self
 
     async def _renew_all_leases_loop(self) -> None:
@@ -2309,6 +2334,12 @@ class ConversationService:
                         pending.setdefault(secret_name, binding)
 
     async def __aexit__(self, exc_type, exc_value, traceback):
+        if self._device_registration_task is not None:
+            self._device_registration_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._device_registration_task
+            self._device_registration_task = None
+
         if self._tool_permissions_started:
             self._tool_permissions_started = False
             await governance_tool_permissions.stop()
@@ -2423,7 +2454,8 @@ class ConversationService:
             governance_deployment_mode=config.governance_deployment_mode,
             governance_client=_governance_client_from_config(config),
             governance_origin_device_id=(
-                config.governance_origin_device_id or "unset-device-id"
+                config.governance_origin_device_id
+                or governance_device_registration.UNSET_DEVICE_ID
             ),
             governance_refuse_truncated_actions=(
                 config.governance_refuse_truncated_actions

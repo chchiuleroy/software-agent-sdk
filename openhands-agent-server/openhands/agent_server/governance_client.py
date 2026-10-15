@@ -440,6 +440,20 @@ class GovernanceClient:
         )
         return response.json()
 
+    async def register_device(
+        self, device_id: str, *, idempotency_key: str
+    ) -> dict[str, Any]:
+        """``POST /api/v1/devices/register``: register ``device_id`` for this
+        process's own service account (central never takes the owner from the
+        body)."""
+        response = await self._request(
+            "POST",
+            "/api/v1/devices/register",
+            json_body={"device_id": device_id},
+            idempotency_key=idempotency_key,
+        )
+        return response.json()
+
     async def tool_permissions(self) -> dict[str, Any]:
         """This agent-server's department tool permissions
         (``GET /api/v1/me/tool-permissions``): the tools its department may

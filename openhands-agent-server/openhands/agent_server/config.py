@@ -441,15 +441,17 @@ class Config(BaseModel):
     governance_origin_device_id: str | None = Field(
         default=None,
         description=(
-            "Value sent as CreateApprovalRequest.origin_device_id. This MVP "
-            "slice does not auto-register a device via central-governance-"
-            "api's POST /devices/register — set this to a stable, "
-            "operator-chosen identifier for this agent-server installation. "
-            "If central-governance-api runs with CGA_DEVICE_BINDING_ENFORCED, "
-            "this value must first be registered by THIS process's own "
-            "governance_client_id service account (POST /api/v1/devices/"
-            "register) and not revoked, or create/claim answer 403 "
-            "device_not_bound. Central checks this only after looking up an "
+            "Value sent as CreateApprovalRequest.origin_device_id. Set this "
+            "to a stable, operator-chosen identifier for this agent-server "
+            "installation. In team mode this process registers it with "
+            "central-governance-api at startup, in the background (POST "
+            "/devices/register, as its own governance_client_id service "
+            "account); the result is in GET /api/governance/status. Until "
+            "that finishes, with CGA_DEVICE_BINDING_ENFORCED on, create/"
+            "claim can answer 403 device_not_bound. A revoked id is never "
+            "registered again: choose a new one. Unset means the placeholder "
+            "'unset-device-id', which is not registered. Central checks "
+            "this only after looking up an "
             "idempotent replay, so a retry that reuses an earlier request's "
             "idempotency key is answered from the stored response instead."
         ),
@@ -682,7 +684,8 @@ def validate_team_mode_config(config: Config) -> None:
         logging.getLogger(__name__).warning(
             "governance_deployment_mode is 'team' but %s_GOVERNANCE_ORIGIN_"
             "DEVICE_ID is unset; central approvals will report the "
-            "placeholder device id 'unset-device-id'.",
+            "placeholder device id 'unset-device-id' (not registered with "
+            "central).",
             ENVIRONMENT_VARIABLE_PREFIX,
         )
 
