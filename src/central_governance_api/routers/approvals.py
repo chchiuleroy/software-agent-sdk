@@ -86,6 +86,7 @@ from central_governance_api.approvals.errors import (
     RecordNotFoundError,
     RecordNotTerminalError,
     SelfVerificationNotAllowedError,
+    TooManyAttentionEventsError,
     TooManyFindingsError,
 )
 from central_governance_api.approvals.idempotency import (
@@ -100,6 +101,7 @@ from central_governance_api.approvals.notify import (
 )
 from central_governance_api.approvals.schemas import (
     FINDING_EVIDENCE_MAX_CHARS,
+    MAX_ATTENTION_EVENTS_PER_APPROVAL,
     MAX_FINDINGS_PER_APPROVAL,
     ApprovalSummary,
     AttentionResolutionRequest,
@@ -1019,6 +1021,24 @@ async def record_attention_resolution(
     authorize_on_record(
         principal, ApprovalAction.RECORD_ATTENTION_RESOLUTION, _ownership(record)
     )
+
+    # Counted one at a time under a lock on the approval's row, so the limit is
+    # exact (the same way findings are counted).
+    await session.execute(
+        select(PendingApprovalRecord.id)
+        .where(PendingApprovalRecord.id == approval_id)
+        .with_for_update(key_share=True)
+    )
+    held = await session.scalar(
+        select(func.count(AdminAuditEvent.id)).where(
+            AdminAuditEvent.event_type == "attention_resolved",
+            AdminAuditEvent.approval_request_id == approval_id,
+        )
+    )
+    if (held or 0) >= MAX_ATTENTION_EVENTS_PER_APPROVAL:
+        raise TooManyAttentionEventsError(
+            approval_id=approval_id, limit=MAX_ATTENTION_EVENTS_PER_APPROVAL
+        )
 
     payload: dict[str, Any] = {
         "action": body.action,

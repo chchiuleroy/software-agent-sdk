@@ -8,11 +8,12 @@ approval, a retry of the same call writes once, and it shows up in the audit tra
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from central_governance_api.auth.dependencies import get_oidc_resolver
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
@@ -20,8 +21,17 @@ from central_governance_api.db import get_db_session
 from central_governance_api.main import create_app
 from central_governance_api.models import AdminAuditEvent, PendingApprovalRecord
 
+from .conftest import ISSUER
 from .test_app_auth import _sign
 from .test_approvals_router import _auth, _create_approval
+from .test_finding_limit_concurrency import (
+    _failed_unknown_record_with_findings,
+    _remove,
+)
+from .test_finding_limit_concurrency import real_client as _real_client_fixture
+
+
+real_client = _real_client_fixture  # the same fixture, under its own name here
 
 
 @pytest.fixture
@@ -286,3 +296,174 @@ async def test_one_audit_row_per_call_even_across_many_calls(
         )
     )
     assert count == 3
+
+
+# --- an approval holds at most this many attention events -------------------
+
+
+async def _add_events(db_session, approval_id: str, n: int) -> None:
+    for i in range(n):
+        db_session.add(
+            AdminAuditEvent(
+                event_type="attention_resolved",
+                actor_issuer=ISSUER,
+                actor_sub="alice",
+                approval_request_id=uuid.UUID(approval_id),
+                payload={"action": "retry", "operator": f"o{i}"},
+            )
+        )
+    await db_session.flush()
+
+
+async def test_an_approval_holds_at_most_100_attention_events(
+    client, signing_key, db_session
+):
+    created = await _create_approval(client, signing_key, sub="alice")
+    await _add_events(db_session, created["id"], 99)
+
+    last = await _post(client, signing_key, created["id"], BODY, "cap-last")
+    assert last.status_code == 201, last.text
+    over = await _post(client, signing_key, created["id"], BODY, "cap-over")
+    assert over.status_code == 409
+    assert over.json()["error_code"] == "too_many_attention_events"
+    assert len(await _events(db_session, created["id"])) == 100
+
+
+async def test_the_limit_is_per_approval_and_counts_only_attention_events(
+    client, signing_key, db_session
+):
+    full = await _create_approval(client, signing_key, sub="alice")
+    other = await _create_approval(client, signing_key, sub="alice")
+    await _add_events(db_session, full["id"], 100)
+    # other kinds of audit events on the same approval do not use up the places
+    for _ in range(100):
+        db_session.add(
+            AdminAuditEvent(
+                event_type="approval_cancelled",
+                actor_issuer=ISSUER,
+                actor_sub="alice",
+                approval_request_id=uuid.UUID(other["id"]),
+            )
+        )
+    await db_session.flush()
+
+    ok = await _post(client, signing_key, other["id"], BODY, "cap-other")
+    refused = await _post(client, signing_key, full["id"], BODY, "cap-full")
+    assert ok.status_code == 201, ok.text
+    assert refused.status_code == 409
+
+
+async def test_a_refused_call_for_the_limit_is_not_remembered_as_an_answer(
+    client, signing_key, db_session
+):
+    created = await _create_approval(client, signing_key, sub="alice")
+    await _add_events(db_session, created["id"], 100)
+    for _ in range(2):
+        resp = await _post(client, signing_key, created["id"], BODY, "cap-same-key")
+        assert resp.status_code == 409
+    assert len(await _events(db_session, created["id"])) == 100
+
+
+async def test_a_success_replays_after_the_approval_is_full(
+    client, signing_key, db_session
+):
+    created = await _create_approval(client, signing_key, sub="alice")
+    first = await _post(client, signing_key, created["id"], BODY, "cap-replay")
+    await _add_events(db_session, created["id"], 100)
+    again = await _post(client, signing_key, created["id"], BODY, "cap-replay")
+    assert first.status_code == again.status_code == 201
+    assert first.json() == again.json()
+
+
+async def test_an_attention_event_waits_for_whoever_holds_the_approvals_row(
+    real_client, signing_key
+):
+    """Counting happens under a lock on the approval's row; the foreign-key insert of
+    an audit event takes a weaker lock itself, so the holder uses FOR NO KEY UPDATE,
+    which only the explicit lock conflicts with."""
+    http, factory = real_client
+    record_id = await _failed_unknown_record_with_findings(factory, 0)
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    try:
+        async with factory() as holder:
+            await holder.execute(
+                select(PendingApprovalRecord.id)
+                .where(PendingApprovalRecord.id == record_id)
+                .with_for_update(key_share=True)
+            )
+            request = asyncio.ensure_future(
+                http.post(
+                    f"/api/v1/approvals/{record_id}/attention-resolutions",
+                    json=BODY,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Idempotency-Key": f"attn-lock-{record_id}",
+                    },
+                )
+            )
+            done, _pending = await asyncio.wait({request}, timeout=1.5)
+            assert not done, "the request finished while the row was locked"
+            await holder.rollback()
+        response = await asyncio.wait_for(request, timeout=10)
+        assert response.status_code == 201, response.text
+    finally:
+        async with factory() as session:
+            await session.execute(
+                delete(AdminAuditEvent).where(
+                    AdminAuditEvent.approval_request_id == record_id
+                )
+            )
+            await session.commit()
+        await _remove(factory, record_id)
+
+
+async def test_simultaneous_attention_events_cannot_pass_the_limit(
+    real_client, signing_key
+):
+    http, factory = real_client
+    record_id = await _failed_unknown_record_with_findings(factory, 0)
+    async with factory() as session:
+        for i in range(96):
+            session.add(
+                AdminAuditEvent(
+                    event_type="attention_resolved",
+                    actor_issuer=ISSUER,
+                    actor_sub="alice",
+                    approval_request_id=record_id,
+                    payload={"action": "retry", "operator": f"o{i}"},
+                )
+            )
+        await session.commit()
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    try:
+
+        async def post(n: int):
+            return await http.post(
+                f"/api/v1/approvals/{record_id}/attention-resolutions",
+                json=BODY,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Idempotency-Key": f"attn-race-{record_id}-{n}",
+                },
+            )
+
+        statuses = sorted(
+            r.status_code for r in await asyncio.gather(*(post(n) for n in range(10)))
+        )
+        async with factory() as session:
+            stored = await session.scalar(
+                select(func.count(AdminAuditEvent.id)).where(
+                    AdminAuditEvent.approval_request_id == record_id
+                )
+            )
+        assert stored == 100
+        assert statuses == [201] * 4 + [409] * 6, statuses
+    finally:
+        async with factory() as session:
+            await session.execute(
+                delete(AdminAuditEvent).where(
+                    AdminAuditEvent.approval_request_id == record_id
+                )
+            )
+            await session.commit()
+        await _remove(factory, record_id)

@@ -265,6 +265,11 @@ class ReconciliationFindingRequest(RequestModel):
         return self
 
 
+# One approval holds at most this many attention_resolved events (an append-only
+# audit table: without a limit its owner's operator could add them without end).
+MAX_ATTENTION_EVENTS_PER_APPROVAL = 100
+
+
 class AttentionResolutionRequest(RequestModel):
     """What an agent-server tells central after its operator dealt with a record that
     needed attention (retry, dismiss, abandon). Evidence of an operator's own account:
