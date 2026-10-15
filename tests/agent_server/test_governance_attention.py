@@ -607,3 +607,114 @@ def test_resolved_by_is_written_only_once_someone_resolved_the_record():
     stored = json.loads(record.to_json())
     assert stored["resolved_by"] == "ada"
     assert OutboxRecord.from_json(record.to_json()).resolved_by == "ada"
+
+
+# ---------------------- outcomes (requester_assertion) ----------------------
+
+
+@pytest.mark.parametrize(
+    ("reason", "offered"),
+    [
+        (NeedsAttentionReason.REPORT_FAILED, True),
+        (NeedsAttentionReason.RECONCILE_FAILED, True),
+        (NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED, True),
+        (NeedsAttentionReason.LATE_REPORT_REFUSED, True),
+        # the action cannot have run: there is nothing to assert
+        (NeedsAttentionReason.CLAIM_FAILED, False),
+        (NeedsAttentionReason.CLAIM_TRANSIENT, False),
+        (NeedsAttentionReason.CLAIM_RETRY_FAILED, False),
+        (NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED, False),
+        (NeedsAttentionReason.BINDING_REPORT_FAILED, False),
+        # may be anything: offered, as dismiss is
+        (None, True),
+        ("from_a_newer_server", True),
+        # a file that could not be read has no record to speak of
+        (attention.UNREADABLE_OUTBOX, False),
+    ],
+)
+def test_outcomes_are_offered_only_where_the_action_may_have_run(reason, offered):
+    expected = (
+        ["confirmed_executed", "confirmed_not_executed", "inconclusive"]
+        if offered
+        else []
+    )
+    assert attention.allowed_outcomes_for(reason) == expected
+
+
+def test_every_reason_is_decided_one_way_or_the_other():
+    """A new NeedsAttentionReason must be placed on purpose: either the action
+    may have run (an outcome is offered) or it cannot have (none)."""
+    for reason in NeedsAttentionReason:
+        assert attention.allowed_outcomes_for(reason.value) in (
+            [],
+            ["confirmed_executed", "confirmed_not_executed", "inconclusive"],
+        )
+    cannot_have_run = {
+        NeedsAttentionReason.CLAIM_FAILED,
+        NeedsAttentionReason.CLAIM_TRANSIENT,
+        NeedsAttentionReason.CLAIM_RETRY_FAILED,
+        NeedsAttentionReason.APPROVAL_CANCELLED_OR_EXPIRED,
+        NeedsAttentionReason.BINDING_REPORT_FAILED,
+    }
+    for reason in NeedsAttentionReason:
+        offered = bool(attention.allowed_outcomes_for(reason.value))
+        assert offered == (reason not in cannot_have_run), reason
+
+
+def test_a_listed_item_carries_its_allowed_outcomes(tmp_path):
+    for name, reason in (
+        ("a", NeedsAttentionReason.REPORT_FAILED),
+        ("b", NeedsAttentionReason.CLAIM_FAILED),
+    ):
+        record = _parked(reason)
+        record.conversation_id = name
+        directory = tmp_path / uuid.uuid4().hex
+        directory.mkdir()
+        (directory / OUTBOX_FILENAME).write_text(record.to_json(), encoding="utf-8")
+
+    by_reason = {i.reason: i for i in attention.scan_needs_attention(tmp_path)}
+
+    assert by_reason["report_failed"].allowed_outcomes == [
+        "confirmed_executed",
+        "confirmed_not_executed",
+        "inconclusive",
+    ]
+    assert by_reason["claim_failed"].allowed_outcomes == []
+
+
+def test_an_outcome_only_goes_with_dismiss():
+    assert _request(action="dismiss", note="why", outcome="inconclusive").outcome == (
+        attention.AttentionOutcome.INCONCLUSIVE
+    )
+    assert _request(action="dismiss", note="why").outcome is None
+    for action in ("retry", "abandon"):
+        with pytest.raises(ValueError, match="outcome"):
+            _request(action=action, outcome="confirmed_executed")
+
+
+def test_an_unknown_outcome_is_refused():
+    with pytest.raises(ValueError):
+        _request(action="dismiss", note="why", outcome="probably_ran")
+
+
+def test_check_resolvable_refuses_an_outcome_the_reason_does_not_allow():
+    parked = _parked(NeedsAttentionReason.CLAIM_FAILED)
+    err = _error_of(
+        check_resolvable,
+        parked,
+        AttentionAction.DISMISS,
+        "req-1",
+        attention.AttentionOutcome.CONFIRMED_EXECUTED,
+    )
+    assert err.error_code == "outcome_not_allowed"
+
+    allowed = _parked(NeedsAttentionReason.REPORT_FAILED)
+    assert (
+        check_resolvable(
+            allowed,
+            AttentionAction.DISMISS,
+            "req-1",
+            attention.AttentionOutcome.CONFIRMED_EXECUTED,
+        )
+        is allowed
+    )

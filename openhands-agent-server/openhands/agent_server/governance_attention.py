@@ -100,6 +100,42 @@ def allowed_actions_for(reason: str | None) -> list[str]:
     return [a.value for a in _ALLOWED_ACTIONS[known]]
 
 
+class AttentionOutcome(StrEnum):
+    """What an operator who looked at central says happened to the action. Sent to
+    central as a ``requester_assertion`` finding (evidence only: it never changes
+    the approval's status)."""
+
+    CONFIRMED_EXECUTED = "confirmed_executed"
+    CONFIRMED_NOT_EXECUTED = "confirmed_not_executed"
+    INCONCLUSIVE = "inconclusive"
+
+
+# Where the action may have run, so there is something to assert. Where it cannot
+# have (a claim that never succeeded, a binding mismatch, an approval central
+# cancelled) there is nothing to assert and none is offered. A reason that is
+# missing or unknown may be anything, so it is offered, as dismiss itself is.
+_MAY_HAVE_RUN = frozenset(
+    {
+        NeedsAttentionReason.REPORT_FAILED,
+        NeedsAttentionReason.RECONCILE_FAILED,
+        NeedsAttentionReason.CENTRAL_STATUS_UNEXPECTED,
+        NeedsAttentionReason.LATE_REPORT_REFUSED,
+    }
+)
+
+
+def allowed_outcomes_for(reason: str | None) -> list[str]:
+    """The outcomes an operator may assert when dismissing a record parked for
+    ``reason`` (empty: none)."""
+    if reason == UNREADABLE_OUTBOX:
+        return []
+    try:
+        known = NeedsAttentionReason(reason)
+    except ValueError:  # None, or a reason this version does not know
+        return [o.value for o in AttentionOutcome]
+    return [o.value for o in AttentionOutcome] if known in _MAY_HAVE_RUN else []
+
+
 class AttentionItem(BaseModel):
     """One conversation whose outbox needs an operator. Deliberately carries no
     action payload or other record content, only what identifies the problem."""
@@ -118,6 +154,11 @@ class AttentionItem(BaseModel):
     attempt_count: int
     last_attempt_at: str | None
     allowed_actions: list[str]
+    allowed_outcomes: list[str] = Field(
+        default_factory=list,
+        description="The outcomes that may accompany a dismiss (see "
+        "AttentionOutcome); empty where the action cannot have run.",
+    )
 
 
 def _display_id(directory_name: str) -> str:
@@ -199,6 +240,7 @@ def scan_needs_attention(conversations_dir: Path) -> list[AttentionItem]:
                 attempt_count=record.attempt_count,
                 last_attempt_at=record.last_attempt_at,
                 allowed_actions=allowed_actions_for(record.needs_attention_reason),
+                allowed_outcomes=allowed_outcomes_for(record.needs_attention_reason),
             )
         )
     found.sort(key=lambda i: (i.last_attempt_at or "", i.conversation_id), reverse=True)
@@ -247,6 +289,14 @@ class ResolveRequest(BaseModel):
         "logged for every action.",
     )
 
+    outcome: AttentionOutcome | None = Field(
+        default=None,
+        description="Dismiss only: what the operator confirmed at central about "
+        "the action. Filed with central as a requester_assertion before the "
+        "record is closed; the record is left alone if central does not take it. "
+        "Only for records where the action may have run (allowed_outcomes).",
+    )
+
     @field_validator("operator")
     @classmethod
     def _operator_is_a_plain_name(cls, value: str) -> str:
@@ -266,6 +316,8 @@ class ResolveRequest(BaseModel):
             self.note = self.note.strip() or None
         if self.action is AttentionAction.DISMISS and self.note is None:
             raise ValueError("dismiss needs a note saying why")
+        if self.outcome is not None and self.action is not AttentionAction.DISMISS:
+            raise ValueError("an outcome only goes with dismiss")
         return self
 
 
@@ -274,7 +326,9 @@ class ResolveResponse(BaseModel):
     action: AttentionAction
     request_id: str
     new_state: str
-    central_step: Literal["not_applicable", "cancelled", "aborted", "already_terminal"]
+    central_step: Literal[
+        "not_applicable", "cancelled", "aborted", "already_terminal", "assertion_filed"
+    ]
     conversation_still_waiting: bool | None = Field(
         description="True if the conversation is still waiting for confirmation of "
         "this very action. The record no longer governs it, so it must be rejected "
@@ -283,7 +337,10 @@ class ResolveResponse(BaseModel):
 
 
 def check_resolvable(
-    record: OutboxRecord | None, action: AttentionAction, expected_request_id: str
+    record: OutboxRecord | None,
+    action: AttentionAction,
+    expected_request_id: str,
+    outcome: AttentionOutcome | None = None,
 ) -> OutboxRecord:
     """The record, if ``action`` may be applied to it right now. Raised errors
     leave everything untouched, so this is also run again inside the locked
@@ -307,6 +364,14 @@ def check_resolvable(
             f"{action.value} is not allowed for reason "
             f"{record.needs_attention_reason!r}",
             allowed_actions=allowed,
+        )
+    if outcome is not None and outcome.value not in allowed_outcomes_for(
+        record.needs_attention_reason
+    ):
+        raise ResolveError(
+            "outcome_not_allowed",
+            f"{outcome.value} cannot be asserted for reason "
+            f"{record.needs_attention_reason!r}",
         )
     return record
 

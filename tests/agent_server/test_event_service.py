@@ -27,7 +27,11 @@ from openhands.agent_server.event_service import (
     _with_execution_started,
     _with_pending_report_outcome,
 )
-from openhands.agent_server.governance_attention import AttentionAction, ResolveError
+from openhands.agent_server.governance_attention import (
+    AttentionAction,
+    AttentionOutcome,
+    ResolveError,
+)
 from openhands.agent_server.governance_client import (
     GovernancePermanentError,
     GovernanceTransientError,
@@ -7824,6 +7828,194 @@ class TestEventServiceGovernanceOrchestration:
             )
 
         assert exc.value.error_code == "unreadable_outbox"
+
+    # -- dismiss with an outcome (requester_assertion) --
+
+    def _asserting_central(self, **overrides) -> MagicMock:
+        return self._central(
+            reconciliation_finding=AsyncMock(return_value={"id": "finding-1"}),
+            **overrides,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dismiss_with_an_outcome_files_the_assertion_before_closing(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        seen_states: list[str] = []
+
+        async def _finding(*args, **kwargs):
+            # at the moment central is asked, the record must still be parked
+            seen_states.append(governed_service.governance_outbox.load().state.value)
+            return {"id": "finding-1"}
+
+        client = self._central(reconciliation_finding=AsyncMock(side_effect=_finding))
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="checked at central: it ran",
+            operator="ada",
+            outcome=AttentionOutcome.CONFIRMED_EXECUTED,
+        )
+
+        assert seen_states == ["needs_attention"]
+        client.reconciliation_finding.assert_awaited_once()
+        args, kwargs = client.reconciliation_finding.call_args
+        assert args == ("approval-1",)
+        assert kwargs["finding_type"] == "requester_assertion"
+        assert kwargs["conclusion"] == "confirmed_executed"
+        assert kwargs["note"] == "checked at central: it ran"
+        assert kwargs["evidence"] == {
+            "operator": "ada",
+            "operator_self_declared": True,
+            "via": "needs_attention_dismiss",
+            "reason": "report_failed",
+            "request_id": "req-1",
+        }
+        assert kwargs["idempotency_key"].startswith("assert-")
+        assert result.central_step == "assertion_filed"
+        assert result.new_state == "resolved_manually"
+        stored = governed_service.governance_outbox.load()
+        assert stored.state == OutboxState.RESOLVED_MANUALLY
+        assert stored.resolved_by == "ada"
+
+    @pytest.mark.asyncio
+    async def test_the_assertion_key_covers_what_is_sent(self, governed_service):
+        """Same statement -> same key (a retry replays); any change -> a new key
+        (a different statement is a new, append-only finding)."""
+
+        async def _key(outcome, note, operator, request_id="req-1"):
+            await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+            if request_id != "req-1":
+
+                def _rename(r: OutboxRecord) -> OutboxRecord:
+                    r.request_id = request_id
+                    return r
+
+                await governed_service.governance_outbox.mutate(_rename)
+            client = self._asserting_central()
+            governed_service.governance_client = client
+            governed_service._conversation = None
+            await governed_service.resolve_needs_attention(
+                AttentionAction.DISMISS,
+                expected_request_id=request_id,
+                note=note,
+                operator=operator,
+                outcome=outcome,
+            )
+            return client.reconciliation_finding.call_args.kwargs["idempotency_key"]
+
+        executed = AttentionOutcome.CONFIRMED_EXECUTED
+        base = await _key(executed, "n", "ada")
+        # the first record is closed; free the slot to park the next one
+        await governed_service.governance_outbox.archive_and_clear()
+        again = await _key(executed, "n", "ada")
+        await governed_service.governance_outbox.archive_and_clear()
+        other_note = await _key(executed, "different", "ada")
+        await governed_service.governance_outbox.archive_and_clear()
+        other_name = await _key(executed, "n", "bob")
+        await governed_service.governance_outbox.archive_and_clear()
+        other_outcome = await _key(AttentionOutcome.INCONCLUSIVE, "n", "ada")
+        await governed_service.governance_outbox.archive_and_clear()
+        other_request = await _key(executed, "n", "ada", request_id="req-2")
+
+        assert base == again
+        assert len({base, other_note, other_name, other_outcome, other_request}) == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            GovernancePermanentError(
+                "not terminal", error_code="record_not_terminal", status_code=409
+            ),
+            RuntimeError("connection reset"),
+        ],
+    )
+    async def test_a_refused_assertion_leaves_the_record_parked(
+        self, governed_service, failure
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        client = self._central(reconciliation_finding=AsyncMock(side_effect=failure))
+        governed_service.governance_client = client
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.DISMISS,
+                expected_request_id="req-1",
+                note="why",
+                operator="ada",
+                outcome=AttentionOutcome.CONFIRMED_NOT_EXECUTED,
+            )
+
+        assert exc.value.error_code == "central_failed"
+        assert "nothing was changed" in exc.value.detail
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_an_outcome_is_refused_where_the_action_cannot_have_run(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        client = self._asserting_central()
+        governed_service.governance_client = client
+        before = governed_service.governance_outbox.load()
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.DISMISS,
+                expected_request_id="req-1",
+                note="why",
+                operator="ada",
+                outcome=AttentionOutcome.CONFIRMED_EXECUTED,
+            )
+
+        assert exc.value.error_code == "outcome_not_allowed"
+        client.reconciliation_finding.assert_not_awaited()
+        assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_an_assertion_needs_a_central_client(self, governed_service):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        governed_service.governance_client = None
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.DISMISS,
+                expected_request_id="req-1",
+                note="why",
+                operator="ada",
+                outcome=AttentionOutcome.INCONCLUSIVE,
+            )
+
+        assert exc.value.error_code == "central_client_unavailable"
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.NEEDS_ATTENTION
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dismiss_without_an_outcome_never_calls_central(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        client = self._asserting_central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        result = await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="why",
+            operator="ada",
+        )
+
+        client.reconciliation_finding.assert_not_awaited()
+        assert result.central_step == "not_applicable"
 
     # -- dismiss --
 

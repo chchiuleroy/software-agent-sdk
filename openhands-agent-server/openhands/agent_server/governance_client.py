@@ -470,12 +470,16 @@ class GovernanceClient:
         conclusion: str | None = None,
         note: str = "",
         execution_attempt_id: str | None = None,
+        evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "finding_type": finding_type,
             "conclusion": conclusion,
             "note": note,
         }
+        # Free-form evidence kept with the finding; left out when there is none.
+        if evidence is not None:
+            body["evidence"] = evidence
         # Central requires this for a late_report and rejects it on any other
         # finding type, so it is left out entirely (not null) when absent.
         if execution_attempt_id is not None:

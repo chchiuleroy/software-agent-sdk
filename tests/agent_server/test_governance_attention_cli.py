@@ -745,3 +745,141 @@ def test_the_prompt_says_who_it_is_acting_as_and_that_it_is_not_verified(
 
     assert code == 0
     assert "Acting as 'ada' (self-declared, not verified)" in out
+
+
+# ------------------------------ --outcome (dismiss) ------------------------------
+
+
+def test_outcome_is_sent_with_a_dismiss(server, capsys):
+    server.routes[("POST", RESOLVE_PATH)] = (200, OK_RESULT)
+
+    code, _, _ = run(
+        capsys,
+        "resolve",
+        CID,
+        "dismiss",
+        "--request-id",
+        "req-1",
+        "--note",
+        "checked",
+        "--operator",
+        "ada",
+        "--outcome",
+        "confirmed_executed",
+        "--url",
+        server.url,
+    )
+
+    assert code == 0
+    assert server.posts()[0]["body"]["outcome"] == "confirmed_executed"
+
+
+def test_no_outcome_is_sent_unless_asked_for(server, capsys):
+    server.routes[("POST", RESOLVE_PATH)] = (200, OK_RESULT)
+    run(
+        capsys,
+        "resolve",
+        CID,
+        "dismiss",
+        "--request-id",
+        "req-1",
+        "--note",
+        "checked",
+        "--url",
+        server.url,
+    )
+    assert "outcome" not in server.posts()[0]["body"]
+
+
+@pytest.mark.parametrize("action", ["retry", "abandon"])
+def test_an_outcome_with_another_action_is_refused_before_any_request(
+    server, capsys, action
+):
+    code, _, err = run(
+        capsys,
+        "resolve",
+        CID,
+        action,
+        "--request-id",
+        "req-1",
+        "--outcome",
+        "inconclusive",
+        "--url",
+        server.url,
+    )
+    assert code == 2 and "--outcome only goes with dismiss" in err
+    assert server.requests == []
+
+
+def test_an_unknown_outcome_value_is_refused(server, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        run(
+            capsys,
+            "resolve",
+            CID,
+            "dismiss",
+            "--request-id",
+            "req-1",
+            "--note",
+            "x",
+            "--outcome",
+            "probably_ran",
+            "--url",
+            server.url,
+        )
+    assert exit_info.value.code == 2
+    assert server.requests == []
+
+
+def test_the_prompt_says_central_is_told_first_and_a_refused_outcome_is_not_sent(
+    server, capsys, monkeypatch
+):
+    asserting = {**ITEM, "allowed_outcomes": ["inconclusive"]}
+    server.routes[("GET", LIST_PATH)] = (200, [asserting])
+    server.routes[("POST", RESOLVE_PATH)] = (200, OK_RESULT)
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+    code, out, _ = run(
+        capsys,
+        "resolve",
+        CID,
+        "dismiss",
+        "--note",
+        "x",
+        "--outcome",
+        "inconclusive",
+        "--url",
+        server.url,
+    )
+    assert code == 0 and "It first tells central: inconclusive" in out
+
+    # an outcome the record does not allow is refused before asking anyone
+    server.requests.clear()
+    monkeypatch.setattr("builtins.input", lambda *_: pytest.fail("must not ask"))
+    code, _, err = run(
+        capsys,
+        "resolve",
+        CID,
+        "dismiss",
+        "--note",
+        "x",
+        "--outcome",
+        "confirmed_executed",
+        "--url",
+        server.url,
+    )
+    assert code == 1 and "cannot be asserted" in err and server.posts() == []
+
+
+def test_list_shows_which_outcomes_a_record_allows(server, capsys):
+    server.routes[("GET", LIST_PATH)] = (
+        200,
+        [{**ITEM, "allowed_outcomes": ["confirmed_executed", "inconclusive"]}],
+    )
+    code, out, _ = run(capsys, "list", "--url", server.url)
+    assert code == 0
+    assert "outcomes      confirmed_executed, inconclusive" in out
+
+    server.routes[("GET", LIST_PATH)] = (200, [ITEM])
+    _, out, _ = run(capsys, "list", "--url", server.url)
+    assert "outcomes" not in out

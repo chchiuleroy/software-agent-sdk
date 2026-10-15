@@ -1004,10 +1004,136 @@ async def main():
                     all(outbox_path(cid) is None for cid, *_ in rounds),
                 )
 
+            def rewrite_outbox(cid, **fields):
+                """Edit the record on disk, to stand for a reason that is hard to
+                provoke for real (the agent-server is idle, so nothing races it)."""
+                path = outbox_path(cid)
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data.update(fields)
+                path.write_text(
+                    json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
+                )
+
+            def findings(cid):
+                return q(
+                    "select finding_type || '|' || coalesce(conclusion, '') || '|' "
+                    "|| coalesce(evidence->>'operator', '') || '|' "
+                    "|| coalesce(evidence->>'operator_self_declared', '') "
+                    "from reconciliation_findings where approval_request_id = "
+                    f"'{approval_id(cid)}' order by created_at"
+                )
+
+            async def scenario_assertion():
+                """dismiss with an outcome files a requester_assertion at central
+                first (evidence only), and the record is closed only if it took it."""
+                # (1) where the action cannot have run, an outcome is refused
+                cid = await park_by_central_cancel("g1")
+                if cid is None:
+                    return check("SETUP G: a parked conversation", False)
+                rid = request_id_of(cid)
+                item = listed(await attention(), cid) or {}
+                check(
+                    "G the list offers no outcomes for an approval central cancelled",
+                    item.get("allowed_outcomes") == [],
+                    str(item.get("allowed_outcomes")),
+                )
+                before = outbox_of(cid)
+                body = {
+                    "action": "dismiss",
+                    "expected_request_id": rid,
+                    "operator": OPERATOR,
+                    "note": "e2e: asserting",
+                    "outcome": "confirmed_executed",
+                }
+                r = await ac.post(f"/api/governance/attention/{cid}/resolve", json=body)
+                detail = r.json().get("detail", {}) if r.status_code == 409 else {}
+                check(
+                    "G an outcome is refused for it",
+                    r.status_code == 409
+                    and detail.get("error_code") == "outcome_not_allowed",
+                    f"{r.status_code} {r.text[:120]}",
+                )
+                check(
+                    "G the refusal changed nothing and central heard nothing",
+                    outbox_of(cid) == before and findings(cid) == "",
+                )
+
+                # (2) where it may have run: the assertion reaches central, then
+                # the record is closed
+                rewrite_outbox(cid, needs_attention_reason="report_failed")
+                item = listed(await attention(), cid) or {}
+                check(
+                    "G a report_failed record offers the three outcomes",
+                    item.get("allowed_outcomes")
+                    == [
+                        "confirmed_executed",
+                        "confirmed_not_executed",
+                        "inconclusive",
+                    ],
+                    str(item.get("allowed_outcomes")),
+                )
+                status_before = central_status(cid)
+                r = await ac.post(f"/api/governance/attention/{cid}/resolve", json=body)
+                out = r.json() if r.status_code == 200 else {}
+                check(
+                    "G dismiss with an outcome succeeds and says it told central",
+                    r.status_code == 200
+                    and out.get("central_step") == "assertion_filed"
+                    and out.get("new_state") == "resolved_manually",
+                    f"{r.status_code} {r.text[:160]}",
+                )
+                check(
+                    "G central holds one requester_assertion in the declared name",
+                    findings(cid)
+                    == f"requester_assertion|confirmed_executed|{OPERATOR}|true",
+                    findings(cid),
+                )
+                check(
+                    "G a finding is evidence only: the approval's status is unchanged",
+                    central_status(cid) == status_before,
+                    f"{status_before} -> {central_status(cid)}",
+                )
+                ob = outbox_of(cid) or {}
+                check(
+                    "G the record is closed by the operator",
+                    ob.get("state") == "resolved_manually"
+                    and ob.get("resolved_by") == OPERATOR,
+                    str(ob.get("state")),
+                )
+
+                # (3) central refuses (the approval is still pending, not terminal):
+                # nothing is closed and the operator is told
+                cid2 = await start_and_run("g2")
+                if not cid2 or not await pending_approval(cid2, 1):
+                    return check("SETUP G: a pending approval", False)
+                rewrite_outbox(
+                    cid2,
+                    state="needs_attention",
+                    needs_attention_reason="report_failed",
+                )
+                before2 = outbox_of(cid2)
+                r = await ac.post(
+                    f"/api/governance/attention/{cid2}/resolve",
+                    json={**body, "expected_request_id": request_id_of(cid2)},
+                )
+                detail = r.json().get("detail", {}) if r.status_code == 424 else {}
+                check(
+                    "G central refusing the assertion: a 424 saying nothing changed",
+                    r.status_code == 424
+                    and detail.get("error_code") == "central_failed"
+                    and "nothing was changed" in str(detail.get("detail")),
+                    f"{r.status_code} {r.text[:200]}",
+                )
+                check(
+                    "G the record is still parked and central holds no finding",
+                    outbox_of(cid2) == before2 and findings(cid2) == "",
+                )
+
             await scenario("CONTROL (healthy baseline)", control())
             await scenario("A: central cancels -> abandon", scenario_a())
             await scenario("D: dismiss and refused requests", scenario_d())
             await scenario("CLI against the real agent-server", scenario_cli())
+            await scenario("G: requester_assertion on dismiss", scenario_assertion())
             await scenario("RACE: resolve and delete at the same time", scenario_race())
 
             # ============================ phase 2 ============================

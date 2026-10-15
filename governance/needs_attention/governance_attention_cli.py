@@ -2,7 +2,9 @@
 
   python governance_attention_cli.py list [--json] [--url URL]
   python governance_attention_cli.py resolve <conversation-id> retry|abandon|dismiss
-         [--request-id ID] [--note TEXT] [--operator NAME] [--yes] [--url URL]
+         [--request-id ID] [--note TEXT] [--operator NAME]
+         [--outcome confirmed_executed|confirmed_not_executed|inconclusive]
+         [--yes] [--url URL]
 
 It talks to one agent-server's GET /api/governance/attention and
 POST /api/governance/attention/{id}/resolve (see design.md in this directory).
@@ -19,6 +21,11 @@ Settings (environment, or --url):
 without it the CLI shows you the record as it is right now, asks, and quotes the id it
 just showed. --yes only skips that question and therefore requires --request-id: there
 is no way to act on a record you have not seen.
+
+--outcome (dismiss only, and only where `list` shows outcomes for the record) says
+what you confirmed at central about the action. It is filed with central first as
+a requester_assertion (evidence, in your declared name; it never changes the
+approval's status); if central does not take it, nothing is changed.
 
 --operator is who you say you are (default: your login name). It is recorded with
 the record and logged, but it is NOT verified: the server only knows the shared
@@ -48,6 +55,7 @@ URL_ENV = "OH_AGENT_SERVER_URL"
 KEY_ENVS = ("OH_SESSION_API_KEYS_0", "SESSION_API_KEY")
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 ACTIONS = ("retry", "abandon", "dismiss")
+OUTCOMES = ("confirmed_executed", "confirmed_not_executed", "inconclusive")
 TIMEOUT_SECONDS = 30
 # Far above any real answer (a list of a few records). A bigger body is refused unread.
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -230,6 +238,11 @@ def _describe(item: dict) -> str:
             f"last {item.get('last_attempt_at')}",
             f"  request_id    {item.get('request_id')}",
             f"  allowed       {', '.join(item.get('allowed_actions') or []) or 'none'}",
+            *(
+                [f"  outcomes      {', '.join(item['allowed_outcomes'])}"]
+                if item.get("allowed_outcomes")
+                else []
+            ),
             *([f"  next          {step}"] if step else []),
         ]
     )
@@ -270,6 +283,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     note = (args.note or "").strip() or None
     if action == "dismiss" and note is None:
         raise CliError("dismiss needs --note saying why")
+    outcome = args.outcome
+    if outcome is not None and action != "dismiss":
+        raise CliError("--outcome only goes with dismiss")
     if args.request_id is not None and not args.request_id.strip():
         raise CliError("--request-id is empty")
     if args.yes and not args.request_id:
@@ -308,7 +324,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 f"(allowed: {', '.join(item.get('allowed_actions') or []) or 'none'})",
                 code=1,
             )
+        if outcome is not None and outcome not in (item.get("allowed_outcomes") or []):
+            raise CliError(
+                f"{outcome} cannot be asserted for this record "
+                f"(allowed: {', '.join(item.get('allowed_outcomes') or []) or 'none'})",
+                code=1,
+            )
         print(f"\nAbout to {action}: {EFFECT[action]}.")
+        if outcome is not None:
+            print(f"It first tells central: {outcome} (a requester_assertion).")
         print(f"Acting as {operator!r} (self-declared, not verified).")
         try:
             answer = input("Go ahead? [y/N] ").strip().lower()
@@ -325,6 +349,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     }
     if note is not None:
         body["note"] = note
+    if outcome is not None:
+        body["outcome"] = outcome
     status, result = call(
         "POST", f"{url}/api/governance/attention/{conversation_id}/resolve", key, body
     )
@@ -395,6 +421,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_resolve.add_argument("action", choices=ACTIONS)
     p_resolve.add_argument("--request-id", help="the request_id shown by `list`")
     p_resolve.add_argument("--note", help="why (required for dismiss)")
+    p_resolve.add_argument(
+        "--outcome",
+        choices=OUTCOMES,
+        help="dismiss only: what you confirmed at central; filed there first",
+    )
     p_resolve.add_argument(
         "--operator",
         help="who is acting, recorded but not verified (default: your login name)",
