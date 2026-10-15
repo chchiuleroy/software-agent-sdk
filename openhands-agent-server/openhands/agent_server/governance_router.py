@@ -189,6 +189,7 @@ async def resolve_needs_attention(
             body.action,
             expected_request_id=body.expected_request_id,
             note=body.note,
+            operator=body.operator,
         )
         if result is None:
             raise HTTPException(

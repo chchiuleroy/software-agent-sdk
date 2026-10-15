@@ -503,10 +503,11 @@ def test_apply_close_ends_the_record_and_keeps_why_it_was_parked(
 ):
     record = _parked(NeedsAttentionReason.CLAIM_FAILED)
 
-    apply_close(record, action, "req-1", "operator note")
+    apply_close(record, action, "req-1", "operator note", "ada")
 
     assert record.state == expected_state
     assert record.resolution_note == "operator note"
+    assert record.resolved_by == "ada"
     assert record.resolved_at is not None
     assert record.needs_attention_reason == "claim_failed"
     assert record.last_error_code == "not_found"
@@ -514,15 +515,16 @@ def test_apply_close_ends_the_record_and_keeps_why_it_was_parked(
 
 def test_apply_close_rechecks_the_record_it_is_given():
     record = _record(state=OutboxState.RESULT_REPORTED)
-    err = _error_of(apply_close, record, AttentionAction.DISMISS, "req-1", "n")
+    err = _error_of(apply_close, record, AttentionAction.DISMISS, "req-1", "n", "ada")
     assert err.error_code == "state_changed"
     assert record.state == OutboxState.RESULT_REPORTED
     assert record.resolution_note is None
+    assert record.resolved_by is None
 
 
 def test_apply_close_refuses_an_action_the_reason_does_not_allow():
     record = _parked(NeedsAttentionReason.REPORT_FAILED)
-    err = _error_of(apply_close, record, AttentionAction.ABANDON, "req-1", None)
+    err = _error_of(apply_close, record, AttentionAction.ABANDON, "req-1", None, "ada")
     assert err.error_code == "action_not_allowed"
     assert record.state == OutboxState.NEEDS_ATTENTION
 
@@ -539,7 +541,9 @@ def test_resolved_manually_is_terminal_not_retriable():
 
 
 def _request(**body) -> ResolveRequest:
-    return ResolveRequest.model_validate({"expected_request_id": "r", **body})
+    return ResolveRequest.model_validate(
+        {"expected_request_id": "r", "operator": "ada", **body}
+    )
 
 
 def test_dismiss_needs_a_note():
@@ -563,3 +567,43 @@ def test_the_request_bounds_its_free_text():
         _request(action="retry", expected_request_id="r" * 257)
     with pytest.raises(ValueError):
         _request(action="purge")
+
+
+def test_the_operator_is_trimmed_and_may_be_any_printable_name():
+    assert _request(action="retry", operator="  ada  ").operator == "ada"
+    assert _request(action="retry", operator="王小明 (ops)").operator == "王小明 (ops)"
+    assert len(_request(action="retry", operator="a" * 64).operator) == 64
+
+
+@pytest.mark.parametrize(
+    "operator",
+    [
+        "",
+        "   ",
+        "a" * 65,
+        "ada\nINFO forged log line",  # a line break could forge a log line
+        "ada\tbob",
+        "ada\x00",
+        "ada\u200b",  # zero-width space: invisible, so it would pass for a name
+    ],
+)
+def test_the_operator_must_be_a_short_visible_name(operator):
+    with pytest.raises(ValueError, match="operator"):
+        _request(action="retry", operator=operator)
+
+
+def test_the_operator_is_required():
+    with pytest.raises(ValueError, match="operator"):
+        ResolveRequest.model_validate({"action": "retry", "expected_request_id": "r"})
+
+
+def test_resolved_by_is_written_only_once_someone_resolved_the_record():
+    """An older server rejects keys it does not know, so a record nobody has
+    resolved must serialize exactly as before the field existed."""
+    record = _parked(NeedsAttentionReason.CLAIM_FAILED)
+    assert "resolved_by" not in json.loads(record.to_json())
+
+    apply_close(record, AttentionAction.DISMISS, "req-1", "why", "ada")
+    stored = json.loads(record.to_json())
+    assert stored["resolved_by"] == "ada"
+    assert OutboxRecord.from_json(record.to_json()).resolved_by == "ada"

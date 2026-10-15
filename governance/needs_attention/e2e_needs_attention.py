@@ -44,6 +44,7 @@ Takes about five minutes (the relay cycle is 30 seconds and one scenario waits f
 """
 
 import asyncio
+import getpass
 import json
 import os
 import pathlib
@@ -85,6 +86,7 @@ def pg_tool(name: str) -> str:
 
 
 DB = "central_e2e_attn"
+OPERATOR = "e2e-ada"  # what the requests below declare as the operator
 IDP_PORT, API_PORT, AGENT_PORT, LLM_PORT = 18794, 8898, 8797, 18795
 PROXY_PORT = 18796  # the agent-server reaches central through this
 ISSUER = f"http://127.0.0.1:{IDP_PORT}/realms/e2e"
@@ -554,7 +556,11 @@ async def main():
                 return r.json() if r.status_code == 200 else None
 
             async def resolve(cid, action, request_id, note=None):
-                body = {"action": action, "expected_request_id": request_id}
+                body = {
+                    "action": action,
+                    "expected_request_id": request_id,
+                    "operator": OPERATOR,
+                }
                 if note is not None:
                     body["note"] = note
                 return await ac.post(
@@ -656,6 +662,7 @@ async def main():
                     "A the record ends cancelled with the operator's note",
                     ob.get("state") == "cancelled"
                     and ob.get("resolution_note") == "e2e: not wanted"
+                    and ob.get("resolved_by") == OPERATOR
                     and ob.get("resolved_at") is not None,
                     f"state={ob.get('state')!r}",
                 )
@@ -734,10 +741,27 @@ async def main():
                 )
                 r = await ac.post(
                     f"/api/governance/attention/{cid}/resolve",
-                    json={"action": "dismiss", "expected_request_id": request_id},
+                    json={
+                        "action": "dismiss",
+                        "expected_request_id": request_id,
+                        "operator": OPERATOR,
+                    },
                 )
                 check(
                     "D dismiss without a note is a 422",
+                    r.status_code == 422,
+                    str(r.status_code),
+                )
+                r = await ac.post(
+                    f"/api/governance/attention/{cid}/resolve",
+                    json={
+                        "action": "dismiss",
+                        "expected_request_id": request_id,
+                        "note": "e2e: no operator",
+                    },
+                )
+                check(
+                    "D any action without an operator is a 422",
                     r.status_code == 422,
                     str(r.status_code),
                 )
@@ -837,6 +861,8 @@ async def main():
                     request_id_of(cid_1),
                     "--note",
                     "e2e: cli dismiss",
+                    "--operator",
+                    "e2e-cli-operator",
                 )
                 check(
                     "CLI resolve dismiss with --request-id succeeds",
@@ -852,7 +878,8 @@ async def main():
                 check(
                     "CLI dismiss: the record ends resolved_manually with the note",
                     ob.get("state") == "resolved_manually"
-                    and ob.get("resolution_note") == "e2e: cli dismiss",
+                    and ob.get("resolution_note") == "e2e: cli dismiss"
+                    and ob.get("resolved_by") == "e2e-cli-operator",
                     str(ob.get("state")),
                 )
 
@@ -864,6 +891,12 @@ async def main():
                     and "About to abandon" in r.stdout
                     and "cancelled" in r.stdout,
                     f"exit={r.returncode} {r.stdout[-160:]} {r.stderr[:100]}",
+                )
+                ob = outbox_of(cid_2) or {}
+                check(
+                    "CLI abandon without --operator records the login name",
+                    ob.get("resolved_by") == getpass.getuser(),
+                    f"{ob.get('resolved_by')!r}",
                 )
                 check(
                     "CLI abandon: the REAL conversation is idle again",
@@ -921,6 +954,7 @@ async def main():
                         "action": action,
                         "expected_request_id": request_id_of(cid),
                         "note": "e2e race",
+                        "operator": OPERATOR,
                     }
                     resolved, deleted = await asyncio.gather(
                         ac.post(f"/api/governance/attention/{cid}/resolve", json=body),
@@ -987,9 +1021,12 @@ async def main():
                     json={"device_id": AGENT_DEVICE},
                     headers={**svc, **ik()},
                 )
+                # The agent-server registers its own device at startup (SDK #42), so
+                # by now it is normally registered already; either answer is fine.
                 check(
-                    "SETUP register the agent's device",
-                    r.status_code == 201,
+                    "SETUP the agent's device is registered",
+                    r.status_code == 201
+                    or (r.status_code == 409 and "device_already_registered" in r.text),
                     r.text[:80],
                 )
                 cid_b = await start_and_run("b1")

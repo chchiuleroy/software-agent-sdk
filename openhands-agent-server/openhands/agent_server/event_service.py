@@ -2981,6 +2981,7 @@ class EventService:
         *,
         expected_request_id: str,
         note: str | None,
+        operator: str,
     ) -> ResolveResponse:
         """Acts on an outbox record parked in NEEDS_ATTENTION (operator request).
 
@@ -2998,7 +2999,10 @@ class EventService:
         """
         async with self._resolve_lock:
             return await self._resolve_needs_attention_locked(
-                action, expected_request_id=expected_request_id, note=note
+                action,
+                expected_request_id=expected_request_id,
+                note=note,
+                operator=operator,
             )
 
     async def _resolve_needs_attention_locked(
@@ -3007,6 +3011,7 @@ class EventService:
         *,
         expected_request_id: str,
         note: str | None,
+        operator: str,
     ) -> ResolveResponse:
         if self.governance_deployment_mode != "team":
             raise ResolveError("not_team_mode", "governance is not in team mode")
@@ -3023,7 +3028,7 @@ class EventService:
             )
         elif action is AttentionAction.DISMISS:
             updated = await self.governance_outbox.mutate(
-                lambda r: apply_close(r, action, expected_request_id, note)
+                lambda r: apply_close(r, action, expected_request_id, note, operator)
             )
         else:
             client = self.governance_client
@@ -3062,11 +3067,12 @@ class EventService:
                     f"failed ({type(exc).__name__}); the abandon can be repeated",
                 ) from exc
             updated = await self.governance_outbox.mutate(
-                lambda r: apply_close(r, action, expected_request_id, note)
+                lambda r: apply_close(r, action, expected_request_id, note, operator)
             )
         logger.info(
-            "operator %s on the governance outbox of conversation %s "
-            "(reason=%s, error_code=%s, request_id=%s) -> %s",
+            "operator %r (self-declared) %s on the governance outbox of "
+            "conversation %s (reason=%s, error_code=%s, request_id=%s) -> %s",
+            operator,
             action.value,
             self.stored.id,
             record.needs_attention_reason,

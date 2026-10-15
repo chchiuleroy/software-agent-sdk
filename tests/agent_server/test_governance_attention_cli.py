@@ -450,6 +450,8 @@ def test_resolve_with_a_request_id_sends_exactly_that(server, capsys):
         "req-1",
         "--note",
         "  checked at central  ",
+        "--operator",
+        "  ada  ",
         "--url",
         server.url,
     )
@@ -460,6 +462,7 @@ def test_resolve_with_a_request_id_sends_exactly_that(server, capsys):
         "action": "dismiss",
         "expected_request_id": "req-1",
         "note": "checked at central",
+        "operator": "ada",
     }
     assert len(server.requests) == 1  # no list fetch: the id was given
     assert "resolved_manually" in out
@@ -691,3 +694,54 @@ def test_central_step_is_reported_for_an_abandon(server, capsys):
     )
 
     assert "central: aborted" in out
+
+
+def test_the_operator_defaults_to_the_login_name(server, capsys, monkeypatch):
+    server.routes[("POST", RESOLVE_PATH)] = (200, {**OK_RESULT, "action": "retry"})
+    monkeypatch.setattr(cli.getpass, "getuser", lambda: "login-name")
+
+    for extra in ([], ["--operator", "   "]):  # blank counts as not given
+        server.requests.clear()
+        code, _, _ = run(
+            capsys,
+            "resolve",
+            CID,
+            "retry",
+            "--request-id",
+            "req-1",
+            "--url",
+            server.url,
+            *extra,
+        )
+        assert code == 0
+        assert server.posts()[0]["body"]["operator"] == "login-name"
+
+
+def test_no_login_name_and_no_operator_is_refused_before_any_request(
+    server, capsys, monkeypatch
+):
+    def _no_user():
+        raise OSError("no user")
+
+    monkeypatch.setattr(cli.getpass, "getuser", _no_user)
+
+    code, _, err = run(
+        capsys, "resolve", CID, "retry", "--request-id", "req-1", "--url", server.url
+    )
+
+    assert code == 2 and "--operator" in err and server.requests == []
+
+
+def test_the_prompt_says_who_it_is_acting_as_and_that_it_is_not_verified(
+    server, capsys, monkeypatch
+):
+    server.routes[("GET", LIST_PATH)] = (200, [ITEM])
+    server.routes[("POST", RESOLVE_PATH)] = (200, {**OK_RESULT, "action": "retry"})
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+    code, out, _ = run(
+        capsys, "resolve", CID, "retry", "--operator", "ada", "--url", server.url
+    )
+
+    assert code == 0
+    assert "Acting as 'ada' (self-declared, not verified)" in out

@@ -1974,6 +1974,7 @@ class ConversationService:
         *,
         expected_request_id: str,
         note: str | None,
+        operator: str,
     ) -> ResolveResponse | None:
         """Operator action on a conversation's governance outbox (see
         ``EventService.resolve_needs_attention``); None if there is no such
@@ -2009,7 +2010,10 @@ class ConversationService:
                 return None
             resolving = asyncio.ensure_future(
                 event_service.resolve_needs_attention(
-                    action, expected_request_id=expected_request_id, note=note
+                    action,
+                    expected_request_id=expected_request_id,
+                    note=note,
+                    operator=operator,
                 )
             )
             try:

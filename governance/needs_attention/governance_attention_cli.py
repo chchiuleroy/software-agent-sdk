@@ -2,7 +2,7 @@
 
   python governance_attention_cli.py list [--json] [--url URL]
   python governance_attention_cli.py resolve <conversation-id> retry|abandon|dismiss
-         [--request-id ID] [--note TEXT] [--yes] [--url URL]
+         [--request-id ID] [--note TEXT] [--operator NAME] [--yes] [--url URL]
 
 It talks to one agent-server's GET /api/governance/attention and
 POST /api/governance/attention/{id}/resolve (see design.md in this directory).
@@ -20,6 +20,10 @@ without it the CLI shows you the record as it is right now, asks, and quotes the
 just showed. --yes only skips that question and therefore requires --request-id: there
 is no way to act on a record you have not seen.
 
+--operator is who you say you are (default: your login name). It is recorded with
+the record and logged, but it is NOT verified: the server only knows the shared
+session API key, so anyone holding it can write any name.
+
 Exit status: 0 done, 1 refused (by you or by the server), 2 usage, configuration or
 connection problem.
 """
@@ -27,6 +31,7 @@ connection problem.
 from __future__ import annotations
 
 import argparse
+import getpass
 import http.client
 import json
 import os
@@ -253,6 +258,13 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _login_name() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # no login name in the environment, or none that can be looked up
+        raise CliError("could not find your login name: pass --operator NAME") from None
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     action = args.action
     note = (args.note or "").strip() or None
@@ -269,6 +281,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     except ValueError:
         # Not echoed: whatever was typed here may be something else, a key for one.
         raise CliError("the conversation id is not a UUID") from None
+    operator = (args.operator or "").strip() or _login_name()
     url = base_url(args.url)
     key = session_key()
     check_transport(url, key)
@@ -296,6 +309,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 code=1,
             )
         print(f"\nAbout to {action}: {EFFECT[action]}.")
+        print(f"Acting as {operator!r} (self-declared, not verified).")
         try:
             answer = input("Go ahead? [y/N] ").strip().lower()
         except EOFError:
@@ -304,7 +318,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             raise CliError("not done", code=1)
         request_id = item["request_id"]
 
-    body: dict[str, Any] = {"action": action, "expected_request_id": request_id}
+    body: dict[str, Any] = {
+        "action": action,
+        "expected_request_id": request_id,
+        "operator": operator,
+    }
     if note is not None:
         body["note"] = note
     status, result = call(
@@ -377,6 +395,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_resolve.add_argument("action", choices=ACTIONS)
     p_resolve.add_argument("--request-id", help="the request_id shown by `list`")
     p_resolve.add_argument("--note", help="why (required for dismiss)")
+    p_resolve.add_argument(
+        "--operator",
+        help="who is acting, recorded but not verified (default: your login name)",
+    )
     p_resolve.add_argument(
         "--yes", action="store_true", help="do not ask; requires --request-id"
     )

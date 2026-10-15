@@ -4672,7 +4672,7 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service._claim_and_run_governed(record, "approval-1", future)
 
         retried = await governed_service.resolve_needs_attention(
-            AttentionAction.RETRY, expected_request_id="req-1", note=None
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
         )
         assert retried.new_state == "claim_inflight"
         await governed_service._relay_outbox_once()
@@ -4686,7 +4686,10 @@ class TestEventServiceGovernanceOrchestration:
         assert parked.claim_failures == 2
         with pytest.raises(ResolveError):
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
         # and it is not retried behind anyone's back
         await governed_service._relay_outbox_once()
@@ -4709,7 +4712,7 @@ class TestEventServiceGovernanceOrchestration:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         await governed_service._claim_and_run_governed(record, "approval-1", future)
         await governed_service.resolve_needs_attention(
-            AttentionAction.RETRY, expected_request_id="req-1", note=None
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
         )
         client.claim = AsyncMock(
             side_effect=GovernancePermanentError(
@@ -4725,7 +4728,10 @@ class TestEventServiceGovernanceOrchestration:
         assert parked.claim_failures == 2
         with pytest.raises(ResolveError):
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
     @pytest.mark.asyncio
@@ -4741,7 +4747,7 @@ class TestEventServiceGovernanceOrchestration:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         await governed_service._claim_and_run_governed(record, "approval-1", future)
         await governed_service.resolve_needs_attention(
-            AttentionAction.RETRY, expected_request_id="req-1", note=None
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
         )
         client.claim = AsyncMock(
             return_value={
@@ -7567,7 +7573,7 @@ class TestEventServiceGovernanceOrchestration:
         governed_service._ensure_claim_redispatch_task = MagicMock()
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.RETRY, expected_request_id="req-1", note=None
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
         )
 
         assert result.new_state == "claim_inflight"
@@ -7606,7 +7612,7 @@ class TestEventServiceGovernanceOrchestration:
         governed_service.governance_client = client
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.RETRY, expected_request_id="req-1", note=None
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
         )
         assert result.new_state == "result_pending"
         await governed_service._relay_outbox_once()
@@ -7631,7 +7637,7 @@ class TestEventServiceGovernanceOrchestration:
         before = governed_service.governance_outbox.load()
 
         await governed_service.resolve_needs_attention(
-            AttentionAction.RETRY, expected_request_id="req-1", note=None
+            AttentionAction.RETRY, expected_request_id="req-1", note=None, operator="op"
         )
 
         after = governed_service.governance_outbox.load()
@@ -7639,6 +7645,26 @@ class TestEventServiceGovernanceOrchestration:
         assert after.last_error_code is None
         assert after.attempt_count == before.attempt_count
         assert after.request_id == parked.request_id
+
+    @pytest.mark.asyncio
+    async def test_the_operator_is_logged_for_retry_but_not_stored(
+        self, governed_service, caplog
+    ):
+        """A retry leaves the record in flight, so there is nowhere to keep who did
+        it; the log line is the only trace, and it quotes the name (repr) so a
+        name cannot pose as part of the line."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+
+        with caplog.at_level("INFO"):
+            await governed_service.resolve_needs_attention(
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="ada",
+            )
+
+        assert governed_service.governance_outbox.load().resolved_by is None
+        assert "operator 'ada' (self-declared) retry" in caplog.text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -7659,7 +7685,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "retry_not_possible"
@@ -7679,7 +7708,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "retry_not_possible"
@@ -7704,7 +7736,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "action_not_allowed"
@@ -7725,7 +7760,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-OTHER", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-OTHER",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "request_id_mismatch"
@@ -7737,7 +7775,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "state_changed"
@@ -7746,7 +7787,10 @@ class TestEventServiceGovernanceOrchestration:
     async def test_resolve_without_an_outbox_is_not_found(self, governed_service):
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "not_found"
@@ -7758,7 +7802,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "not_team_mode"
@@ -7769,7 +7816,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.DISMISS, expected_request_id="req-1", note="x"
+                AttentionAction.DISMISS,
+                expected_request_id="req-1",
+                note="x",
+                operator="op",
             )
 
         assert exc.value.error_code == "unreadable_outbox"
@@ -7789,6 +7839,7 @@ class TestEventServiceGovernanceOrchestration:
             AttentionAction.DISMISS,
             expected_request_id="req-1",
             note="checked at central, nothing to report",
+            operator="ada",
         )
 
         assert result.new_state == "resolved_manually"
@@ -7796,6 +7847,7 @@ class TestEventServiceGovernanceOrchestration:
         stored = governed_service.governance_outbox.load()
         assert stored.state == OutboxState.RESOLVED_MANUALLY
         assert stored.resolution_note == "checked at central, nothing to report"
+        assert stored.resolved_by == "ada"
         assert stored.resolved_at is not None
         assert stored.needs_attention_reason == "report_failed"  # history kept
         assert stored.last_error_code == "x_code"
@@ -7818,7 +7870,10 @@ class TestEventServiceGovernanceOrchestration:
         self._waiting_on(governed_service, action)
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.DISMISS, expected_request_id="req-1", note="why"
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="why",
+            operator="op",
         )
 
         assert result.conversation_still_waiting is True
@@ -7831,7 +7886,10 @@ class TestEventServiceGovernanceOrchestration:
         """The point of the whole feature: the conversation is not stuck."""
         await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
         await governed_service.resolve_needs_attention(
-            AttentionAction.DISMISS, expected_request_id="req-1", note="why"
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="why",
+            operator="op",
         )
         new_action = _governance_pending_action(call_id="call_2")
         self._waiting_on(governed_service, new_action)
@@ -7857,7 +7915,10 @@ class TestEventServiceGovernanceOrchestration:
         self._waiting_on(governed_service, action)
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.ABANDON, expected_request_id="req-1", note="not wanted"
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note="not wanted",
+            operator="bob",
         )
 
         client.cancel.assert_awaited_once()
@@ -7869,6 +7930,7 @@ class TestEventServiceGovernanceOrchestration:
         stored = governed_service.governance_outbox.load()
         assert stored.state == OutboxState.CANCELLED
         assert stored.resolution_note == "not wanted"
+        assert stored.resolved_by == "bob"
 
     @pytest.mark.asyncio
     async def test_abandon_aborts_an_already_accepted_approval(self, governed_service):
@@ -7878,7 +7940,10 @@ class TestEventServiceGovernanceOrchestration:
         self._waiting_on(governed_service, _governance_pending_action())
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note=None,
+            operator="op",
         )
 
         client.report_result.assert_awaited_once()
@@ -7906,7 +7971,10 @@ class TestEventServiceGovernanceOrchestration:
         self._waiting_on(governed_service, action)
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note=None,
+            operator="op",
         )
 
         assert result.central_step == "already_terminal"
@@ -7937,7 +8005,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "central_failed"
@@ -7963,7 +8034,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "central_failed"
@@ -7984,7 +8058,10 @@ class TestEventServiceGovernanceOrchestration:
         self._waiting_on(governed_service, other)
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note=None,
+            operator="op",
         )
 
         self._rejected(governed_service).assert_not_called()
@@ -8011,7 +8088,10 @@ class TestEventServiceGovernanceOrchestration:
         )
 
         await governed_service.resolve_needs_attention(
-            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note=None,
+            operator="op",
         )
 
         self._rejected(governed_service).assert_not_called()
@@ -8028,7 +8108,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "conversation_inactive"
@@ -8046,7 +8129,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "central_client_unavailable"
@@ -8079,7 +8165,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "state_changed"
@@ -8115,7 +8204,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "unreadable_outbox"
@@ -8148,13 +8240,19 @@ class TestEventServiceGovernanceOrchestration:
 
         abandon = asyncio.create_task(
             governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
         )
         await in_central.wait()  # the abandon is now parked inside the central call
         retry = asyncio.create_task(
             governed_service.resolve_needs_attention(
-                AttentionAction.RETRY, expected_request_id="req-1", note=None
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
         )
         await asyncio.sleep(0.05)  # a retry with no lock would commit right here
@@ -8206,7 +8304,10 @@ class TestEventServiceGovernanceOrchestration:
         )
 
         await governed_service.resolve_needs_attention(
-            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note=None,
+            operator="op",
         )
 
         assert held_when_rejecting == [1]  # called once, inside the critical section
@@ -8230,7 +8331,10 @@ class TestEventServiceGovernanceOrchestration:
 
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "reject_failed"
@@ -8243,7 +8347,10 @@ class TestEventServiceGovernanceOrchestration:
         client.report_result.side_effect = self._illegal()
 
         result = await governed_service.resolve_needs_attention(
-            AttentionAction.ABANDON, expected_request_id="req-1", note=None
+            AttentionAction.ABANDON,
+            expected_request_id="req-1",
+            note=None,
+            operator="op",
         )
 
         assert result.central_step == "already_terminal"
@@ -8261,7 +8368,10 @@ class TestEventServiceGovernanceOrchestration:
         # The early live-conversation check refuses before any side effect.
         with pytest.raises(ResolveError) as exc:
             await governed_service.resolve_needs_attention(
-                AttentionAction.ABANDON, expected_request_id="req-1", note=None
+                AttentionAction.ABANDON,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
             )
 
         assert exc.value.error_code == "conversation_inactive"

@@ -64,7 +64,7 @@ Roy 已拍板（2026-10-13「照建議」）：只做第 1、2 層（單一對�
   - 錯誤：404 沒有記錄；409 狀態已不是 `NEEDS_ATTENTION`／`request_id` 不符；409 動作不被該 reason 允許（回 `allowed_actions`）；422 dismiss 缺 note。
   - 需載入對話才能 `reject_pending_actions`／啟動 relay：走 `ConversationService` 既有的載入函式。
 - CLI：`governance/needs_attention/governance_attention_cli.py`，`list`／`resolve <conversation_id> <action> [--note ...]`；session API key 從環境變數讀，不印值。
-- **認證限度**：agent-server 只有共用的 `X-Session-API-Key`（`dependencies.py`），沒有操作者身分。`resolution_note` 以外，**稽核上無法記錄「誰」**。central 也不會得知。這是 v1 的明確限度。
+- **認證限度**：agent-server 只有共用的 `X-Session-API-Key`（`dependencies.py`），沒有操作者身分。`resolution_note` 以外，**稽核上無法記錄「誰」**。central 也不會得知。這是 v1 的明確限度。**2026-10-15 更新**：resolve 請求新增必填欄位 `operator`（自我宣告，不是認證；1～64 字、只能是可見字元），abandon／dismiss 寫入 `OutboxRecord.resolved_by`（沒值時不寫入檔案），三種動作都寫進 log；retry 不留在紀錄。central 仍不會得知。plan-gate 兩關由 Roy 核可（方案 A；方案 B「向 central 補一筆稽核事件」另案，未做）。
 
 ## 5. 步驟（每步獨立 commit，可停）
 
