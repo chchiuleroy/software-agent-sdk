@@ -23,6 +23,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from central_governance_api.accounts.errors import (
@@ -160,6 +161,29 @@ def _install_exception_handlers(app: FastAPI) -> None:
             )
 
         app.add_exception_handler(exc_type, _handler)
+
+    def _validation_handler(_request: Request, exc: Exception) -> JSONResponse:
+        """422 without echoing what the caller sent. FastAPI's own answer puts each
+        error's ``input`` (the whole body for a model-level check) into the response:
+        a body holding NaN then cannot be rendered as JSON at all (a 500), and a body
+        with something sensitive in it comes straight back. ``loc``, ``type`` and
+        ``msg`` say what is wrong."""
+        assert isinstance(exc, RequestValidationError)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {
+                        "type": error.get("type"),
+                        "loc": list(error.get("loc", ())),
+                        "msg": error.get("msg"),
+                    }
+                    for error in exc.errors()
+                ]
+            },
+        )
+
+    app.add_exception_handler(RequestValidationError, _validation_handler)
 
 
 @asynccontextmanager

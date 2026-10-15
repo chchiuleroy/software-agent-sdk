@@ -29,6 +29,12 @@ than ``_EVIDENCE_CHARS`` as JSON text is left out (``evidence_truncated``). The 
 happens in the database, so the oversized values are never loaded. Whether a record is
 ``admin_verified`` always looks at ALL its findings, not only the ones shown.
 
+Known limit: the queue is read with several queries under PostgreSQL's default
+READ COMMITTED isolation, not one snapshot. A finding filed while a page is being
+built can make one record show ``admin_verified`` true under the ``false`` filter,
+or ``findings_total`` differ by one from the findings listed. Nothing is written
+from this view and a refresh shows the settled state.
+
 Everything in ``note`` and ``evidence`` is text a requester or an administrator wrote;
 treat it as untrusted wherever it is shown.
 """
