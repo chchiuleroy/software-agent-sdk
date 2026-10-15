@@ -15,7 +15,7 @@ python governance_attention_cli.py list
 python governance_attention_cli.py resolve <對話id> retry|abandon|dismiss [--request-id ID] [--note 文字] [--operator 名字] [--outcome 結果]
 ```
 
-`--outcome`（只用於 dismiss）是你在中央確認到的結果：`confirmed_executed`（動作已執行）、`confirmed_not_executed`（動作沒有執行）、`inconclusive`（無法確定）。**只有 `list` 對該紀錄顯示 `outcomes` 時才能用**（動作可能已執行的原因：`report_failed`、`reconcile_failed`、`central_status_unexpected`、`late_report_refused`，以及原因未知的紀錄；動作不可能執行過的原因沒有可說的）。它會**先**以 `requester_assertion` finding 送到中央（證據含你宣告的名字；finding 只是證據，**不會改變核准的狀態**），中央收下才結束本機紀錄；中央不收（例如核准還沒到終態）就什麼都不改、回 424。同樣內容重送會重放同一筆；不同內容是新的一筆（finding 只追加）。
+`--outcome`（只用於 dismiss）是你在中央確認到的結果：`confirmed_executed`（動作已執行）、`confirmed_not_executed`（動作沒有執行）、`inconclusive`（無法確定）。**只有 `list` 對該紀錄顯示 `outcomes` 時才能用**（動作可能已執行的原因：`report_failed`、`reconcile_failed`、`central_status_unexpected`、`late_report_refused`，以及原因未知的紀錄；動作不可能執行過的原因沒有可說的）。它會**先**以 `requester_assertion` finding 送到中央（證據含你宣告的名字；finding 只是證據，**不會改變核准的狀態**），中央收下才結束本機紀錄；中央不收（例如核准還沒到終態）就什麼都不改、回 424。同樣內容重送會重放同一筆；不同內容是新的一筆（finding 只追加）。若中央已收下、但本機關閉紀錄失敗，會回 `local_close_failed`：**重送完全相同的 dismiss（同結果、同備註、同名字）即可完成**，中央會重放同一筆；若改了內容才重送，會多一筆 finding。（若程序在兩步之間被終止，畫面上看不出中央已收下；同樣重送相同內容是安全的，沒有「待處理的斷言」這種持久化狀態。）
 
 `--operator` 是你宣告的操作者名字（預設為本機登入名），**不是經過驗證的身分**；見下方「已知限度」。
 

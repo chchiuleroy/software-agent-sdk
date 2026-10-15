@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import hashlib
+import json
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -3002,8 +3003,11 @@ class EventService:
             raise ResolveError(
                 "assertion_not_possible", "the record has no central approval id"
             )
+        # JSON, not a joined string: "a|b" + "c" and "a" + "b|c" must differ.
         digest = hashlib.sha256(
-            "|".join((record.request_id, outcome.value, note or "", operator)).encode()
+            json.dumps(
+                [record.request_id, outcome.value, note or "", operator]
+            ).encode()
         ).hexdigest()[:32]
         try:
             await client.reconciliation_finding(
@@ -3108,9 +3112,26 @@ class EventService:
                     expected_request_id,
                     outcome,
                 )
-            updated = await self.governance_outbox.mutate(
-                lambda r: apply_close(r, action, expected_request_id, note, operator)
-            )
+            try:
+                updated = await self.governance_outbox.mutate(
+                    lambda r: apply_close(
+                        r, action, expected_request_id, note, operator, outcome
+                    )
+                )
+            except ResolveError:
+                raise
+            except Exception as exc:
+                if central_step != "assertion_filed":
+                    raise
+                # Central has the assertion; the record here is still parked. The
+                # same dismiss (same outcome, note and name) finishes it: central
+                # replays the same finding. A different one would add another.
+                raise ResolveError(
+                    "local_close_failed",
+                    "central took the assertion, but closing the record here "
+                    f"failed ({type(exc).__name__}); repeat the same dismiss "
+                    "(same outcome, note and name) to finish",
+                ) from exc
         else:
             client = self.governance_client
             if client is None:

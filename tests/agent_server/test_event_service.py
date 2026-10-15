@@ -7922,6 +7922,13 @@ class TestEventServiceGovernanceOrchestration:
         await governed_service.governance_outbox.archive_and_clear()
         other_request = await _key(executed, "n", "ada", request_id="req-2")
 
+        # a separator inside the note or the name must not make two statements equal
+        await governed_service.governance_outbox.archive_and_clear()
+        left = await _key(executed, "a|b", "c")
+        await governed_service.governance_outbox.archive_and_clear()
+        right = await _key(executed, "a", "b|c")
+        assert left != right
+
         assert base == again
         assert len({base, other_note, other_name, other_outcome, other_request}) == 5
 
@@ -7955,6 +7962,73 @@ class TestEventServiceGovernanceOrchestration:
         assert exc.value.error_code == "central_failed"
         assert "nothing was changed" in exc.value.detail
         assert governed_service.governance_outbox.load() == before
+
+    @pytest.mark.asyncio
+    async def test_a_local_failure_after_central_took_it_says_so_and_a_repeat_finishes(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        client = self._asserting_central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+        real_mutate = governed_service.governance_outbox.mutate
+        governed_service.governance_outbox.mutate = AsyncMock(
+            side_effect=OSError("disk full")
+        )
+        kwargs = dict(
+            expected_request_id="req-1",
+            note="why",
+            operator="ada",
+            outcome=AttentionOutcome.CONFIRMED_EXECUTED,
+        )
+
+        with pytest.raises(ResolveError) as exc:
+            await governed_service.resolve_needs_attention(
+                AttentionAction.DISMISS, **kwargs
+            )
+
+        assert exc.value.error_code == "local_close_failed"
+        assert "repeat the same dismiss" in exc.value.detail
+        client.reconciliation_finding.assert_awaited_once()
+        first_key = client.reconciliation_finding.call_args.kwargs["idempotency_key"]
+        governed_service.governance_outbox.mutate = real_mutate
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.NEEDS_ATTENTION
+        )
+
+        # the same dismiss again: central is sent the same key (it replays), and the
+        # record closes
+        await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS, **kwargs
+        )
+        assert client.reconciliation_finding.await_count == 2
+        assert (
+            client.reconciliation_finding.call_args.kwargs["idempotency_key"]
+            == first_key
+        )
+        assert (
+            governed_service.governance_outbox.load().state
+            == OutboxState.RESOLVED_MANUALLY
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_local_failure_without_an_assertion_is_not_relabelled(
+        self, governed_service
+    ):
+        await self._park(governed_service, NeedsAttentionReason.REPORT_FAILED)
+        governed_service._conversation = None
+        governed_service.governance_outbox.mutate = AsyncMock(
+            side_effect=OSError("disk full")
+        )
+
+        with pytest.raises(OSError):
+            await governed_service.resolve_needs_attention(
+                AttentionAction.DISMISS,
+                expected_request_id="req-1",
+                note="why",
+                operator="ada",
+            )
 
     @pytest.mark.asyncio
     async def test_an_outcome_is_refused_where_the_action_cannot_have_run(

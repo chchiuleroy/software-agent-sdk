@@ -430,13 +430,14 @@ def apply_close(
     expected_request_id: str,
     note: str | None,
     operator: str,
+    outcome: AttentionOutcome | None = None,
 ) -> OutboxRecord:
     """Ends a parked record: ``abandon`` -> CANCELLED, ``dismiss`` ->
     RESOLVED_MANUALLY. The reason and error code stay as the history of why;
     ``operator`` is recorded as declared (see ``ResolveRequest.operator``)."""
     if action is AttentionAction.RETRY:
         raise ValueError("retry does not close a record")
-    check_resolvable(record, action, expected_request_id)
+    check_resolvable(record, action, expected_request_id, outcome)
     record.state = (
         OutboxState.CANCELLED
         if action is AttentionAction.ABANDON

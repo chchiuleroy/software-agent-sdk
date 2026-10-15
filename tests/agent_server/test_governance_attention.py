@@ -718,3 +718,20 @@ def test_check_resolvable_refuses_an_outcome_the_reason_does_not_allow():
         )
         is allowed
     )
+
+
+def test_apply_close_rechecks_the_outcome_it_is_given():
+    """It runs inside the locked write on the freshly read record, so an outcome
+    the record no longer allows cannot close it."""
+    outcome = attention.AttentionOutcome.CONFIRMED_EXECUTED
+    parked = _parked(NeedsAttentionReason.CLAIM_FAILED)
+    err = _error_of(
+        apply_close, parked, AttentionAction.DISMISS, "req-1", "n", "ada", outcome
+    )
+    assert err.error_code == "outcome_not_allowed"
+    assert parked.state == OutboxState.NEEDS_ATTENTION
+    assert parked.resolved_by is None
+
+    allowed = _parked(NeedsAttentionReason.REPORT_FAILED)
+    apply_close(allowed, AttentionAction.DISMISS, "req-1", "n", "ada", outcome)
+    assert allowed.state == OutboxState.RESOLVED_MANUALLY
