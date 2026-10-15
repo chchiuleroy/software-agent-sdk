@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 import json
-import re
 import shutil
 import threading
 import time
@@ -9198,13 +9197,49 @@ class TestEventServiceGovernanceOrchestration:
         assert keys[0] != keys[1]
 
     @pytest.mark.asyncio
-    async def test_an_odd_reason_text_is_sent_as_a_code_central_accepts(
-        self, governed_service
+    @pytest.mark.parametrize("reason", [r.value for r in NeedsAttentionReason])
+    async def test_every_known_reason_is_sent_as_itself(self, governed_service, reason):
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+
+        def _set(r: OutboxRecord) -> OutboxRecord:
+            r.needs_attention_reason = reason
+            return r
+
+        await governed_service.governance_outbox.mutate(_set)
+        client = self._central()
+        governed_service.governance_client = client
+        governed_service._conversation = None
+
+        await governed_service.resolve_needs_attention(
+            AttentionAction.DISMISS,
+            expected_request_id="req-1",
+            note="x",
+            operator="op",
+        )
+
+        assert client.attention_resolution.call_args.kwargs["reason"] == reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "odd",
+        [
+            "some new reason: with spaces" + "x" * 100,
+            "internal-id-1234 and a path C:/somewhere",
+            "",
+            "claim_failed ",
+            "CLAIM_FAILED",
+        ],
+    )
+    async def test_a_reason_this_code_does_not_know_is_sent_as_unknown(
+        self, governed_service, odd
     ):
+        """A reason is mapped, not cleaned: text that is not one of ours never
+        leaves the device in any form, and different texts do not collapse into
+        look-alike codes."""
         await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
 
         def _odd(r: OutboxRecord) -> OutboxRecord:
-            r.needs_attention_reason = "some new reason: with spaces" + "x" * 100
+            r.needs_attention_reason = odd
             return r
 
         await governed_service.governance_outbox.mutate(_odd)
@@ -9219,8 +9254,55 @@ class TestEventServiceGovernanceOrchestration:
             operator="op",
         )
 
-        reason = client.attention_resolution.call_args.kwargs["reason"]
-        assert re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", reason), reason
+        sent = client.attention_resolution.call_args
+        assert sent.kwargs["reason"] == "unknown"
+        assert "internal-id" not in repr(sent) and "somewhere" not in repr(sent)
+
+    @pytest.mark.asyncio
+    async def test_a_slow_central_audit_does_not_hold_the_next_resolve(
+        self, governed_service
+    ):
+        """The audit is sent after the resolve lock is released: while it is still
+        waiting on central, another resolve of the same conversation is checked and
+        answered at once (here refused, the record having moved on)."""
+        await self._park(governed_service, NeedsAttentionReason.CLAIM_FAILED)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {"id": "event-1"}
+
+        client = self._central(attention_resolution=AsyncMock(side_effect=_slow))
+        governed_service.governance_client = client
+        governed_service._ensure_claim_redispatch_task = MagicMock()
+
+        first = asyncio.ensure_future(
+            governed_service.resolve_needs_attention(
+                AttentionAction.RETRY,
+                expected_request_id="req-1",
+                note=None,
+                operator="op",
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        try:
+            with pytest.raises(ResolveError) as exc:
+                await asyncio.wait_for(
+                    governed_service.resolve_needs_attention(
+                        AttentionAction.RETRY,
+                        expected_request_id="req-1",
+                        note=None,
+                        operator="op",
+                    ),
+                    timeout=2,
+                )
+            assert exc.value.error_code == "state_changed"
+        finally:
+            release.set()
+        result = await asyncio.wait_for(first, timeout=5)
+        assert result.central_audit == "recorded"
 
     @pytest.mark.asyncio
     async def test_without_a_central_client_there_is_nothing_to_tell(

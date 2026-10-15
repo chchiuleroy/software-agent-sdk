@@ -2,7 +2,6 @@ import asyncio
 import functools
 import hashlib
 import json
-import re
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -162,6 +161,7 @@ logger = get_logger(__name__)
 # How long resolving a record waits for central to take the audit event: the action
 # has already happened, so a slow central must not hold the operator.
 _ATTENTION_AUDIT_TIMEOUT_SECONDS = 10.0
+_KNOWN_ATTENTION_REASONS = frozenset(r.value for r in NeedsAttentionReason)
 
 
 class CredentialBindingActivationTooLate(RuntimeError):
@@ -3059,10 +3059,14 @@ class EventService:
         client = self.governance_client
         if client is None or record.central_approval_id is None:
             return "not_applicable"
-        # a code, as central wants it (letters, digits, _ . -); anything else is cut
-        reason = re.sub(
-            r"[^A-Za-z0-9_.-]", "_", record.needs_attention_reason or "unknown"
-        )[:64]
+        # Only a reason this code knows is sent; anything else is "unknown" (a field
+        # that is sanitised instead of mapped could carry text, and different texts
+        # would collapse into one).
+        reason = (
+            record.needs_attention_reason
+            if record.needs_attention_reason in _KNOWN_ATTENTION_REASONS
+            else "unknown"
+        )
         try:
             await asyncio.wait_for(
                 client.attention_resolution(
@@ -3114,13 +3118,19 @@ class EventService:
         run one at a time: a second one is checked against what the first left.
         """
         async with self._resolve_lock:
-            return await self._resolve_needs_attention_locked(
+            response, record = await self._resolve_needs_attention_locked(
                 action,
                 expected_request_id=expected_request_id,
                 note=note,
                 operator=operator,
                 outcome=outcome,
             )
+        # Outside the lock: the action is done, and a slow central must not hold
+        # up the next resolve of this conversation.
+        response.central_audit = await self._record_attention_resolution(
+            record, action, operator, outcome
+        )
+        return response
 
     async def _resolve_needs_attention_locked(
         self,
@@ -3130,7 +3140,9 @@ class EventService:
         note: str | None,
         operator: str,
         outcome: AttentionOutcome | None = None,
-    ) -> ResolveResponse:
+    ) -> tuple[ResolveResponse, OutboxRecord]:
+        """The resolve itself, under the lock. Returns the answer and the record as it
+        was before the action (what the audit event is built from)."""
         if self.governance_deployment_mode != "team":
             raise ResolveError("not_team_mode", "governance is not in team mode")
         record = check_resolvable(
@@ -3231,22 +3243,19 @@ class EventService:
             record.request_id,
             updated.state.value,
         )
-        central_audit = await self._record_attention_resolution(
-            record, action, operator, outcome
-        )
-        return ResolveResponse(
+        response = ResolveResponse(
             conversation_id=str(self.stored.id),
             action=action,
             request_id=record.request_id,
             new_state=updated.state.value,
             central_step=central_step,
-            central_audit=central_audit,
             conversation_still_waiting=(
                 None
                 if action is AttentionAction.RETRY
                 else await self._action_still_pending(record.action_event_id)
             ),
         )
+        return response, record
 
     async def run_and_wait_for_start(
         self, *, central_approval_id: str, timeout_seconds: float = 20.0
