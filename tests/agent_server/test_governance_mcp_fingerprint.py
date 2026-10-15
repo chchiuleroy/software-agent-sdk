@@ -112,6 +112,15 @@ def test_a_non_string_key_is_refused_not_turned_into_a_string():
     assert fp(schema={"1": "x"})  # the string key is fine
 
 
+def test_a_tuple_is_refused_not_given_the_fingerprint_of_the_same_list():
+    """json.dumps writes (1, 2) and [1, 2] identically; only a list is JSON."""
+    assert fp(schema={"x": [1, 2]})
+    with pytest.raises(TypeError):
+        fp(schema={"x": (1, 2)})
+    with pytest.raises(TypeError):
+        fp(schema={"anyOf": [{"enum": (1, 2)}]})
+
+
 def test_what_is_hashed_is_the_tool_and_nothing_around_it():
     """The same three fields give the same fingerprint however the caller got them."""
     a = mcp_tool_fingerprint("t", "d", {"type": "object"})

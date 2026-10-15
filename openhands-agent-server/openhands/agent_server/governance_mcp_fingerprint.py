@@ -39,6 +39,9 @@ def _require_plain_json(value: Any) -> None:
             if not isinstance(key, str):
                 raise TypeError(f"schema key {key!r} is not a string")
             _require_plain_json(item)
+    elif isinstance(value, tuple):
+        # json.dumps writes a tuple as an array, the same bytes as the list
+        raise TypeError("schema holds a tuple; JSON has only lists")
     elif isinstance(value, list):
         for item in value:
             _require_plain_json(item)
