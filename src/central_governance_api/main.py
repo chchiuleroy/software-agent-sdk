@@ -50,6 +50,7 @@ from central_governance_api.approvals.errors import (
     LateReportNotApplicableError,
     RecordNotFoundError,
     RecordNotTerminalError,
+    SelfVerificationNotAllowedError,
 )
 from central_governance_api.approvals.idempotency import IdempotencyKeyReusedError
 from central_governance_api.approvals.state_machine import IllegalTransitionError
@@ -82,6 +83,9 @@ from central_governance_api.routers.devices import router as devices_router
 from central_governance_api.routers.health import router as health_router
 from central_governance_api.routers.inbox import router as inbox_router
 from central_governance_api.routers.me import router as me_router
+from central_governance_api.routers.reconciliation import (
+    router as reconciliation_router,
+)
 from central_governance_api.routers.tool_permissions import (
     admin_router as tool_permissions_admin_router,
 )
@@ -108,6 +112,7 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     ExecutionCommitmentRequiredError: (400, "execution_commitment_required"),
     RecordNotTerminalError: (409, "record_not_terminal"),
     LateReportNotApplicableError: (409, "late_report_not_applicable"),
+    SelfVerificationNotAllowedError: (409, "cannot_verify_own_request"),
     RecordNotFoundError: (404, "record_not_found"),
     DigestMismatchError: (400, "digest_mismatch"),
     InvalidCursorError: (400, "invalid_cursor"),
@@ -191,6 +196,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(approvals_router)
     app.include_router(devices_router)
     app.include_router(audit_router)
+    app.include_router(reconciliation_router)
     app.include_router(inbox_router)
     app.include_router(account_requests_router)
     app.include_router(admin_accounts_router)

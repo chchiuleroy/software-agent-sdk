@@ -83,6 +83,7 @@ from central_governance_api.approvals.errors import (
     LateReportNotApplicableError,
     RecordNotFoundError,
     RecordNotTerminalError,
+    SelfVerificationNotAllowedError,
 )
 from central_governance_api.approvals.idempotency import (
     commit_or_replay,
@@ -867,6 +868,12 @@ async def create_reconciliation_finding(
     record = await _load_record(session, approval_id)
     action = _FINDING_TYPE_ACTIONS[body.finding_type]
     authorize_on_record(principal, action, _ownership(record))
+    if (
+        body.finding_type == "admin_verified"
+        and principal.issuer == record.requester_issuer
+        and principal.sub == record.requester_sub
+    ):
+        raise SelfVerificationNotAllowedError(approval_id=approval_id)
 
     current = ApprovalStatus(record.status)
     if not is_terminal(current):

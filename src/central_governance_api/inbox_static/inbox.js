@@ -20,6 +20,9 @@ const STORAGE_HASH = "inbox_hash";
 const DEVICES_PAGE = 50;
 const DEVICES_MAX = 200; // GET /api/v1/devices rejects a larger limit
 const AUDIT_PAGE = 50;
+const QUEUE_PAGE = 50;
+const NOTE_MAX = 500;
+const NOTE_SHOWN = 2000; // what the server sends of a note at most
 
 // ---------------------------------------------------------------- pure helpers
 // (exported so tests/js/inbox.test.mjs can run them under Node)
@@ -183,6 +186,16 @@ export const SECTIONS = [
     title: "Audit",
     audience: "admin",
     requiredRoles: ["governance.admin", "governance.superadmin"],
+    status: "live",
+  },
+  // Records that ended failed_unknown (the action may or may not have run) and
+  // need an independent check. Governance.admin only: the finding it files is
+  // authorised for that role alone, and superadmin is not a superset of it.
+  {
+    id: "reconciliation",
+    title: "Reconciliation",
+    audience: "admin",
+    requiredRoles: ["governance.admin"],
     status: "live",
   },
 ];
@@ -387,6 +400,94 @@ export function describeAuditEvent(item, me) {
   };
 }
 
+// -------------------------------------------------------- reconciliation queue
+// Rows of GET /api/v1/reconciliation-queue. Notes and evidence were written by a
+// requester or an administrator: untrusted text, shown as text only.
+
+export const QUEUE_FILTERS = [
+  ["false", "Needs verification"],
+  ["true", "Already verified"],
+  ["", "All"],
+];
+
+export const CONCLUSIONS = [
+  ["confirmed_not_executed", "Confirmed: it did NOT run"],
+  ["confirmed_executed", "Confirmed: it DID run"],
+  ["inconclusive", "Could not tell"],
+];
+
+export function queuePath(admin_verified, cursor, limit = QUEUE_PAGE) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (admin_verified === "true" || admin_verified === "false") {
+    params.set("admin_verified", admin_verified);
+  }
+  if (cursor) params.set("cursor", String(cursor));
+  return `/api/v1/reconciliation-queue?${params.toString()}`;
+}
+
+// How many findings the record has in all: the server says, and never fewer
+// than the ones it sent.
+function shownCount(item) {
+  const shown = Array.isArray(item.findings) ? item.findings.length : 0;
+  const total = Number.isInteger(item.findings_total) ? item.findings_total : 0;
+  return Math.max(shown, total);
+}
+
+export function describeQueueItem(item, me) {
+  const requester = ownerLabel(item.requester, me);
+  return {
+    id: String(item.id),
+    tool: truncate(item.tool_name ?? "", 80),
+    summary: truncate(item.action_summary ?? "", 300),
+    payload: payloadText(item.action_payload),
+    requester,
+    device: truncate(item.origin_device_id ?? "", 80),
+    conversation: truncate(item.conversation_id ?? "", 80),
+    created: formatUtc(item.created_at),
+    verified: item.admin_verified === true,
+    // Central refuses an admin_verified from the requester itself (409), so the
+    // form is not offered; the server stays the authority.
+    canVerify: !requester.mine,
+    findingsTotal: shownCount(item),
+    findings: (Array.isArray(item.findings) ? item.findings : []).map((f) => ({
+      type: truncate(f.finding_type ?? "", 40),
+      conclusion: f.conclusion ? truncate(f.conclusion, 40) : "no conclusion",
+      note: truncate(f.note ?? "", NOTE_SHOWN),
+      noteCut: f.note_truncated === true,
+      evidenceCut: f.evidence_truncated === true,
+      verifier: ownerLabel(f.verifier, me),
+      when: formatUtc(f.created_at),
+      evidence: f.evidence ? payloadText(f.evidence) : "",
+    })),
+  };
+}
+
+// The body of the finding an administrator files. Returns null for a conclusion
+// the server does not know, so a stale or tampered form cannot send one.
+export function verificationBody(conclusion, note) {
+  if (!CONCLUSIONS.some(([value]) => value === conclusion)) return null;
+  return {
+    finding_type: "admin_verified",
+    conclusion,
+    note: String(note ?? "").trim().slice(0, NOTE_MAX),
+  };
+}
+
+export function verifyConfirmText(view, conclusion) {
+  const label =
+    CONCLUSIONS.find(([value]) => value === conclusion)?.[1] ?? conclusion;
+  return [
+    "Record this verification?",
+    "",
+    `${view.tool} requested by ${view.requester.short}`,
+    view.summary,
+    "",
+    `Your finding: ${label}`,
+    "",
+    "It is kept as evidence. It does not change the request's status.",
+  ].join("\n");
+}
+
 // ------------------------------------------------------------------- rendering
 // `doc` is a Document (or a test double): no innerHTML, only text nodes.
 
@@ -499,6 +600,108 @@ export function renderAuditEvent(doc, view) {
   return li;
 }
 
+export function renderQueueItem(doc, view, onVerify) {
+  const li = el(doc, "li", undefined, view.verified ? "item queue verified" : "item queue");
+  li.appendChild(el(doc, "h2", view.tool));
+  const facts = el(doc, "dl");
+  const rows = [
+    ["Request", view.summary],
+    ["Requested", view.created],
+    ["Device", view.device],
+    ["Conversation", view.conversation],
+  ];
+  for (const [label, value] of rows) {
+    facts.appendChild(el(doc, "dt", label));
+    facts.appendChild(el(doc, "dd", value));
+  }
+  const by = el(
+    doc,
+    "dd",
+    view.requester.mine ? `${view.requester.short} (you)` : view.requester.short,
+  );
+  by.title = view.requester.full;
+  facts.appendChild(el(doc, "dt", "Requester"));
+  facts.appendChild(by);
+  li.appendChild(facts);
+  if (view.payload) {
+    const details = el(doc, "details");
+    details.appendChild(el(doc, "summary", "What was requested"));
+    details.appendChild(el(doc, "pre", view.payload));
+    li.appendChild(details);
+  }
+  li.appendChild(
+    el(
+      doc,
+      "h3",
+      view.findingsTotal === 0
+        ? "No findings yet"
+        : `Findings (${view.findingsTotal})`,
+    ),
+  );
+  if (view.findingsTotal > view.findings.length) {
+    li.appendChild(
+      el(
+        doc,
+        "p",
+        `Showing the newest ${view.findings.length}; ${view.findingsTotal - view.findings.length} earlier finding(s) are not shown.`,
+        "note",
+      ),
+    );
+  }
+  for (const f of view.findings) {
+    const row = el(doc, "div", undefined, "finding");
+    const who = f.verifier.mine ? `${f.verifier.short} (you)` : f.verifier.short;
+    const head = el(doc, "p", `${f.type}: ${f.conclusion}, by ${who}, ${f.when}`);
+    head.title = f.verifier.full;
+    row.appendChild(head);
+    if (f.note) {
+      row.appendChild(
+        el(doc, "p", f.noteCut ? `${f.note} (cut: the note is longer)` : f.note, "claim"),
+      );
+    }
+    if (f.evidenceCut) {
+      row.appendChild(el(doc, "p", "Evidence left out: it is too large to show.", "note"));
+    }
+    if (f.evidence) {
+      const details = el(doc, "details");
+      details.appendChild(el(doc, "summary", "Evidence"));
+      details.appendChild(el(doc, "pre", f.evidence));
+      row.appendChild(details);
+    }
+    li.appendChild(row);
+  }
+  if (!view.canVerify) {
+    li.appendChild(
+      el(
+        doc,
+        "p",
+        "You made this request, so someone else has to verify it.",
+        "note",
+      ),
+    );
+    return li;
+  }
+  const form = el(doc, "div", undefined, "actions");
+  const choice = el(doc, "select");
+  for (const [value, label] of CONCLUSIONS) {
+    const option = el(doc, "option", label);
+    option.value = value;
+    choice.appendChild(option);
+  }
+  const note = el(doc, "input");
+  note.type = "text";
+  note.maxLength = NOTE_MAX;
+  note.placeholder = "How you checked (kept with the finding)";
+  const button = el(doc, "button", "Record verification", "accept");
+  button.type = "button";
+  button.addEventListener("click", () => onVerify(view, choice.value, note.value));
+  form.appendChild(choice);
+  form.appendChild(note);
+  form.appendChild(button);
+  li.appendChild(form);
+  return li;
+}
+
 export function renderDevice(doc, view, onRevoke) {
   const li = el(
     doc,
@@ -587,6 +790,11 @@ async function main() {
   const auditApplyEl = document.getElementById("audit-apply");
   const auditTypeEl = document.getElementById("audit-type");
   const auditApprovalEl = document.getElementById("audit-approval");
+  const queueEl = document.getElementById("reconciliation");
+  const queueListEl = document.getElementById("queue-list");
+  const queueMoreEl = document.getElementById("queue-more");
+  const queueRefreshEl = document.getElementById("queue-refresh");
+  const queueFilterEl = document.getElementById("queue-filter");
   const whoEl = document.getElementById("who");
   const signoutEl = document.getElementById("signout");
   const say = (message) => {
@@ -642,6 +850,12 @@ async function main() {
   let auditNextCursor = null;
   let auditFilters = { eventType: "", approvalId: "" };
   let auditSeq = 0;
+  // The Reconciliation screen: same shape as Audit (cursor paging, filter kept
+  // for every page of one walk, stale responses dropped).
+  let queue = [];
+  let queueNextCursor = null;
+  let queueFilter = "false";
+  let queueSeq = 0;
 
   function signOut(message) {
     token = null;
@@ -659,6 +873,12 @@ async function main() {
     auditListEl.replaceChildren();
     auditMoreEl.hidden = true;
     auditEl.hidden = true;
+    queue = [];
+    queueNextCursor = null;
+    queueSeq += 1;
+    queueListEl.replaceChildren();
+    queueMoreEl.hidden = true;
+    queueEl.hidden = true;
     listEl.replaceChildren();
     navEl.replaceChildren();
     navEl.hidden = true;
@@ -880,6 +1100,114 @@ async function main() {
     );
   }
 
+  function renderQueue() {
+    queueListEl.replaceChildren(
+      ...queue.map((item) =>
+        renderQueueItem(document, describeQueueItem(item, meInfo), verifyItem),
+      ),
+    );
+    queueMoreEl.hidden = queueNextCursor === null;
+  }
+
+  // reset: start again from the first page with the filter now in the form;
+  // otherwise append the next page of the same walk. `notice` goes in front of
+  // the count line (e.g. after a verification).
+  async function loadQueue(reset, notice = "") {
+    if (!token) return;
+    if (!reset && queueNextCursor === null) return;
+    if (Date.now() >= expiresAtMs) {
+      signOut("Your session expired. Sign in again.");
+      return;
+    }
+    if (reset) queueFilter = queueFilterEl.value;
+    const seq = (queueSeq += 1);
+    let response;
+    try {
+      response = await api(
+        queuePath(queueFilter, reset ? null : queueNextCursor),
+      );
+    } catch {
+      if (token && seq === queueSeq && active === "reconciliation") {
+        say("Could not reach the server.");
+      }
+      return;
+    }
+    // A newer request, or another section, now owns the status line.
+    if (seq !== queueSeq || active !== "reconciliation") return;
+    if (response.status === 403) {
+      say("This account may not read the reconciliation queue (needs governance.admin).");
+      return;
+    }
+    if (!response.ok) {
+      say(`Could not load the queue (HTTP ${response.status}).`);
+      return;
+    }
+    const body = await response.json();
+    if (seq !== queueSeq || active !== "reconciliation") return;
+    queue = reset ? body.items : [...queue, ...body.items];
+    queueNextCursor = body.next_cursor ?? null;
+    renderQueue();
+    say(
+      `${notice}${
+        queue.length === 0
+          ? "Nothing to show."
+          : `${queue.length} record(s), newest first${queueNextCursor === null ? "" : " (more available)"}.`
+      }`,
+    );
+  }
+
+  async function verifyItem(view, conclusion, note) {
+    const body = verificationBody(conclusion, note);
+    if (body === null) {
+      sayIn("reconciliation", "Choose what you found first.");
+      return;
+    }
+    if (!window.confirm(verifyConfirmText(view, conclusion))) return;
+    const keyId = `verify:${view.id}:${conclusion}:${body.note}`;
+    // Same key for a retry of the same click, so a lost response is safe; a
+    // changed note or conclusion is a different finding and gets a new key.
+    if (!idempotencyKeys.has(keyId)) {
+      idempotencyKeys.set(keyId, crypto.randomUUID());
+    }
+    let response;
+    try {
+      response = await api(
+        `/api/v1/approvals/${encodeURIComponent(view.id)}/reconciliation-findings`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotencyKeys.get(keyId),
+          },
+          body: JSON.stringify(body),
+        },
+      );
+    } catch {
+      sayIn("reconciliation", "Could not reach the server.");
+      return;
+    }
+    if (response.ok) {
+      idempotencyKeys.delete(keyId);
+      await loadQueue(true, "Verification recorded. ");
+      return;
+    }
+    let code = "";
+    try {
+      code = String((await response.json()).error_code ?? "");
+    } catch {
+      code = "";
+    }
+    if (response.status === 409 && code === "cannot_verify_own_request") {
+      sayIn("reconciliation", "You made this request, so someone else has to verify it.");
+    } else if (response.status === 403) {
+      sayIn("reconciliation", "Not allowed: verifying needs the governance.admin role.");
+    } else if (response.status === 404) {
+      sayIn("reconciliation", "That record no longer exists.");
+    } else {
+      sayIn("reconciliation", `The verification was not accepted (HTTP ${response.status}).`);
+    }
+  }
+
   // What each live section shows and what it does when opened. A section in
   // SECTIONS only works if it has an entry here.
   const PANELS = {
@@ -887,6 +1215,7 @@ async function main() {
     approvals: { el: approvalsEl, open: refresh },
     devices: { el: devicesEl, open: () => loadDevices(true) },
     audit: { el: auditEl, open: () => loadAudit(true) },
+    reconciliation: { el: queueEl, open: () => loadQueue(true) },
   };
 
   function showSection() {
@@ -986,6 +1315,15 @@ async function main() {
   auditRefreshEl.addEventListener("click", () => loadAudit(true));
   auditApplyEl.addEventListener("click", () => loadAudit(true));
   auditMoreEl.addEventListener("click", () => loadAudit(false));
+  queueRefreshEl.addEventListener("click", () => loadQueue(true));
+  queueMoreEl.addEventListener("click", () => loadQueue(false));
+  queueFilterEl.addEventListener("change", () => loadQueue(true));
+  for (const [value, label] of QUEUE_FILTERS) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    queueFilterEl.appendChild(option);
+  }
   for (const type of AUDIT_EVENT_TYPES) {
     const option = document.createElement("option");
     option.value = type;

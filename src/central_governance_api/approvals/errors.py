@@ -127,6 +127,21 @@ class RecordNotTerminalError(Exception):
         )
 
 
+class SelfVerificationNotAllowedError(Exception):
+    """RECONCILIATION-FINDINGS only: an ``admin_verified`` finding says an
+    administrator checked what really happened. The principal who made the request
+    cannot be that independent check on its own request, so the finding is refused
+    when the verifier is the requester (same issuer and subject). Maps to HTTP 409.
+    The message is safe to show: it carries only the approval id."""
+
+    def __init__(self, *, approval_id: uuid.UUID) -> None:
+        self.approval_id = approval_id
+        super().__init__(
+            f"approval {approval_id} was requested by this same principal; "
+            "an admin_verified finding must come from someone else"
+        )
+
+
 class LateReportNotApplicableError(Exception):
     """RECONCILIATION-FINDINGS only: a ``late_report`` is the requester's
     own device reporting the real outcome of an attempt after central

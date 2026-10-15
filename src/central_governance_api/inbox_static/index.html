@@ -60,6 +60,24 @@
         <ul id="audit-list" aria-live="polite"></ul>
         <button id="audit-more" type="button" hidden>Load more</button>
       </section>
+      <section id="reconciliation" aria-label="Reconciliation" hidden>
+        <p class="note">
+          Requests that ended without a report: the action may or may not have
+          run. Check what really happened (in the system the action touched),
+          then record it. A finding is evidence and does not change the
+          request's status; the requester's own account of it is shown beside
+          yours. You cannot verify a request you made yourself.
+        </p>
+        <div class="toolbar">
+          <label>
+            Show
+            <select id="queue-filter"></select>
+          </label>
+          <button id="queue-refresh" type="button">Refresh</button>
+        </div>
+        <ul id="queue-list" aria-live="polite"></ul>
+        <button id="queue-more" type="button" hidden>Load more</button>
+      </section>
     </main>
     <script type="module" src="/inbox/inbox.js"></script>
   </body>
