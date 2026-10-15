@@ -6,6 +6,7 @@ have no behavior of their own beyond field validation.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -193,12 +194,37 @@ class CancelResponse(BaseModel):
     status: str
 
 
+# What one reconciliation finding may carry. The queue endpoint
+# (routers/reconciliation.py) shows a note up to the same length and an evidence
+# document up to the same size, so nothing a caller is allowed to write is cut when an
+# administrator reads it. The size of ``evidence`` that counts is the length of its
+# jsonb as text, the way PostgreSQL itself prints it, which is what the read side
+# measures: the router asks the database (a number such as 1e-100 is printed in full
+# there, so no Python measure can be exact). The check below is only a cheap early
+# refusal on a LOWER bound of that length; it never refuses something the database
+# would accept.
+FINDING_NOTE_MAX_CHARS = 2000
+FINDING_EVIDENCE_MAX_CHARS = 8000
+MAX_FINDINGS_PER_APPROVAL = 100
+
+
+def _contains_nul(value: Any) -> bool:
+    """PostgreSQL's jsonb cannot hold U+0000 in a key or a string."""
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_contains_nul(k) or _contains_nul(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_contains_nul(v) for v in value)
+    return False
+
+
 class ReconciliationFindingRequest(RequestModel):
     finding_type: Literal["requester_assertion", "admin_verified", "late_report"]
     conclusion: (
         Literal["confirmed_not_executed", "confirmed_executed", "inconclusive"] | None
     ) = None
-    note: str = ""
+    note: str = Field(default="", max_length=FINDING_NOTE_MAX_CHARS)
     evidence: dict[str, Any] | None = None
     execution_attempt_id: uuid.UUID | None = Field(
         default=None,
@@ -206,6 +232,25 @@ class ReconciliationFindingRequest(RequestModel):
         "attempt this late report is about. Must match the record's own "
         "attempt, and is stored with the finding.",
     )
+
+    @model_validator(mode="after")
+    def _evidence_is_bounded(self) -> ReconciliationFindingRequest:
+        if "\x00" in self.note:
+            raise ValueError("note holds a NUL character, which cannot be stored")
+        if self.evidence is not None:
+            if _contains_nul(self.evidence):
+                raise ValueError(
+                    "evidence holds a NUL character, which cannot be stored"
+                )
+            size = len(
+                json.dumps(self.evidence, ensure_ascii=False, separators=(", ", ": "))
+            )
+            if size > FINDING_EVIDENCE_MAX_CHARS:
+                raise ValueError(
+                    f"evidence is {size} characters as JSON; at most "
+                    f"{FINDING_EVIDENCE_MAX_CHARS} are accepted"
+                )
+        return self
 
     @model_validator(mode="after")
     def _attempt_id_only_for_late_report(self) -> ReconciliationFindingRequest:

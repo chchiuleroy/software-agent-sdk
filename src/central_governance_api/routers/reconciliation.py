@@ -44,6 +44,10 @@ from pydantic import BaseModel
 from sqlalchemy import Text, case, cast, exists, func, literal, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from central_governance_api.approvals.schemas import (
+    FINDING_EVIDENCE_MAX_CHARS,
+    FINDING_NOTE_MAX_CHARS,
+)
 from central_governance_api.approvals.state_machine import ApprovalStatus
 from central_governance_api.auth.dependencies import get_current_principal
 from central_governance_api.auth.oidc import Principal
@@ -61,8 +65,10 @@ router = APIRouter(prefix="/api/v1/reconciliation-queue", tags=["reconciliation"
 _MAX_LIMIT = 200
 _DEFAULT_LIMIT = 50
 _MAX_FINDINGS = 20
-_NOTE_CHARS = 2000
-_EVIDENCE_CHARS = 8000
+# the same limits the write side enforces (approvals/schemas.py), so a note or an
+# evidence document accepted today is never cut here; older, longer ones still are
+_NOTE_CHARS = FINDING_NOTE_MAX_CHARS
+_EVIDENCE_CHARS = FINDING_EVIDENCE_MAX_CHARS
 
 
 def _require_admin(principal: Principal = Depends(get_current_principal)) -> Principal:

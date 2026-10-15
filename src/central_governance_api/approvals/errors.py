@@ -127,6 +127,33 @@ class RecordNotTerminalError(Exception):
         )
 
 
+class EvidenceTooLargeError(Exception):
+    """RECONCILIATION-FINDINGS only: the evidence, as the database prints its jsonb,
+    is longer than the limit. Maps to HTTP 422. The message is safe to show."""
+
+    def __init__(self, *, size: int, limit: int) -> None:
+        self.size = size
+        self.limit = limit
+        super().__init__(
+            f"evidence is {size} characters as stored; at most {limit} are accepted"
+        )
+
+
+class TooManyFindingsError(Exception):
+    """RECONCILIATION-FINDINGS only: one approval may hold at most
+    ``MAX_FINDINGS_PER_APPROVAL`` findings (the table is append-only, so without a
+    limit a requester could add them without end). The count is read under a lock on
+    the approval's row, so concurrent findings for one approval are counted one at a
+    time and the limit is exact. Maps to HTTP 409. The message is safe to show."""
+
+    def __init__(self, *, approval_id: uuid.UUID, limit: int) -> None:
+        self.approval_id = approval_id
+        self.limit = limit
+        super().__init__(
+            f"approval {approval_id} already has {limit} findings; no more are accepted"
+        )
+
+
 class SelfVerificationNotAllowedError(Exception):
     """RECONCILIATION-FINDINGS only: an ``admin_verified`` finding says an
     administrator checked what really happened. The principal who made the request
