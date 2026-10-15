@@ -32,6 +32,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update
 
 from central_governance_api.approvals.digest import compute_display_digest
+from central_governance_api.approvals.schemas import MAX_FINDINGS_PER_APPROVAL
 from central_governance_api.approvals.sweep import sweep_expired_approvals
 from central_governance_api.auth.dependencies import get_oidc_resolver
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
@@ -1216,3 +1217,135 @@ async def test_the_limit_binds_every_finding_type_including_the_admin(
     )
     assert resp.status_code == 409
     assert resp.json()["error_code"] == "too_many_findings"
+
+
+async def test_a_nul_character_is_refused_in_a_note_and_anywhere_in_evidence(
+    client, signing_key, db_session
+):
+    """PostgreSQL cannot store U+0000 in text or jsonb: the answer is a clean 422,
+    not a database error."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    nul = chr(0)
+    bodies = [
+        {"note": f"a{nul}b"},
+        {"evidence": {"k": f"a{nul}b"}},
+        {"evidence": {f"k{nul}": "v"}},
+        {"evidence": {"outer": {"inner": [f"x{nul}"]}}},
+    ]
+    for n, body in enumerate(bodies):
+        resp = await _post_finding(client, signing_key, approval_id, body, f"nul-{n}")
+        assert resp.status_code == 422, (body, resp.text)
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_evidence_is_measured_by_the_database_not_by_python(
+    client, signing_key, db_session
+):
+    """1e-100 is 6 characters in the request but PostgreSQL prints it in full (over a
+    hundred): a document that looks small to Python is too large as stored."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    big = await _post_finding(
+        client, signing_key, approval_id, {"evidence": {"k": [1e-100] * 100}}, "sci-big"
+    )
+    assert big.status_code == 422, big.text
+    assert big.json()["error_code"] == "evidence_too_large"
+    assert await _findings_for(db_session, approval_id) == []
+
+    small = await _post_finding(
+        client,
+        signing_key,
+        approval_id,
+        {"evidence": {"k": [1e-100] * 50}},
+        "sci-small",
+    )
+    assert small.status_code == 201, small.text
+    admin = _sign(signing_key, sub="dave", roles=["governance.admin"])
+    items = (
+        await client.get("/api/v1/reconciliation-queue", headers=_auth(admin))
+    ).json()["items"]
+    finding = items[0]["findings"][0]
+    assert finding["evidence_truncated"] is False, "accepted means shown whole"
+    assert len(finding["evidence"]["k"]) == 50
+
+
+async def test_a_late_report_is_measured_with_the_attempt_id_the_service_adds(
+    client, signing_key, db_session
+):
+    """The service adds execution_attempt_id to a late report's evidence; the size
+    that counts is what is stored, so an evidence that fits only before that is
+    refused."""
+    approval_id, attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    # {"k": "<n>"} is n + 9 characters; the added key makes it longer than 8000
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={
+            "finding_type": "late_report",
+            "execution_attempt_id": attempt_id,
+            "evidence": {"k": "x" * 7991},
+        },
+        headers=_auth(token, "late-too-big"),
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error_code"] == "evidence_too_large"
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_only_those_allowed_to_file_a_finding_can_use_up_the_quota(
+    client, signing_key, db_session
+):
+    """Authorization runs before the count: a stranger, a superadmin and a caller
+    with no role are refused and take no place."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    body = {"finding_type": "requester_assertion", "note": "mine now"}
+    for sub, roles in (
+        ("mallory", ["agent.operator"]),
+        ("root", ["governance.superadmin"]),
+        ("nobody", []),
+    ):
+        resp = await client.post(
+            f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+            json=body,
+            headers=_auth(_sign(signing_key, sub=sub, roles=roles), f"quota-{sub}"),
+        )
+        assert resp.status_code == 403, (sub, resp.text)
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_a_success_replays_after_the_quota_filled_up_and_a_refusal_does_not(
+    client, signing_key, db_session
+):
+    """The same Idempotency-Key and body returns the stored success even when the
+    approval is full by now (nothing new is written); a request refused for being
+    over the limit is not stored, so repeating it is refused again."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    first = await _post_finding(
+        client, signing_key, approval_id, {"note": "once"}, "replay-q"
+    )
+    assert first.status_code == 201, first.text
+    for n in range(MAX_FINDINGS_PER_APPROVAL - 1):
+        db_session.add(
+            ReconciliationFinding(
+                approval_request_id=uuid.UUID(approval_id),
+                finding_type="requester_assertion",
+                note=f"n{n}",
+                verifier_issuer=ISSUER,
+                verifier_sub="alice",
+            )
+        )
+    await db_session.flush()
+    again = await _post_finding(
+        client, signing_key, approval_id, {"note": "once"}, "replay-q"
+    )
+    assert again.status_code == 201 and again.json() == first.json()
+    for _ in range(2):
+        over = await _post_finding(
+            client, signing_key, approval_id, {"note": "extra"}, "over-q"
+        )
+        assert over.status_code == 409
+        assert over.json()["error_code"] == "too_many_findings"
+    assert (
+        len(await _findings_for(db_session, approval_id)) == MAX_FINDINGS_PER_APPROVAL
+    )

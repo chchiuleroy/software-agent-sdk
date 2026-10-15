@@ -57,12 +57,13 @@ Pattern shared by every write endpoint below:
 from __future__ import annotations
 
 import hmac
+import json
 import uuid
 from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from central_governance_api.accounts.tool_permissions import ensure_tool_permitted
@@ -77,6 +78,7 @@ from central_governance_api.approvals.digest import verify_display_digest
 from central_governance_api.approvals.errors import (
     ConcurrentModificationError,
     DigestMismatchError,
+    EvidenceTooLargeError,
     ExecutionAttemptMismatchError,
     ExecutionCommitmentMismatchError,
     ExecutionCommitmentRequiredError,
@@ -97,6 +99,7 @@ from central_governance_api.approvals.notify import (
     wait_for_status_change,
 )
 from central_governance_api.approvals.schemas import (
+    FINDING_EVIDENCE_MAX_CHARS,
     MAX_FINDINGS_PER_APPROVAL,
     ApprovalSummary,
     CancelResponse,
@@ -904,6 +907,13 @@ async def create_reconciliation_finding(
             "execution_attempt_id": str(body.execution_attempt_id),
         }
 
+    # Findings of one approval are counted one at a time: the approval's row is
+    # locked until this transaction ends, so the limit below is exact.
+    await session.execute(
+        select(PendingApprovalRecord.id)
+        .where(PendingApprovalRecord.id == approval_id)
+        .with_for_update(key_share=True)
+    )
     existing = await session.scalar(
         select(func.count(ReconciliationFinding.id)).where(
             ReconciliationFinding.approval_request_id == approval_id
@@ -913,6 +923,18 @@ async def create_reconciliation_finding(
         raise TooManyFindingsError(
             approval_id=approval_id, limit=MAX_FINDINGS_PER_APPROVAL
         )
+
+    if evidence is not None:
+        # The database's own measure of what it will store and the queue will show
+        # (see approvals/schemas.py): no Python length is exact for every number.
+        stored_size = await session.scalar(
+            text("SELECT length(CAST(CAST(:doc AS jsonb) AS text))"),
+            {"doc": json.dumps(evidence)},
+        )
+        if (stored_size or 0) > FINDING_EVIDENCE_MAX_CHARS:
+            raise EvidenceTooLargeError(
+                size=stored_size, limit=FINDING_EVIDENCE_MAX_CHARS
+            )
 
     finding = ReconciliationFinding(
         approval_request_id=approval_id,

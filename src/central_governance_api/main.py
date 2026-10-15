@@ -44,6 +44,7 @@ from central_governance_api.approvals.authorize import AuthorizationDeniedError
 from central_governance_api.approvals.errors import (
     ConcurrentModificationError,
     DigestMismatchError,
+    EvidenceTooLargeError,
     ExecutionAttemptMismatchError,
     ExecutionCommitmentMismatchError,
     ExecutionCommitmentRequiredError,
@@ -115,6 +116,7 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     LateReportNotApplicableError: (409, "late_report_not_applicable"),
     SelfVerificationNotAllowedError: (409, "cannot_verify_own_request"),
     TooManyFindingsError: (409, "too_many_findings"),
+    EvidenceTooLargeError: (422, "evidence_too_large"),
     RecordNotFoundError: (404, "record_not_found"),
     DigestMismatchError: (400, "digest_mismatch"),
     InvalidCursorError: (400, "invalid_cursor"),

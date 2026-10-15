@@ -197,11 +197,26 @@ class CancelResponse(BaseModel):
 # What one reconciliation finding may carry. The queue endpoint
 # (routers/reconciliation.py) shows a note up to the same length and an evidence
 # document up to the same size, so nothing a caller is allowed to write is cut when an
-# administrator reads it. ``evidence`` is measured the way PostgreSQL writes jsonb as
-# text (a space after ``,`` and ``:``), because that is what the read side measures.
+# administrator reads it. The size of ``evidence`` that counts is the length of its
+# jsonb as text, the way PostgreSQL itself prints it, which is what the read side
+# measures: the router asks the database (a number such as 1e-100 is printed in full
+# there, so no Python measure can be exact). The check below is only a cheap early
+# refusal on a LOWER bound of that length; it never refuses something the database
+# would accept.
 FINDING_NOTE_MAX_CHARS = 2000
 FINDING_EVIDENCE_MAX_CHARS = 8000
 MAX_FINDINGS_PER_APPROVAL = 100
+
+
+def _contains_nul(value: Any) -> bool:
+    """PostgreSQL's jsonb cannot hold U+0000 in a key or a string."""
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_contains_nul(k) or _contains_nul(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_contains_nul(v) for v in value)
+    return False
 
 
 class ReconciliationFindingRequest(RequestModel):
@@ -220,7 +235,13 @@ class ReconciliationFindingRequest(RequestModel):
 
     @model_validator(mode="after")
     def _evidence_is_bounded(self) -> ReconciliationFindingRequest:
+        if "\x00" in self.note:
+            raise ValueError("note holds a NUL character, which cannot be stored")
         if self.evidence is not None:
+            if _contains_nul(self.evidence):
+                raise ValueError(
+                    "evidence holds a NUL character, which cannot be stored"
+                )
             size = len(
                 json.dumps(self.evidence, ensure_ascii=False, separators=(", ", ": "))
             )
