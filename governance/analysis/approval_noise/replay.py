@@ -372,27 +372,27 @@ def bash_features(command: str, cwd: str | None) -> dict[str, Any]:
         base = head.split()[0]
         heads.append(head)
         flags.update(t for t in tokens if t in _FLAG_WHITELIST)
-        before = len(ops)
+        seg: set[str] = set()
         if head in _VCS_READ or base in _READ_HEADS:
-            ops.add("read")
+            seg.add("read")
         if base in _WRITE_HEADS:
-            ops.add("write")
+            seg.add("write")
         if base in _DELETE_HEADS:
-            ops.add("delete")
+            seg.add("delete")
         if base in _RUNNER_BASES or head in _RUNNER_HEADS:
-            ops.add("runner")
+            seg.add("runner")
         if base in _EXEC_BASES:
-            ops.add("exec_script")
+            seg.add("exec_script")
         if head in _VCS_READ:
-            ops.add("vcs_read")
+            seg.add("vcs_read")
         if head in _VCS_WRITE:
-            ops.add("vcs_write")
+            seg.add("vcs_write")
         if head in _VCS_REMOTE or base == "gh":
-            ops.add("vcs_remote")
+            seg.add("vcs_remote")
         if head in _INSTALL:
-            ops.add("install")
+            seg.add("install")
         if base in ("curl", "wget"):
-            ops.add("network_fetch")
+            seg.add("network_fetch")
             words = {t.upper().strip("\"'") for t in tokens[1:]}
             lowered = [t.lower() for t in tokens[1:]]
             if (
@@ -412,19 +412,20 @@ def bash_features(command: str, cwd: str | None) -> dict[str, Any]:
             ):
                 sends = True
         if base in ("scp", "rsync"):
-            ops.add("network_send")
+            seg.add("network_send")
         if base == "ssh":
-            ops.add("remote_exec")
+            seg.add("remote_exec")
         if base in ("taskkill", "start", "explorer"):
-            ops.add("process")
+            seg.add("process")
         if base in _REMOTE_STATE_HEADS:
-            ops.add("remote_state")
+            seg.add("remote_state")
         if head == "git push":
             sends = True
         if head == "other":
-            ops.add("other")
-        if len(ops) == before:  # a known word that fits no class above: say so
-            ops.add("other")
+            seg.add("other")
+        if not seg:  # a word that fits no class above: say so (per segment)
+            seg.add("other")
+        ops |= seg
         if previous_base in ("curl", "wget") and base in _EXEC_BASES:
             pipe_to_shell = True
         previous_base = base

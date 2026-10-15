@@ -1,0 +1,5 @@
+# The report prints long sentences in f-strings; keep them whole rather than reflow every message.
+extend = "../../pyproject.toml"
+
+[lint]
+extend-ignore = ["E501"]

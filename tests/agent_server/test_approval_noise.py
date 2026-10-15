@@ -607,3 +607,26 @@ def test_an_mcp_call_is_replayed_under_its_real_name_but_written_under_a_safe_on
         replayer.verdict = original
     assert asked == ["mcp__acme_secret__tok"]
     assert out[0]["cc_tool"] == "mcp__other" and "acme" not in json.dumps(out)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd x && ls",
+        "ls | wc -l",
+        "cat a.txt && cat b.txt",
+        "cd a && cd b && ls -la",
+        "git status && git diff",
+    ],
+)
+def test_several_segments_of_the_same_class_do_not_make_an_unclassified_one(command):
+    """Found after the first labelling round: a segment was called unclassified
+    whenever it added nothing NEW to the set, so `cd x && ls` (two reads) got
+    "other", and most Bash ended up undecidable for a wrong reason."""
+    assert "other" not in features(command)["ops"], features(command)["ops"]
+
+
+def test_an_unclassified_segment_still_says_so_among_classified_ones():
+    assert "other" in features("cd x && export FOO=1")["ops"]
+    assert "other" in features("ls && frobnicate --now")["ops"]
+    assert "other" in features("export A=1 && ls")["ops"]
