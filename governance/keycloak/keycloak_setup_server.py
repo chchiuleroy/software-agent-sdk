@@ -298,7 +298,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if created.status_code != 201:
                     detail = ""
                     try:
-                        detail = str(created.json().get("errorMessage", ""))[:120]
+                        # a server may echo the request back: never show the password
+                        detail = str(created.json().get("errorMessage", "")).replace(
+                            pw1, "***"
+                        )[:120]
                     except ValueError:
                         pass
                     STATE["log"].append(
@@ -351,7 +354,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     )
         elif route == "register-client":
             raw_port = form.get("port", "").strip() or "8899"
-            if not raw_port.isdigit() or not 1 <= int(raw_port) <= 65535:
+            if not (raw_port.isascii() and raw_port.isdigit()) or not (
+                1 <= int(raw_port) <= 65535
+            ):
                 STATE["log"].append(f"註冊 client 未執行：埠「{raw_port[:10]}」不合法")
             else:
                 lines: list[str] = []
