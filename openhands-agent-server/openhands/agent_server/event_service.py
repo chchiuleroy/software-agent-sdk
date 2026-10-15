@@ -2,6 +2,7 @@ import asyncio
 import functools
 import hashlib
 import json
+import re
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -157,6 +158,10 @@ WAIT_FOR_DECISION_MIN_RETRY_DELAY_SECONDS = 1.0
 
 
 logger = get_logger(__name__)
+
+# How long resolving a record waits for central to take the audit event: the action
+# has already happened, so a slow central must not hold the operator.
+_ATTENTION_AUDIT_TIMEOUT_SECONDS = 10.0
 
 
 class CredentialBindingActivationTooLate(RuntimeError):
@@ -3038,6 +3043,50 @@ class EventService:
             ) from exc
         return "assertion_filed"
 
+    async def _record_attention_resolution(
+        self,
+        record: OutboxRecord,
+        action: AttentionAction,
+        operator: str,
+        outcome: AttentionOutcome | None,
+    ) -> Literal["recorded", "not_recorded", "not_applicable"]:
+        """Tells central what the operator just did, as an audit event. Best effort by
+        design: this runs after the action has happened here, central being
+        unreachable is exactly when a record needs attention, and an audit gap must
+        not undo or block the action. The result is shown to the operator. No free
+        text is sent (the resolution note stays on this device). A fresh key per
+        resolution: two retries of one record are two events."""
+        client = self.governance_client
+        if client is None or record.central_approval_id is None:
+            return "not_applicable"
+        # a code, as central wants it (letters, digits, _ . -); anything else is cut
+        reason = re.sub(
+            r"[^A-Za-z0-9_.-]", "_", record.needs_attention_reason or "unknown"
+        )[:64]
+        try:
+            await asyncio.wait_for(
+                client.attention_resolution(
+                    record.central_approval_id,
+                    idempotency_key=f"attn-{uuid4().hex}",
+                    action=action.value,
+                    reason=reason[:64],
+                    operator=operator,
+                    outcome=outcome.value if outcome is not None else None,
+                ),
+                timeout=_ATTENTION_AUDIT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001  (best effort; any failure is the same to the caller)
+            logger.warning(
+                "central was not told what the operator did on conversation %s "
+                "(action=%s, request_id=%s): %s",
+                self.stored.id,
+                action.value,
+                record.request_id,
+                type(exc).__name__,
+            )
+            return "not_recorded"
+        return "recorded"
+
     async def resolve_needs_attention(
         self,
         action: AttentionAction,
@@ -3182,12 +3231,16 @@ class EventService:
             record.request_id,
             updated.state.value,
         )
+        central_audit = await self._record_attention_resolution(
+            record, action, operator, outcome
+        )
         return ResolveResponse(
             conversation_id=str(self.stored.id),
             action=action,
             request_id=record.request_id,
             new_state=updated.state.value,
             central_step=central_step,
+            central_audit=central_audit,
             conversation_still_waiting=(
                 None
                 if action is AttentionAction.RETRY

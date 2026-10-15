@@ -329,6 +329,13 @@ class ResolveResponse(BaseModel):
     central_step: Literal[
         "not_applicable", "cancelled", "aborted", "already_terminal", "assertion_filed"
     ]
+    central_audit: Literal["recorded", "not_recorded", "not_applicable"] = Field(
+        default="not_applicable",
+        description="Whether central was told what the operator did (an audit event, "
+        "item 1.11). Best effort: the action above has happened either way. "
+        "'not_recorded' means central could not be reached or refused it; "
+        "'not_applicable' means the record never reached central.",
+    )
     conversation_still_waiting: bool | None = Field(
         description="True if the conversation is still waiting for confirmation of "
         "this very action. The record no longer governs it, so it must be rejected "

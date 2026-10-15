@@ -151,6 +151,17 @@ class _FaultProxy(BaseHTTPRequestHandler):
     def _forward(self, method: str):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
+        is_audit = method == "POST" and self.path.endswith("/attention-resolutions")
+        if is_audit and FAULT["audits"] > 0:
+            FAULT["audits"] -= 1
+            FAULT["refused"] += 1
+            payload = json.dumps({"detail": "injected"}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if method == "POST" and self.path.endswith("/claim") and FAULT["claims"] > 0:
             FAULT["claims"] -= 1
             FAULT["refused"] += 1
@@ -195,7 +206,7 @@ class _FaultProxy(BaseHTTPRequestHandler):
         pass
 
 
-FAULT = {"claims": 0, "refused": 0}
+FAULT = {"claims": 0, "audits": 0, "refused": 0}
 
 
 def _chat_response(message: dict) -> bytes:
@@ -1129,11 +1140,139 @@ async def main():
                     outbox_of(cid2) == before2 and findings(cid2) == "",
                 )
 
+            def audit_events(cid):
+                return q(
+                    "select (payload->>'action') || '|' || (payload->>'reason') || '|' "
+                    "|| (payload->>'operator') || '|' "
+                    "|| coalesce(payload->>'operator_self_declared', '') || '|' "
+                    "|| coalesce(payload->>'outcome', '') "
+                    "from admin_audit_events where event_type = 'attention_resolved' "
+                    f"and approval_request_id = '{approval_id(cid)}' "
+                    "order by occurred_at, id"
+                )
+
+            async def scenario_audit():
+                """Item 1.11, option B: what an operator did reaches central's audit
+                trail. Abandon, dismiss, dismiss with an outcome and retry each leave
+                one event naming the declared operator; no note leaves the device; a
+                central that cannot take the event does not stop the action."""
+                # abandon
+                cid = await park_by_central_cancel("h1")
+                if cid is None:
+                    return check("SETUP H: a parked conversation", False)
+                r = await resolve(cid, "abandon", request_id_of(cid), "e2e secret note")
+                out = r.json() if r.status_code == 200 else {}
+                check(
+                    "H abandon: done, and the answer says central was told",
+                    r.status_code == 200 and out.get("central_audit") == "recorded",
+                    f"{r.status_code} {r.text[:160]}",
+                )
+                check(
+                    "H abandon: one attention_resolved event, with the declared name",
+                    audit_events(cid)
+                    == f"abandon|approval_cancelled_or_expired|{OPERATOR}|true|",
+                    audit_events(cid),
+                )
+                # plain dismiss
+                cid = await park_by_central_cancel("h2")
+                if cid is None:
+                    return check("SETUP H: a second parked conversation", False)
+                r = await resolve(cid, "dismiss", request_id_of(cid), "e2e secret note")
+                out = r.json() if r.status_code == 200 else {}
+                check(
+                    "H dismiss: recorded, with no outcome",
+                    r.status_code == 200
+                    and out.get("central_audit") == "recorded"
+                    and audit_events(cid)
+                    == f"dismiss|approval_cancelled_or_expired|{OPERATOR}|true|",
+                    f"{r.status_code} {audit_events(cid)}",
+                )
+                # dismiss with an outcome (the assertion and the event both go)
+                cid = await park_by_central_cancel("h3")
+                if cid is None:
+                    return check("SETUP H: a third parked conversation", False)
+                rewrite_outbox(cid, needs_attention_reason="report_failed")
+                r = await ac.post(
+                    f"/api/governance/attention/{cid}/resolve",
+                    json={
+                        "action": "dismiss",
+                        "expected_request_id": request_id_of(cid),
+                        "operator": OPERATOR,
+                        "note": "e2e secret note",
+                        "outcome": "confirmed_not_executed",
+                    },
+                )
+                out = r.json() if r.status_code == 200 else {}
+                check(
+                    "H dismiss with an outcome: finding and event reach central",
+                    r.status_code == 200
+                    and out.get("central_step") == "assertion_filed"
+                    and out.get("central_audit") == "recorded"
+                    and audit_events(cid)
+                    == f"dismiss|report_failed|{OPERATOR}|true|confirmed_not_executed"
+                    and findings(cid).startswith("requester_assertion|"),
+                    f"{r.status_code} {audit_events(cid)!r}",
+                )
+                # retry, and the same record retried again is a second event
+                cid = await start_and_run("h4")
+                if not cid or not await pending_approval(cid, 1):
+                    return check("SETUP H: a pending approval", False)
+                for n in (1, 2):
+                    rewrite_outbox(
+                        cid,
+                        state="needs_attention",
+                        needs_attention_reason="claim_failed",
+                    )
+                    r = await resolve(cid, "retry", request_id_of(cid))
+                    out = r.json() if r.status_code == 200 else {}
+                    check(
+                        f"H retry #{n}: done and recorded",
+                        r.status_code == 200 and out.get("central_audit") == "recorded",
+                        f"{r.status_code} {r.text[:140]}",
+                    )
+                events = audit_events(cid).splitlines()
+                check(
+                    "H two retries of one record are two events",
+                    events == [f"retry|claim_failed|{OPERATOR}|true|"] * 2,
+                    str(events),
+                )
+                # the note never leaves the device
+                secret_rows = q(
+                    "select count(*) from admin_audit_events where "
+                    "payload::text like '%e2e secret note%'"
+                )
+                check(
+                    "H no note text reached central's audit trail",
+                    secret_rows == "0",
+                    f"rows={secret_rows}",
+                )
+                # central cannot take the event: the action still stands
+                cid = await start_and_run("h5")
+                if not cid or not await pending_approval(cid, 1):
+                    return check("SETUP H: another pending approval", False)
+                rewrite_outbox(
+                    cid, state="needs_attention", needs_attention_reason="claim_failed"
+                )
+                FAULT["audits"] = 1
+                before = FAULT["refused"]
+                r = await resolve(cid, "retry", request_id_of(cid))
+                out = r.json() if r.status_code == 200 else {}
+                check(
+                    "H central refuses the event: retry stands, not recorded",
+                    r.status_code == 200
+                    and out.get("central_audit") == "not_recorded"
+                    and out.get("new_state") == "claim_inflight"
+                    and FAULT["refused"] == before + 1
+                    and audit_events(cid) == "",
+                    f"{r.status_code} {r.text[:160]} events={audit_events(cid)!r}",
+                )
+
             await scenario("CONTROL (healthy baseline)", control())
             await scenario("A: central cancels -> abandon", scenario_a())
             await scenario("D: dismiss and refused requests", scenario_d())
             await scenario("CLI against the real agent-server", scenario_cli())
             await scenario("G: requester_assertion on dismiss", scenario_assertion())
+            await scenario("H: audit events at central (option B)", scenario_audit())
             await scenario("RACE: resolve and delete at the same time", scenario_race())
 
             # ============================ phase 2 ============================
