@@ -6,6 +6,7 @@ have no behavior of their own beyond field validation.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -193,12 +194,22 @@ class CancelResponse(BaseModel):
     status: str
 
 
+# What one reconciliation finding may carry. The queue endpoint
+# (routers/reconciliation.py) shows a note up to the same length and an evidence
+# document up to the same size, so nothing a caller is allowed to write is cut when an
+# administrator reads it. ``evidence`` is measured the way PostgreSQL writes jsonb as
+# text (a space after ``,`` and ``:``), because that is what the read side measures.
+FINDING_NOTE_MAX_CHARS = 2000
+FINDING_EVIDENCE_MAX_CHARS = 8000
+MAX_FINDINGS_PER_APPROVAL = 100
+
+
 class ReconciliationFindingRequest(RequestModel):
     finding_type: Literal["requester_assertion", "admin_verified", "late_report"]
     conclusion: (
         Literal["confirmed_not_executed", "confirmed_executed", "inconclusive"] | None
     ) = None
-    note: str = ""
+    note: str = Field(default="", max_length=FINDING_NOTE_MAX_CHARS)
     evidence: dict[str, Any] | None = None
     execution_attempt_id: uuid.UUID | None = Field(
         default=None,
@@ -206,6 +217,19 @@ class ReconciliationFindingRequest(RequestModel):
         "attempt this late report is about. Must match the record's own "
         "attempt, and is stored with the finding.",
     )
+
+    @model_validator(mode="after")
+    def _evidence_is_bounded(self) -> ReconciliationFindingRequest:
+        if self.evidence is not None:
+            size = len(
+                json.dumps(self.evidence, ensure_ascii=False, separators=(", ", ": "))
+            )
+            if size > FINDING_EVIDENCE_MAX_CHARS:
+                raise ValueError(
+                    f"evidence is {size} characters as JSON; at most "
+                    f"{FINDING_EVIDENCE_MAX_CHARS} are accepted"
+                )
+        return self
 
     @model_validator(mode="after")
     def _attempt_id_only_for_late_report(self) -> ReconciliationFindingRequest:

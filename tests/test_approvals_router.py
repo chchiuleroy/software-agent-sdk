@@ -1078,3 +1078,141 @@ async def test_the_same_subject_under_another_issuer_is_not_the_requester(
         headers=_auth(both, "lookalike-1"),
     )
     assert resp.status_code == 201, resp.text
+
+
+# --- what one finding may carry, and how many an approval may hold ----------
+
+
+async def _post_finding(client, signing_key, approval_id, body, key):
+    token = _sign(signing_key, sub="alice", roles=["agent.operator"])
+    return await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "requester_assertion", **body},
+        headers=_auth(token, key),
+    )
+
+
+async def test_a_note_of_2000_characters_is_accepted_and_2001_is_not(
+    client, signing_key, db_session
+):
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    ok = await _post_finding(
+        client, signing_key, approval_id, {"note": "n" * 2000}, "note-ok"
+    )
+    too_long = await _post_finding(
+        client, signing_key, approval_id, {"note": "n" * 2001}, "note-long"
+    )
+    assert ok.status_code == 201, ok.text
+    assert too_long.status_code == 422
+    assert len(await _findings_for(db_session, approval_id)) == 1
+
+
+async def test_evidence_of_exactly_8000_characters_is_accepted_and_one_more_is_not(
+    client, signing_key, db_session
+):
+    """The size is measured as PostgreSQL writes jsonb as text, which is what the
+    queue reads back: {"k": "<n>"} is n + 9 characters."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    ok = await _post_finding(
+        client, signing_key, approval_id, {"evidence": {"k": "x" * 7991}}, "ev-ok"
+    )
+    too_big = await _post_finding(
+        client, signing_key, approval_id, {"evidence": {"k": "x" * 7992}}, "ev-big"
+    )
+    assert ok.status_code == 201, ok.text
+    assert too_big.status_code == 422
+    assert len(await _findings_for(db_session, approval_id)) == 1
+
+
+async def test_what_the_service_accepts_is_not_cut_when_the_queue_shows_it(
+    client, signing_key, db_session
+):
+    """The write limits and the read-side cuts are the same numbers: the largest
+    accepted note and evidence come back whole."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    resp = await _post_finding(
+        client,
+        signing_key,
+        approval_id,
+        {"note": "é" * 2000, "evidence": {"k": "漢" * 7991}},
+        "roundtrip",
+    )
+    assert resp.status_code == 201, resp.text
+    admin = _sign(signing_key, sub="dave", roles=["governance.admin"])
+    items = (
+        await client.get("/api/v1/reconciliation-queue", headers=_auth(admin))
+    ).json()["items"]
+    finding = items[0]["findings"][0]
+    assert finding["note_truncated"] is False and len(finding["note"]) == 2000
+    assert finding["evidence_truncated"] is False
+    assert finding["evidence"] == {"k": "漢" * 7991}
+
+
+async def test_an_approval_holds_at_most_100_findings(client, signing_key, db_session):
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    for n in range(99):
+        db_session.add(
+            ReconciliationFinding(
+                approval_request_id=uuid.UUID(approval_id),
+                finding_type="requester_assertion",
+                note=f"n{n}",
+                verifier_issuer=ISSUER,
+                verifier_sub="alice",
+            )
+        )
+    await db_session.flush()
+    hundredth = await _post_finding(
+        client, signing_key, approval_id, {"note": "100"}, "cap-100"
+    )
+    assert hundredth.status_code == 201, hundredth.text
+    over = await _post_finding(
+        client, signing_key, approval_id, {"note": "101"}, "cap-101"
+    )
+    assert over.status_code == 409
+    assert over.json()["error_code"] == "too_many_findings"
+    assert len(await _findings_for(db_session, approval_id)) == 100
+
+
+async def test_the_limit_is_per_approval_not_global(client, signing_key, db_session):
+    full_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    other_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    for n in range(100):
+        db_session.add(
+            ReconciliationFinding(
+                approval_request_id=uuid.UUID(full_id),
+                finding_type="requester_assertion",
+                note=f"n{n}",
+                verifier_issuer=ISSUER,
+                verifier_sub="alice",
+            )
+        )
+    await db_session.flush()
+    resp = await _post_finding(
+        client, signing_key, other_id, {"note": "fine"}, "cap-other"
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_the_limit_binds_every_finding_type_including_the_admin(
+    client, signing_key, db_session
+):
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    for n in range(100):
+        db_session.add(
+            ReconciliationFinding(
+                approval_request_id=uuid.UUID(approval_id),
+                finding_type="requester_assertion",
+                note=f"n{n}",
+                verifier_issuer=ISSUER,
+                verifier_sub="alice",
+            )
+        )
+    await db_session.flush()
+    admin = _sign(signing_key, sub="dave", roles=["governance.admin"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "admin_verified", "conclusion": "inconclusive"},
+        headers=_auth(admin, "cap-admin"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "too_many_findings"

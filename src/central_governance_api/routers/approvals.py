@@ -62,7 +62,7 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from central_governance_api.accounts.tool_permissions import ensure_tool_permitted
@@ -84,6 +84,7 @@ from central_governance_api.approvals.errors import (
     RecordNotFoundError,
     RecordNotTerminalError,
     SelfVerificationNotAllowedError,
+    TooManyFindingsError,
 )
 from central_governance_api.approvals.idempotency import (
     commit_or_replay,
@@ -96,6 +97,7 @@ from central_governance_api.approvals.notify import (
     wait_for_status_change,
 )
 from central_governance_api.approvals.schemas import (
+    MAX_FINDINGS_PER_APPROVAL,
     ApprovalSummary,
     CancelResponse,
     ClaimRequest,
@@ -901,6 +903,16 @@ async def create_reconciliation_finding(
             **(body.evidence or {}),
             "execution_attempt_id": str(body.execution_attempt_id),
         }
+
+    existing = await session.scalar(
+        select(func.count(ReconciliationFinding.id)).where(
+            ReconciliationFinding.approval_request_id == approval_id
+        )
+    )
+    if (existing or 0) >= MAX_FINDINGS_PER_APPROVAL:
+        raise TooManyFindingsError(
+            approval_id=approval_id, limit=MAX_FINDINGS_PER_APPROVAL
+        )
 
     finding = ReconciliationFinding(
         approval_request_id=approval_id,

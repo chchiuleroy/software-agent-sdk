@@ -127,6 +127,21 @@ class RecordNotTerminalError(Exception):
         )
 
 
+class TooManyFindingsError(Exception):
+    """RECONCILIATION-FINDINGS only: one approval may hold at most
+    ``MAX_FINDINGS_PER_APPROVAL`` findings (the table is append-only, so without a
+    limit a requester could add them without end). The check reads the count and then
+    inserts, so two requests racing at the limit can both pass: the limit is soft by
+    a few, never unbounded. Maps to HTTP 409. The message is safe to show."""
+
+    def __init__(self, *, approval_id: uuid.UUID, limit: int) -> None:
+        self.approval_id = approval_id
+        self.limit = limit
+        super().__init__(
+            f"approval {approval_id} already has {limit} findings; no more are accepted"
+        )
+
+
 class SelfVerificationNotAllowedError(Exception):
     """RECONCILIATION-FINDINGS only: an ``admin_verified`` finding says an
     administrator checked what really happened. The principal who made the request
