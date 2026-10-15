@@ -23,6 +23,7 @@ Secrets (`CGA_TEST_*_SECRET`) come from the environment and are never printed.
 | `e2e_device_autoregister.py` | device auto-registration (1.8) against a real central with binding enforced: register, restart (real 409), revoke stays revoked (no agent-server process) | throwaway Postgres |
 | `e2e_device_list.py` | `GET /api/v1/devices` | throwaway Postgres, Keycloak |
 | `e2e_late_report.py` | late-report wiring | throwaway Postgres, Keycloak |
+| `e2e_mcp_refusal.py` | MCP tools in team mode against a real MCP server over local HTTP (`../tools/ohs_test_mcp.py`): every call refused before any approval, what an approver would see if refusal is off, the tool fingerprint's stability and change | throwaway Postgres (the MCP server is started by the script, 127.0.0.1 only) |
 | `e2e_real_conversation.py` | real conversation with tool permissions enforced | throwaway Postgres |
 | `e2e_real_keycloak.py` | central validated with real Keycloak tokens | throwaway Postgres, Keycloak |
 | `e2e_tool_permissions.py` | department tool permissions | throwaway Postgres |
