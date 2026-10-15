@@ -12,6 +12,8 @@
 | `replay.py` | 把本機 Claude Code 對話裡的工具呼叫丟進**真的分析器**，只輸出去識別的特徵 |
 | `sample.py` | 依預先寫定的配置抽樣（可重現、層內等機率），產生標記者看的批次、重複題與分開存放的答案鍵 |
 | `report.py` | 由標記結果算出估計（分層加權、群聚 bootstrap 區間、CANNOT_TELL 當區間） |
+| `raw_view.py` | 讓標記者看**已遮蔽的原始 Bash 指令**的研究（Roy 2026-10-15 同意）：遮蔽、抽樣、兩種視角的標記與比較 |
+| `standard_raw.md` | `standard.md` 的補充：看得到指令內容時怎麼用同一套標準 |
 | `report_2026-10-15.md` | 這次量測的結果與解讀 |
 
 ## 重跑
@@ -21,6 +23,15 @@ python replay.py --projects <~/.claude/projects> --days 30 --out out
 python sample.py --actions out/actions.jsonl --out out/labels
 # 把 out/labels/label_batch_*.json 連同 standard.md 交給標記者，答案存成 out/labels/<批次名>_out.txt
 python report.py --actions out/actions.jsonl --summary out/summary.json --labels out/labels --out out/report.md
+```
+
+原始指令版（只在本機；原始指令不進 repo，送給標記者的文字先遮蔽）：
+
+```bash
+python replay.py --projects <~/.claude/projects> --days 30 --out out --raw-bash out/raw_bash.jsonl
+python raw_view.py draw --actions out/actions.jsonl --raw out/raw_bash.jsonl --out out/raw_study
+# raw_batch.json（原始指令）與 feature_batch.json（特徵）各交給標記者，答案存成 out/raw_study/raw_out.txt、feature_out.txt
+python raw_view.py report --study out/raw_study
 ```
 
 要用 SDK 自己的 Python（能 `import openhands.sdk` 的那個）。`out/` 不進版本控制。
