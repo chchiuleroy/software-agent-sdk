@@ -19,7 +19,10 @@ from central_governance_api.auth.dependencies import get_oidc_resolver
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
 from central_governance_api.db import get_db_session
 from central_governance_api.main import create_app
-from central_governance_api.models import PendingApprovalRecord
+from central_governance_api.models import (
+    PendingApprovalRecord,
+    ReconciliationFinding,
+)
 
 from .test_app_auth import _sign
 from .test_approvals_router import (
@@ -131,6 +134,7 @@ async def test_an_item_shows_what_a_verifier_needs_and_not_the_digest_inputs(
         "action_payload",
         "created_at",
         "admin_verified",
+        "findings_total",
         "findings",
     }
     assert item["id"] == approval_id
@@ -264,3 +268,122 @@ async def test_offset_and_a_forged_cursor_are_400(client, signing_key):
 async def test_limit_is_bounded(client, signing_key, limit):
     resp = await client.get(URL, params={"limit": limit}, headers=_admin(signing_key))
     assert resp.status_code == 422
+
+
+async def _add_findings(db_session, approval_id: str, rows: list[dict]) -> None:
+    for row in rows:
+        db_session.add(
+            ReconciliationFinding(
+                approval_request_id=uuid.UUID(approval_id),
+                verifier_issuer="http://kc/realms/x",
+                verifier_sub="svc-agent-1",
+                **row,
+            )
+        )
+    await db_session.flush()
+
+
+async def test_a_record_with_many_findings_shows_the_newest_and_says_how_many(
+    client, signing_key, db_session
+):
+    """A requester may keep filing findings: one answer must not grow with them."""
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    base = datetime(2026, 10, 1, tzinfo=UTC)
+    await _add_findings(
+        db_session,
+        approval_id,
+        [
+            {
+                "finding_type": "requester_assertion",
+                "note": f"note {n}",
+                "created_at": base + timedelta(minutes=n),
+            }
+            for n in range(25)
+        ],
+    )
+    item = (await client.get(URL, headers=_admin(signing_key))).json()["items"][0]
+    assert item["findings_total"] == 25
+    notes = [f["note"] for f in item["findings"]]
+    assert notes == [f"note {n}" for n in range(5, 25)]  # the newest 20, oldest first
+
+
+async def test_admin_verified_looks_at_every_finding_not_only_the_ones_shown(
+    client, signing_key, db_session
+):
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    base = datetime(2026, 10, 1, tzinfo=UTC)
+    await _add_findings(
+        db_session,
+        approval_id,
+        [
+            {
+                "finding_type": "admin_verified",
+                "conclusion": "inconclusive",
+                "note": "oldest",
+                "created_at": base,
+            }
+        ]
+        + [
+            {
+                "finding_type": "requester_assertion",
+                "note": f"later {n}",
+                "created_at": base + timedelta(minutes=n + 1),
+            }
+            for n in range(25)
+        ],
+    )
+    admin = _admin(signing_key)
+    item = (await client.get(URL, headers=admin)).json()["items"][0]
+    assert item["findings_total"] == 26
+    assert "admin_verified" not in [f["finding_type"] for f in item["findings"]]
+    assert item["admin_verified"] is True, "the verification is older than the 20 shown"
+    only_open = await client.get(URL, params={"admin_verified": "false"}, headers=admin)
+    assert only_open.json()["items"] == []
+
+
+async def test_a_long_note_and_a_huge_evidence_are_cut_in_the_database(
+    client, signing_key, db_session
+):
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    base = datetime(2026, 10, 1, tzinfo=UTC)
+    await _add_findings(
+        db_session,
+        approval_id,
+        [
+            {
+                "finding_type": "requester_assertion",
+                "note": "n" * 5000,
+                "evidence": {"blob": "e" * 20000},
+                "created_at": base,
+            },
+            {
+                "finding_type": "late_report",
+                "note": "n" * 2000,  # exactly the limit: not cut
+                "evidence": {"ok": "small"},
+                "created_at": base + timedelta(minutes=1),
+            },
+        ],
+    )
+    findings = (await client.get(URL, headers=_admin(signing_key))).json()["items"][0][
+        "findings"
+    ]
+    long_one, exact = findings
+    assert len(long_one["note"]) == 2000 and long_one["note_truncated"] is True
+    assert long_one["evidence"] is None and long_one["evidence_truncated"] is True
+    assert len(exact["note"]) == 2000 and exact["note_truncated"] is False
+    assert exact["evidence"] == {"ok": "small"} and exact["evidence_truncated"] is False
+
+
+async def test_a_finding_without_evidence_is_not_reported_as_cut(
+    client, signing_key, db_session
+):
+    approval_id, _ = await _approval_failed_unknown(client, signing_key, db_session)
+    await _add_findings(
+        db_session,
+        approval_id,
+        [{"finding_type": "requester_assertion", "note": "x", "evidence": None}],
+    )
+    finding = (await client.get(URL, headers=_admin(signing_key))).json()["items"][0][
+        "findings"
+    ][0]
+    assert finding["evidence"] is None and finding["evidence_truncated"] is False

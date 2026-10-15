@@ -987,6 +987,27 @@ async def test_admin_verified_by_the_requester_is_refused(
     assert await _findings_for(db_session, approval_id) == []
 
 
+async def test_a_refused_self_verification_is_not_remembered_as_an_answer(
+    client, signing_key, db_session
+):
+    """Only successes are stored for replay, so repeating a refused request with the
+    same Idempotency-Key is refused again rather than answered from a stored result."""
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    both = _sign(signing_key, sub="alice", roles=["agent.operator", "governance.admin"])
+    body = {"finding_type": "admin_verified", "conclusion": "confirmed_not_executed"}
+    for _ in range(2):
+        resp = await client.post(
+            f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+            json=body,
+            headers=_auth(both, "self-verify-replay-1"),
+        )
+        assert resp.status_code == 409
+        assert resp.json()["error_code"] == "cannot_verify_own_request"
+    assert await _findings_for(db_session, approval_id) == []
+
+
 async def test_admin_verified_by_another_admin_is_accepted(
     client, signing_key, db_session
 ):

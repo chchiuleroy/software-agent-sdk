@@ -931,3 +931,75 @@ test("a verified row is marked and an unverified one is not", () => {
   );
   assert.doesNotMatch(open.className, /verified/);
 });
+
+test("a record with more findings than were sent says how many are not shown", () => {
+  const sent = Array.from({ length: 20 }, (_, n) => ({
+    finding_type: "requester_assertion",
+    conclusion: null,
+    note: `note ${n}`,
+    verifier: "http://kc/realms/x#svc-agent-1",
+    evidence: null,
+    note_truncated: false,
+    evidence_truncated: false,
+    created_at: "2026-10-14T13:00:00+00:00",
+  }));
+  const view = describeQueueItem(
+    queueItem({ findings: sent, findings_total: 26 }),
+    QUEUE_ME,
+  );
+  assert.equal(view.findingsTotal, 26);
+  const text = allText(renderQueueItem(fakeDocument(), view, () => {}));
+  assert.match(text, /Findings \(26\)/);
+  assert.match(text, /Showing the newest 20; 6 earlier finding\(s\) are not shown\./);
+  // all sent: no such line, and an old server without the count still works
+  const complete = describeQueueItem(queueItem({ findings: sent.slice(0, 2) }), QUEUE_ME);
+  assert.equal(complete.findingsTotal, 2);
+  assert.doesNotMatch(
+    allText(renderQueueItem(fakeDocument(), complete, () => {})),
+    /not shown/,
+  );
+});
+
+test("a note that was cut and evidence that was left out are said so", () => {
+  const view = describeQueueItem(
+    queueItem({
+      findings: [
+        {
+          finding_type: "requester_assertion",
+          conclusion: null,
+          note: "start of a long note",
+          verifier: "http://kc/realms/x#svc-agent-1",
+          evidence: null,
+          note_truncated: true,
+          evidence_truncated: true,
+          created_at: "2026-10-14T13:00:00+00:00",
+        },
+      ],
+      findings_total: 1,
+    }),
+    QUEUE_ME,
+  );
+  const text = allText(renderQueueItem(fakeDocument(), view, () => {}));
+  assert.match(text, /start of a long note \(cut: the note is longer\)/);
+  assert.match(text, /Evidence left out: it is too large to show\./);
+  const plain = describeQueueItem(
+    queueItem({
+      findings: [
+        {
+          finding_type: "late_report",
+          conclusion: null,
+          note: "short",
+          verifier: "http://kc/realms/x#svc-agent-1",
+          evidence: { a: 1 },
+          note_truncated: false,
+          evidence_truncated: false,
+          created_at: "2026-10-14T13:00:00+00:00",
+        },
+      ],
+      findings_total: 1,
+    }),
+    QUEUE_ME,
+  );
+  const quiet = allText(renderQueueItem(fakeDocument(), plain, () => {}));
+  assert.doesNotMatch(quiet, /cut:|left out/);
+});

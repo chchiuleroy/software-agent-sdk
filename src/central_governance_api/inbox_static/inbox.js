@@ -22,6 +22,7 @@ const DEVICES_MAX = 200; // GET /api/v1/devices rejects a larger limit
 const AUDIT_PAGE = 50;
 const QUEUE_PAGE = 50;
 const NOTE_MAX = 500;
+const NOTE_SHOWN = 2000; // what the server sends of a note at most
 
 // ---------------------------------------------------------------- pure helpers
 // (exported so tests/js/inbox.test.mjs can run them under Node)
@@ -424,6 +425,14 @@ export function queuePath(admin_verified, cursor, limit = QUEUE_PAGE) {
   return `/api/v1/reconciliation-queue?${params.toString()}`;
 }
 
+// How many findings the record has in all: the server says, and never fewer
+// than the ones it sent.
+function shownCount(item) {
+  const shown = Array.isArray(item.findings) ? item.findings.length : 0;
+  const total = Number.isInteger(item.findings_total) ? item.findings_total : 0;
+  return Math.max(shown, total);
+}
+
 export function describeQueueItem(item, me) {
   const requester = ownerLabel(item.requester, me);
   return {
@@ -439,10 +448,13 @@ export function describeQueueItem(item, me) {
     // Central refuses an admin_verified from the requester itself (409), so the
     // form is not offered; the server stays the authority.
     canVerify: !requester.mine,
+    findingsTotal: shownCount(item),
     findings: (Array.isArray(item.findings) ? item.findings : []).map((f) => ({
       type: truncate(f.finding_type ?? "", 40),
       conclusion: f.conclusion ? truncate(f.conclusion, 40) : "no conclusion",
-      note: truncate(f.note ?? "", NOTE_MAX),
+      note: truncate(f.note ?? "", NOTE_SHOWN),
+      noteCut: f.note_truncated === true,
+      evidenceCut: f.evidence_truncated === true,
       verifier: ownerLabel(f.verifier, me),
       when: formatUtc(f.created_at),
       evidence: f.evidence ? payloadText(f.evidence) : "",
@@ -621,18 +633,35 @@ export function renderQueueItem(doc, view, onVerify) {
     el(
       doc,
       "h3",
-      view.findings.length === 0
+      view.findingsTotal === 0
         ? "No findings yet"
-        : `Findings (${view.findings.length})`,
+        : `Findings (${view.findingsTotal})`,
     ),
   );
+  if (view.findingsTotal > view.findings.length) {
+    li.appendChild(
+      el(
+        doc,
+        "p",
+        `Showing the newest ${view.findings.length}; ${view.findingsTotal - view.findings.length} earlier finding(s) are not shown.`,
+        "note",
+      ),
+    );
+  }
   for (const f of view.findings) {
     const row = el(doc, "div", undefined, "finding");
     const who = f.verifier.mine ? `${f.verifier.short} (you)` : f.verifier.short;
     const head = el(doc, "p", `${f.type}: ${f.conclusion}, by ${who}, ${f.when}`);
     head.title = f.verifier.full;
     row.appendChild(head);
-    if (f.note) row.appendChild(el(doc, "p", f.note, "claim"));
+    if (f.note) {
+      row.appendChild(
+        el(doc, "p", f.noteCut ? `${f.note} (cut: the note is longer)` : f.note, "claim"),
+      );
+    }
+    if (f.evidenceCut) {
+      row.appendChild(el(doc, "p", "Evidence left out: it is too large to show.", "note"));
+    }
     if (f.evidence) {
       const details = el(doc, "details");
       details.appendChild(el(doc, "summary", "Evidence"));
@@ -1114,7 +1143,7 @@ async function main() {
       return;
     }
     const body = await response.json();
-    if (seq !== queueSeq) return;
+    if (seq !== queueSeq || active !== "reconciliation") return;
     queue = reset ? body.items : [...queue, ...body.items];
     queueNextCursor = body.next_cursor ?? null;
     renderQueue();

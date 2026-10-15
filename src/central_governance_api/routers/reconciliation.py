@@ -21,6 +21,14 @@ audit trail (see ``routers/audit.py`` for what that does and does not promise).
 Note that ``created_at`` is when the request was made, not when it became
 ``failed_unknown``.
 
+The size of one answer is bounded, which the number of findings on a record is not
+(a requester may keep filing them): each record shows its newest
+``_MAX_FINDINGS`` findings with ``findings_total`` saying how many exist, a ``note``
+is cut at ``_NOTE_CHARS`` (``note_truncated``), and an ``evidence`` document longer
+than ``_EVIDENCE_CHARS`` as JSON text is left out (``evidence_truncated``). The cutting
+happens in the database, so the oversized values are never loaded. Whether a record is
+``admin_verified`` always looks at ALL its findings, not only the ones shown.
+
 Everything in ``note`` and ``evidence`` is text a requester or an administrator wrote;
 treat it as untrusted wherever it is shown.
 """
@@ -33,9 +41,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import exists, literal, select, tuple_
+from sqlalchemy import Text, case, cast, exists, func, literal, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from central_governance_api.approvals.state_machine import ApprovalStatus
 from central_governance_api.auth.dependencies import get_current_principal
@@ -53,6 +60,9 @@ router = APIRouter(prefix="/api/v1/reconciliation-queue", tags=["reconciliation"
 
 _MAX_LIMIT = 200
 _DEFAULT_LIMIT = 50
+_MAX_FINDINGS = 20
+_NOTE_CHARS = 2000
+_EVIDENCE_CHARS = 8000
 
 
 def _require_admin(principal: Principal = Depends(get_current_principal)) -> Principal:
@@ -66,8 +76,10 @@ class FindingSummary(BaseModel):
     finding_type: str
     conclusion: str | None
     note: str
+    note_truncated: bool
     verifier: str
     evidence: dict[str, Any] | None
+    evidence_truncated: bool
     created_at: datetime
 
 
@@ -83,6 +95,7 @@ class QueueItem(BaseModel):
     action_payload: dict[str, Any]
     created_at: datetime
     admin_verified: bool
+    findings_total: int
     findings: list[FindingSummary]
 
 
@@ -91,35 +104,79 @@ class QueueResponse(BaseModel):
     next_cursor: str | None
 
 
-def _item(record: PendingApprovalRecord) -> QueueItem:
-    findings = sorted(
-        record.reconciliation_findings, key=lambda f: (f.created_at, f.id)
-    )
-    return QueueItem(
-        id=record.id,
-        request_id=record.request_id,
-        status=record.status,
-        requester=f"{record.requester_issuer}#{record.requester_sub}",
-        origin_device_id=record.origin_device_id,
-        conversation_id=record.conversation_id,
-        tool_name=record.tool_name,
-        action_summary=record.action_summary,
-        action_payload=record.action_payload,
-        created_at=record.created_at,
-        admin_verified=any(f.finding_type == "admin_verified" for f in findings),
-        findings=[
-            FindingSummary(
-                id=f.id,
-                finding_type=f.finding_type,
-                conclusion=f.conclusion,
-                note=f.note,
-                verifier=f"{f.verifier_issuer}#{f.verifier_sub}",
-                evidence=f.evidence,
-                created_at=f.created_at,
+async def _findings_of(
+    session: AsyncSession, approval_ids: list[uuid.UUID]
+) -> tuple[dict[uuid.UUID, list[FindingSummary]], dict[uuid.UUID, int], set[uuid.UUID]]:
+    """The newest ``_MAX_FINDINGS`` findings of each given approval (oldest first),
+    how many findings each has in all, and which have an ``admin_verified`` one."""
+    if not approval_ids:
+        return {}, {}, set()
+    too_long = func.length(cast(ReconciliationFinding.evidence, Text)) > _EVIDENCE_CHARS
+    ranked = (
+        select(
+            ReconciliationFinding.id,
+            ReconciliationFinding.approval_request_id,
+            ReconciliationFinding.finding_type,
+            ReconciliationFinding.conclusion,
+            func.left(ReconciliationFinding.note, _NOTE_CHARS + 1).label("note"),
+            ReconciliationFinding.verifier_issuer,
+            ReconciliationFinding.verifier_sub,
+            case((too_long, None), else_=ReconciliationFinding.evidence).label(
+                "evidence"
+            ),
+            func.coalesce(too_long, False).label("evidence_truncated"),
+            ReconciliationFinding.created_at,
+            func.row_number()
+            .over(
+                partition_by=ReconciliationFinding.approval_request_id,
+                order_by=(
+                    ReconciliationFinding.created_at.desc(),
+                    ReconciliationFinding.id.desc(),
+                ),
             )
-            for f in findings
-        ],
+            .label("rank"),
+        )
+        .where(ReconciliationFinding.approval_request_id.in_(approval_ids))
+        .subquery()
     )
+    shown = await session.execute(
+        select(ranked)
+        .where(ranked.c.rank <= _MAX_FINDINGS)
+        .order_by(ranked.c.created_at, ranked.c.id)
+    )
+    by_approval: dict[uuid.UUID, list[FindingSummary]] = {}
+    for row in shown:
+        by_approval.setdefault(row.approval_request_id, []).append(
+            FindingSummary(
+                id=row.id,
+                finding_type=row.finding_type,
+                conclusion=row.conclusion,
+                note=row.note[:_NOTE_CHARS],
+                note_truncated=len(row.note) > _NOTE_CHARS,
+                verifier=f"{row.verifier_issuer}#{row.verifier_sub}",
+                evidence=row.evidence,
+                evidence_truncated=bool(row.evidence_truncated),
+                created_at=row.created_at,
+            )
+        )
+    counted = await session.execute(
+        select(
+            ReconciliationFinding.approval_request_id,
+            func.count(ReconciliationFinding.id),
+        )
+        .where(ReconciliationFinding.approval_request_id.in_(approval_ids))
+        .group_by(ReconciliationFinding.approval_request_id)
+    )
+    totals = {approval_id: count for approval_id, count in counted}
+    verified_rows = await session.execute(
+        select(ReconciliationFinding.approval_request_id)
+        .where(
+            ReconciliationFinding.approval_request_id.in_(approval_ids),
+            ReconciliationFinding.finding_type == "admin_verified",
+        )
+        .distinct()
+    )
+    return by_approval, totals, set(verified_rows.scalars())
 
 
 @router.get("", response_model=QueueResponse, dependencies=[Depends(_require_admin)])
@@ -140,7 +197,6 @@ async def list_reconciliation_queue(
     stmt = (
         select(PendingApprovalRecord)
         .where(PendingApprovalRecord.status == ApprovalStatus.FAILED_UNKNOWN.value)
-        .options(selectinload(PendingApprovalRecord.reconciliation_findings))
         .order_by(
             PendingApprovalRecord.created_at.desc(), PendingApprovalRecord.id.desc()
         )
@@ -165,8 +221,26 @@ async def list_reconciliation_queue(
     rows = list((await session.execute(stmt.limit(limit + 1))).scalars())
     has_more = len(rows) > limit
     rows = rows[:limit]
+    findings, totals, verified = await _findings_of(session, [r.id for r in rows])
     return QueueResponse(
-        items=[_item(row) for row in rows],
+        items=[
+            QueueItem(
+                id=r.id,
+                request_id=r.request_id,
+                status=r.status,
+                requester=f"{r.requester_issuer}#{r.requester_sub}",
+                origin_device_id=r.origin_device_id,
+                conversation_id=r.conversation_id,
+                tool_name=r.tool_name,
+                action_summary=r.action_summary,
+                action_payload=r.action_payload,
+                created_at=r.created_at,
+                admin_verified=r.id in verified,
+                findings_total=totals.get(r.id, 0),
+                findings=findings.get(r.id, []),
+            )
+            for r in rows
+        ],
         next_cursor=(
             encode_cursor(rows[-1].created_at, rows[-1].id) if has_more else None
         ),
