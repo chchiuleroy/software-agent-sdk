@@ -271,3 +271,58 @@ def test_sessions_are_redrawn_inside_a_stratum_not_from_one_pool():
     point, interval = report._interval(asked, {"NOT_NECESSARY"}, 5)
     assert point == pytest.approx(0.5)
     assert interval == pytest.approx((0.5, 0.5))
+
+
+def _bash(**shape):
+    base = {
+        "ops": ["read"],
+        "opaque": False,
+        "redirect": False,
+        "redirect_outside_cwd": False,
+        "redirect_unresolved": False,
+        "paths_outside_cwd": 0,
+        "paths_unresolved": 0,
+        "sends_data": False,
+        "secret_path": False,
+        "pipe_to_shell": False,
+        "has_url": False,
+    }
+    base.update(shape)
+    return {"mapped": "terminal", "confirm": True, "shape": base}
+
+
+def test_the_candidate_rule_counts_only_asked_bash_with_every_condition_clear():
+    """Each condition alone must remove a call from the hits; an unasked call or a
+    non-Bash call never counts."""
+    rows = [_bash()]  # the one hit
+    rows += [
+        _bash(ops=["read", "write"]),
+        _bash(opaque=True),
+        _bash(redirect=True),
+        _bash(redirect_outside_cwd=True),
+        _bash(redirect_unresolved=True),
+        _bash(paths_outside_cwd=1),
+        _bash(paths_unresolved=1),
+        _bash(sends_data=True),
+        _bash(secret_path=True),
+        _bash(pipe_to_shell=True),
+        _bash(has_url=True),
+    ]
+    rows.append({**_bash(), "confirm": False})
+    rows.append({**_bash(), "mapped": "file_editor"})
+    assert report.candidate_rule_hits(rows) == (1, 12)
+
+
+def test_zero_necessary_among_the_unasked_is_not_reported_as_a_certain_zero():
+    key, labels = build([(False, "grep", "project", 100, [U] * 10)])
+    est = report.estimate(key, labels, COUNTS)
+    text = report.render(
+        {"window_days": 30},
+        COUNTS,
+        est,
+        report.by_stratum(key, labels),
+        {"pairs": 0, "same": 0, "rate": None},
+        [],
+    )
+    assert "不代表母體比例為零" in text
+    assert "0.0% to 0.0%" not in text

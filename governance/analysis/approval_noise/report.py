@@ -214,6 +214,35 @@ def self_consistency(key: dict[str, Any], labels: dict[str, str]) -> dict[str, A
     }
 
 
+_SAFE_OPS = {"read", "vcs_read", "runner"}
+
+
+def candidate_rule_hits(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """(hits, asked Bash calls). The exploratory rule was proposed after seeing the
+    labels, so it is a candidate only: read-only effect classes, nothing hidden,
+    no redirect, no path or URL outside the workspace, no data sent, no secret path."""
+    asked_bash = [
+        r for r in rows if r.get("mapped") == "terminal" and r.get("confirm") is True
+    ]
+
+    def hit(shape: dict[str, Any]) -> bool:
+        return (
+            set(shape["ops"]) <= _SAFE_OPS
+            and not shape["opaque"]
+            and not shape["redirect"]
+            and not shape["redirect_outside_cwd"]
+            and not shape["redirect_unresolved"]
+            and shape["paths_outside_cwd"] == 0
+            and shape["paths_unresolved"] == 0
+            and not shape["sends_data"]
+            and not shape["secret_path"]
+            and not shape["pipe_to_shell"]
+            and not shape["has_url"]
+        )
+
+    return sum(hit(r["shape"]) for r in asked_bash), len(asked_bash)
+
+
 def _pct(value: float | None) -> str:
     return "n/a" if value is None else f"{100 * value:.1f}%"
 
@@ -233,6 +262,7 @@ def render(
     strata: list[dict[str, Any]],
     consistency: dict[str, Any],
     problems: list[str],
+    candidate: tuple[int, int] | None = None,
 ) -> str:
     lines = ["# 核准噪音量測報告（自動產生）", ""]
     lines += ["## 覆蓋率", ""]
@@ -255,8 +285,20 @@ def render(
         f"，上界 **{_pct(est['a_high'])}**{_ci(est['a_high_ci'])}",
         f"  （下界把 CANNOT_TELL 當必要，上界當不必要；CANNOT_TELL 約占被問到呼叫的 {_pct(est['cannot_tell_share_of_asked'])}）",
         f"- 噪音率 N ＝ P(asked) × A：**{_pct(est.get('noise_low'))} 到 {_pct(est.get('noise_high'))}**（占全部可對應呼叫）",
-        f"- 沒被問到、但標記者認為必要：{_pct(est['missed_necessary'])}{_ci(est['missed_necessary_ci'])}（樣本小，只作描述）",
+        f"- 沒被問到、但標記者認為必要：{_pct(est['missed_necessary'])}"
+        + (
+            "（樣本中 0 例；重抽樣仍沒有正例，所以沒有區間，**不代表母體比例為零**；樣本小，只作描述）"
+            if not est["missed_necessary"]
+            else f"{_ci(est['missed_necessary_ci'])}（樣本小，只作描述）"
+        ),
         f"- 標記者自我一致性：{consistency['same']} / {consistency['pairs']} ＝ {_pct(consistency['rate'])}（同一位標記者重複標記，不是人與人的一致性）",
+        *(
+            [
+                f"- 探索性候選規則（看過標記後才提出，只是候選）：被問到的 Bash 中命中 {candidate[0]} / {candidate[1]}"
+            ]
+            if candidate
+            else []
+        ),
         "",
         "## 各層",
         "",
@@ -314,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         by_stratum(key, labels),
         self_consistency(key, labels),
         problems,
+        candidate_rule_hits(rows),
     )
     Path(args.out).write_text(text, encoding="utf-8")
     print(text)
