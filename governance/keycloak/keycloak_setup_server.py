@@ -45,6 +45,7 @@ ic = importlib.util.module_from_spec(_INBOX_SPEC)
 _INBOX_SPEC.loader.exec_module(ic)  # type: ignore[union-attr]
 
 TOKEN = secrets.token_urlsafe(24)
+ADMIN_ROLE = "governance.admin"
 SESSION_SECONDS = 20 * 60
 STATE: dict = {
     "username": None,
@@ -162,12 +163,14 @@ def main_page(notice: str = "") -> bytes:
         "<label>central 的埠 <input name='port' value='8899' size='6' autocomplete='off'></label>"
         + OK_BOX
         + "<button>註冊（已存在則不動，只補缺的 mapper）</button></form></fieldset>"
-        f"<fieldset><legend>1. 建立 realm role「{kc.ROLE_NAME}」</legend>"
+        f"<fieldset><legend>1. 建立 realm role「{kc.ROLE_NAME}」與「{ADMIN_ROLE}」</legend>"
         f"<form method='post' action='/{TOKEN}/create-role'>"
         + OK_BOX
         + "<button>建立（已存在則不動）</button></form></fieldset>"
-        f"<fieldset><legend>2. 把「{kc.ROLE_NAME}」授予一位使用者（高權限，只給負責批准帳號的人）</legend>"
+        "<fieldset><legend>2. 把 role 授予一位使用者（高權限，只給負責批准帳號的人）</legend>"
         f"<form method='post' action='/{TOKEN}/grant'>"
+        f"<select name='role'><option value='{kc.ROLE_NAME}'>{kc.ROLE_NAME}</option>"
+        f"<option value='{ADMIN_ROLE}'>{ADMIN_ROLE}（稽核、對帳畫面需要）</option></select> "
         f"<select name='username'><option value=''>（選擇）</option>{users}</select> "
         + OK_BOX
         + "<button>授予</button></form></fieldset>"
@@ -368,32 +371,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif route == "refresh":
             STATE["log"].append(f"使用者清單已重新讀取（{len(STATE['users'])} 位）")
         elif route == "create-role":
-            response = api.get(f"/roles/{kc.ROLE_NAME}")
-            if response.status_code == 200:
-                STATE["log"].append(f"role {kc.ROLE_NAME}: 已存在，未改動")
-            else:
-                created = api.post(
-                    "/roles",
-                    {
-                        "name": kc.ROLE_NAME,
-                        "description": "OHS superadmin: approves accounts, edits departments and tool permissions. Not a superset of governance.admin.",
-                    },
-                )
-                STATE["log"].append(
-                    f"建立 role {kc.ROLE_NAME}: HTTP {created.status_code}"
-                )
+            for name, description in (
+                (
+                    kc.ROLE_NAME,
+                    "OHS superadmin: approves accounts, edits departments and tool permissions. Not a superset of governance.admin.",
+                ),
+                (ADMIN_ROLE, "OHS admin: Audit and Reconciliation screens."),
+            ):
+                response = api.get(f"/roles/{name}")
+                if response.status_code == 200:
+                    STATE["log"].append(f"role {name}: 已存在，未改動")
+                else:
+                    created = api.post(
+                        "/roles", {"name": name, "description": description}
+                    )
+                    STATE["log"].append(
+                        f"建立 role {name}: HTTP {created.status_code}"
+                    )
         elif route == "grant":
             username = form.get("username", "")
             match = [u for u in STATE["users"] if u.get("username") == username]
-            role = api.get(f"/roles/{kc.ROLE_NAME}")
-            if not match or role.status_code != 200:
+            role_name = form.get("role", kc.ROLE_NAME)
+            if role_name not in (kc.ROLE_NAME, ADMIN_ROLE):
+                role_name = ""
+            role = api.get(f"/roles/{role_name}") if role_name else None
+            if not match or role is None or role.status_code != 200:
                 STATE["log"].append("授予失敗：找不到使用者或 role 尚未建立")
             else:
                 done = api.post(
                     f"/users/{match[0]['id']}/role-mappings/realm", [role.json()]
                 )
                 STATE["log"].append(
-                    f"授予 {kc.ROLE_NAME} 給 {username}: HTTP {done.status_code}"
+                    f"授予 {role_name} 給 {username}: HTTP {done.status_code}"
                 )
         elif route == "rotate":
             new1, new2 = form.get("new1", ""), form.get("new2", "")

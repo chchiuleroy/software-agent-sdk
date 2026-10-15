@@ -41,6 +41,8 @@ class FakeKeycloak:
         self.users: list[dict] = []
         self.created_users: list[dict] = []
         self.role: dict | None = None
+        self.admin_role = {"id": "r-2", "name": "governance.admin"}
+        self.created_roles: list[str] = []
         self.granted: list[tuple[str, list]] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -54,12 +56,18 @@ class FakeKeycloak:
         if request.method == "POST" and path == f"{base}/users":
             self.created_users.append(json.loads(request.content))
             return httpx.Response(201)
-        if request.method == "GET" and path == f"{base}/roles/governance.superadmin":
+        if request.method == "GET" and path.startswith(f"{base}/roles/"):
+            name = path.rsplit("/", 1)[-1]
+            if name == "governance.admin":
+                return httpx.Response(200, json=self.admin_role)
             return (
                 httpx.Response(200, json=self.role)
                 if self.role
                 else httpx.Response(404)
             )
+        if request.method == "POST" and path == f"{base}/roles":
+            self.created_roles.append(json.loads(request.content)["name"])
+            return httpx.Response(201)
         if request.method == "POST" and path.endswith("/role-mappings/realm"):
             user_id = path.split("/")[-3]
             self.granted.append((user_id, json.loads(request.content)))
@@ -277,3 +285,25 @@ def test_the_refresh_button_rereads_the_user_list(keycloak):
 
     assert [u["username"] for u in page.STATE["users"]] == ["roy", "ann"]
     assert any("2 位" in line for line in page.STATE["log"])
+
+
+def test_the_admin_role_can_be_granted_too_and_other_names_cannot(keycloak):
+    fake = keycloak(FakeKeycloak())
+    page.STATE["users"] = []
+    fake.users = [{"id": "u-1", "username": "roy", "email": "r@example.com"}]
+    fake.role = {"id": "r-1", "name": "governance.superadmin"}
+
+    route("grant", username="roy", role="governance.admin", ok="1")
+    route("grant", username="roy", role="realm-management", ok="1")
+
+    assert fake.granted == [("u-1", [fake.admin_role])]
+    assert any("授予失敗" in x for x in page.STATE["log"])
+
+
+def test_create_role_makes_both_roles_the_console_needs(keycloak):
+    fake = keycloak(FakeKeycloak())
+    fake.role = None
+
+    route("create-role", ok="1")
+
+    assert fake.created_roles == ["governance.superadmin"]  # admin already exists
