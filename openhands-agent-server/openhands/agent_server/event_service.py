@@ -1,5 +1,7 @@
 import asyncio
 import functools
+import hashlib
+import json
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -21,6 +23,7 @@ from openhands.agent_server.conversation_lease import (
 )
 from openhands.agent_server.governance_attention import (
     AttentionAction,
+    AttentionOutcome,
     ResolveError,
     ResolveResponse,
     apply_close,
@@ -2975,6 +2978,66 @@ class EventService:
                 f"central could not be asked to abort ({type(exc).__name__})",
             ) from exc
 
+    async def _file_requester_assertion(
+        self,
+        record: OutboxRecord,
+        outcome: AttentionOutcome,
+        note: str | None,
+        operator: str,
+    ) -> Literal["assertion_filed"]:
+        """Files the operator's statement of what happened as a
+        ``requester_assertion`` finding at central: evidence only, it never changes
+        the approval's status, and central takes it only once the approval is in a
+        terminal state. The name is as declared, not authenticated; the finding is
+        attributed to this device's service account, and the name goes in the
+        evidence. The idempotency key covers everything that is sent, so a retry
+        with the same content replays and a different statement is a new finding
+        (findings are append-only)."""
+        client = self.governance_client
+        if client is None:
+            raise ResolveError(
+                "central_client_unavailable",
+                "the central governance client is not configured",
+            )
+        if record.central_approval_id is None:
+            raise ResolveError(
+                "assertion_not_possible", "the record has no central approval id"
+            )
+        # JSON, not a joined string: "a|b" + "c" and "a" + "b|c" must differ.
+        digest = hashlib.sha256(
+            json.dumps(
+                [record.request_id, outcome.value, note or "", operator]
+            ).encode()
+        ).hexdigest()[:32]
+        try:
+            await client.reconciliation_finding(
+                record.central_approval_id,
+                idempotency_key=f"assert-{digest}",
+                finding_type="requester_assertion",
+                conclusion=outcome.value,
+                note=note or "",
+                evidence={
+                    "operator": operator,
+                    "operator_self_declared": True,
+                    "via": "needs_attention_dismiss",
+                    "reason": record.needs_attention_reason,
+                    "request_id": record.request_id,
+                },
+            )
+        except GovernancePermanentError as exc:
+            raise ResolveError(
+                "central_failed",
+                f"central refused the assertion ({_error_code_of(exc)}); "
+                "nothing was changed",
+            ) from exc
+        except Exception as exc:
+            raise ResolveError(
+                "central_failed",
+                f"central could not be asked ({type(exc).__name__}); "
+                "nothing was changed",
+            ) from exc
+        return "assertion_filed"
+
     async def resolve_needs_attention(
         self,
         action: AttentionAction,
@@ -2982,6 +3045,7 @@ class EventService:
         expected_request_id: str,
         note: str | None,
         operator: str,
+        outcome: AttentionOutcome | None = None,
     ) -> ResolveResponse:
         """Acts on an outbox record parked in NEEDS_ATTENTION (operator request).
 
@@ -2990,7 +3054,10 @@ class EventService:
         * ``abandon``: withdraws the approval at central, rejects the pending
           action locally and ends the record as CANCELLED. Only offered for
           reasons where no execution attempt can exist.
-        * ``dismiss``: ends the record as RESOLVED_MANUALLY. No other effect.
+        * ``dismiss``: ends the record as RESOLVED_MANUALLY. With an ``outcome``
+          (only where the action may have run) it first files that as a
+          ``requester_assertion`` at central, and ends the record only if central
+          took it; without one there is no other effect.
 
         Every precondition is checked before any side effect, and checked again
         inside the locked write, so a request made from a stale view fails
@@ -3003,6 +3070,7 @@ class EventService:
                 expected_request_id=expected_request_id,
                 note=note,
                 operator=operator,
+                outcome=outcome,
             )
 
     async def _resolve_needs_attention_locked(
@@ -3012,24 +3080,58 @@ class EventService:
         expected_request_id: str,
         note: str | None,
         operator: str,
+        outcome: AttentionOutcome | None = None,
     ) -> ResolveResponse:
         if self.governance_deployment_mode != "team":
             raise ResolveError("not_team_mode", "governance is not in team mode")
         record = check_resolvable(
-            self._load_outbox_for_resolve(), action, expected_request_id
+            self._load_outbox_for_resolve(), action, expected_request_id, outcome
         )
 
         central_step: Literal[
-            "not_applicable", "cancelled", "aborted", "already_terminal"
+            "not_applicable",
+            "cancelled",
+            "aborted",
+            "already_terminal",
+            "assertion_filed",
         ] = "not_applicable"
         if action is AttentionAction.RETRY:
             updated = await self.governance_outbox.mutate(
                 lambda r: apply_retry(r, expected_request_id)
             )
         elif action is AttentionAction.DISMISS:
-            updated = await self.governance_outbox.mutate(
-                lambda r: apply_close(r, action, expected_request_id, note, operator)
-            )
+            if outcome is not None:
+                # Central first, like abandon: if it does not take the assertion
+                # the record is left as it was and the operator is told.
+                central_step = await self._file_requester_assertion(
+                    record, outcome, note, operator
+                )
+                check_resolvable(
+                    self._load_outbox_for_resolve(),
+                    action,
+                    expected_request_id,
+                    outcome,
+                )
+            try:
+                updated = await self.governance_outbox.mutate(
+                    lambda r: apply_close(
+                        r, action, expected_request_id, note, operator, outcome
+                    )
+                )
+            except ResolveError:
+                raise
+            except Exception as exc:
+                if central_step != "assertion_filed":
+                    raise
+                # Central has the assertion; the record here is still parked. The
+                # same dismiss (same outcome, note and name) finishes it: central
+                # replays the same finding. A different one would add another.
+                raise ResolveError(
+                    "local_close_failed",
+                    "central took the assertion, but closing the record here "
+                    f"failed ({type(exc).__name__}); repeat the same dismiss "
+                    "(same outcome, note and name) to finish",
+                ) from exc
         else:
             client = self.governance_client
             if client is None:

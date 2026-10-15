@@ -31,6 +31,7 @@ from openhands.agent_server.event_service import (
 )
 from openhands.agent_server.governance_attention import (
     AttentionAction,
+    AttentionOutcome,
     ResolveResponse,
 )
 from openhands.agent_server.governance_client import GovernanceClient
@@ -1975,6 +1976,7 @@ class ConversationService:
         expected_request_id: str,
         note: str | None,
         operator: str,
+        outcome: AttentionOutcome | None = None,
     ) -> ResolveResponse | None:
         """Operator action on a conversation's governance outbox (see
         ``EventService.resolve_needs_attention``); None if there is no such
@@ -2014,6 +2016,7 @@ class ConversationService:
                     expected_request_id=expected_request_id,
                     note=note,
                     operator=operator,
+                    outcome=outcome,
                 )
             )
             try:

@@ -185,6 +185,7 @@ def test_attention_lists_parked_conversations_in_team_mode(tmp_path):
             "request_id": "req-1",
             "attempt_count": 1,
             "allowed_actions": ["retry", "abandon", "dismiss"],
+            "allowed_outcomes": [],
         }
     ]
 
@@ -219,12 +220,14 @@ RESOLVE_URL = "/api/governance/attention/{}/resolve"
 class _FakeEventService:
     def __init__(self, error: ResolveError | None = None):
         self.error = error
+        self.outcomes: list = []
         self.calls: list[tuple[str, str, str | None, str]] = []
 
     async def resolve_needs_attention(
-        self, action, *, expected_request_id, note, operator
+        self, action, *, expected_request_id, note, operator, outcome=None
     ):
         self.calls.append((action.value, expected_request_id, note, operator))
+        self.outcomes.append(outcome)
         if self.error is not None:
             raise self.error
         return ResolveResponse(
@@ -247,7 +250,9 @@ def _resolve_client(config: Config, event_service) -> tuple[TestClient, list]:
     flow fails these tests."""
     asked: list = []
 
-    async def _resolve(conversation_id, action, *, expected_request_id, note, operator):
+    async def _resolve(
+        conversation_id, action, *, expected_request_id, note, operator, outcome=None
+    ):
         asked.append(conversation_id)
         if event_service is None:
             return None
@@ -256,6 +261,7 @@ def _resolve_client(config: Config, event_service) -> tuple[TestClient, list]:
             expected_request_id=expected_request_id,
             note=note,
             operator=operator,
+            outcome=outcome,
         )
 
     app = create_app(config)
