@@ -7660,11 +7660,12 @@ class TestEventServiceGovernanceOrchestration:
                 AttentionAction.RETRY,
                 expected_request_id="req-1",
                 note=None,
-                operator="ada",
+                operator="retry-operator-7",
             )
 
         assert governed_service.governance_outbox.load().resolved_by is None
-        assert "operator 'ada' (self-declared) retry" in caplog.text
+        # a name no other test uses, so a log line that ignored the argument fails
+        assert "operator 'retry-operator-7' (self-declared) retry" in caplog.text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
