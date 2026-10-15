@@ -292,3 +292,22 @@ def test_the_home_directory_is_shortened_however_another_tool_writes_it(text):
 def test_a_longer_user_name_is_not_cut_in_half():
     cleaned = raw_view.scrub("cat C:/Users/someone2/x", "C:/Users/someone")
     assert cleaned == "cat C:/Users/someone2/x"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("cat ~/.claude/projects/C--Users-someone/memory/x.md", "C--Users-~/memory"),
+        ("ls C--Users-someone", "ls C--Users-~"),
+        # a project folder under the home directory is encoded as home + "-" + its name
+        ("cat ~/.claude/projects/C--Users-someone-sub/x", "C--Users-~-sub/x"),
+        ("cat C--Users-someone2/x", "C--Users-someone2/x"),
+    ],
+)
+def test_claude_codes_encoded_home_directory_name_is_shortened(text, expected):
+    """Claude Code names a project folder after where it was started, with every
+    separator turned into a dash: the user name is in it like anywhere else."""
+    cleaned = raw_view.scrub(text, "C:/Users/someone")
+    assert expected in cleaned, cleaned
+    if "someone2" not in text:
+        assert "someone" not in cleaned

@@ -223,6 +223,8 @@ def scan_command(command: str) -> tuple[list[str], int, bool, bool, list[str]]:
             current = []
         elif c == ">":
             j = i + 1
+            if command.startswith(">|", i):
+                j = i + 2  # `>|` (override noclobber) is one operator, not a pipe
             while j < n and command[j] in ">&":
                 j += 1
             m = re.match(r"\s*([^\s;|&]+)", command[j:])
@@ -239,6 +241,8 @@ def scan_command(command: str) -> tuple[list[str], int, bool, bool, list[str]]:
             if target:
                 targets.append(target)
             current.append(c)
+            i = j  # the whole operator (`>>`, `&>>`) is handled once
+            continue
         else:
             current.append(c)
         i += 1

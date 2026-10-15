@@ -98,6 +98,11 @@ def scrub(text: str, home: str | None = None) -> str:
                 "~",
                 out,
             )
+    if home:
+        # Claude Code names a project directory after the path it was started in, with
+        # every separator turned into "-": C:/Users/name -> C--Users-name
+        encoded = re.sub(r"[^A-Za-z0-9]", "-", home)
+        out = re.sub(re.escape(encoded) + r"(?![A-Za-z0-9_.])", "C--Users-~", out)
     for pattern, replacement in _SECRET_PATTERNS:
         out = pattern.sub(replacement, out)
     if len(out) > MAX_COMMAND_CHARS:
