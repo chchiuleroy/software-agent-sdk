@@ -5,6 +5,13 @@ import test from "node:test";
 import {
   AUDIT_EVENT_TYPES,
   auditPath,
+  CONCLUSIONS,
+  describeQueueItem,
+  QUEUE_FILTERS,
+  queuePath,
+  renderQueueItem,
+  verificationBody,
+  verifyConfirmText,
   base64url,
   buildAuthUrl,
   decodeJwtPayload,
@@ -263,10 +270,10 @@ test("superadmin gets the admin area but NOT approvals: the roles are separate",
   );
 });
 
-test("governance.admin unlocks the Audit trail and nothing else of the admin area", () => {
+test("governance.admin unlocks Audit and Reconciliation and nothing else of the admin area", () => {
   assert.deepEqual(
     ids(visibleSections(["governance.admin", "agent.operator"])),
-    ["profile", "audit"],
+    ["profile", "audit", "reconciliation"],
   );
   assert.deepEqual(ids(visibleSections(["agent.operator"])), ["profile"]);
 });
@@ -709,4 +716,218 @@ test("an audit row without a payload has no details block, and my own action say
 test("the event type filter list has no duplicates and is sorted", () => {
   assert.equal(new Set(AUDIT_EVENT_TYPES).size, AUDIT_EVENT_TYPES.length);
   assert.deepEqual([...AUDIT_EVENT_TYPES].sort(), AUDIT_EVENT_TYPES);
+});
+
+// ------------------------------------------------------- reconciliation queue
+
+const QUEUE_ME = { issuer: "http://kc/realms/x", sub: "dave-0000-1111-2222" };
+
+function queueItem(overrides = {}) {
+  return {
+    id: "0f8fad5b-d9cb-469f-a165-70867728950e",
+    request_id: "req-1",
+    status: "failed_unknown",
+    requester: "http://kc/realms/x#svc-agent-1",
+    origin_device_id: "laptop-7",
+    conversation_id: "conv-9",
+    tool_name: "terminal",
+    action_summary: "run the deploy script",
+    action_payload: { kind: "terminal", command_preview: "deploy.sh" },
+    created_at: "2026-10-14T12:00:00.123456+00:00",
+    admin_verified: false,
+    findings: [],
+    ...overrides,
+  };
+}
+
+function findNodes(node, tag) {
+  return [
+    ...(node.tag === tag ? [node] : []),
+    ...node.children.flatMap((child) => findNodes(child, tag)),
+  ];
+}
+
+test("Reconciliation is a live section for governance.admin ONLY", () => {
+  const section = SECTIONS.find((s) => s.id === "reconciliation");
+  assert.equal(section.status, "live");
+  assert.deepEqual(section.requiredRoles, ["governance.admin"]);
+  assert.ok(ids(visibleSections(["governance.admin"])).includes("reconciliation"));
+  // superadmin is not a superset of admin: the finding it files is admin-only
+  for (const roles of [
+    [],
+    ["agent.approver"],
+    ["agent.operator"],
+    ["governance.superadmin"],
+  ]) {
+    assert.ok(
+      !ids(visibleSections(roles)).includes("reconciliation"),
+      roles.join(),
+    );
+  }
+  assert.deepEqual(resolveSection("#reconciliation", ["governance.superadmin"]), {
+    id: "profile",
+    denied: true,
+  });
+  assert.deepEqual(resolveSection("#reconciliation", ["governance.admin"]), {
+    id: "reconciliation",
+    denied: false,
+  });
+});
+
+test("the queue path carries the filter and the cursor untouched", () => {
+  const base = "/api/v1/reconciliation-queue?limit=50";
+  assert.equal(queuePath("false", null), `${base}&admin_verified=false`);
+  assert.equal(queuePath("true", null), `${base}&admin_verified=true`);
+  assert.equal(queuePath("", null), base);
+  assert.equal(queuePath("anything else", null), base);
+  assert.match(queuePath("false", "a b/c+d="), /cursor=a\+b%2Fc%2Bd%3D$/);
+});
+
+test("the filter choices default to what needs a person", () => {
+  assert.equal(QUEUE_FILTERS[0][0], "false");
+  assert.deepEqual(
+    QUEUE_FILTERS.map(([value]) => value),
+    ["false", "true", ""],
+  );
+});
+
+test("a verification body only ever carries a known conclusion and a bounded note", () => {
+  assert.deepEqual(verificationBody("confirmed_executed", "  checked the log  "), {
+    finding_type: "admin_verified",
+    conclusion: "confirmed_executed",
+    note: "checked the log",
+  });
+  assert.equal(verificationBody("confirmed_maybe", "x"), null);
+  assert.equal(verificationBody("", "x"), null);
+  assert.equal(verificationBody("inconclusive", "x".repeat(900)).note.length, 500);
+  assert.equal(verificationBody("inconclusive", undefined).note, "");
+  assert.deepEqual(
+    CONCLUSIONS.map(([value]) => value),
+    ["confirmed_not_executed", "confirmed_executed", "inconclusive"],
+  );
+});
+
+test("the confirmation names the request, the requester and the finding", () => {
+  const view = describeQueueItem(queueItem(), QUEUE_ME);
+  const text = verifyConfirmText(view, "confirmed_not_executed");
+  assert.match(text, /terminal requested by svc-agent-1/);
+  assert.match(text, /run the deploy script/);
+  assert.match(text, /did NOT run/);
+  assert.match(text, /does not change the request's status/);
+});
+
+test("a queue row shows what a verifier needs and marks my own request", () => {
+  const view = describeQueueItem(queueItem(), QUEUE_ME);
+  assert.equal(view.tool, "terminal");
+  assert.equal(view.summary, "run the deploy script");
+  assert.equal(view.created, "2026-10-14 12:00 UTC");
+  assert.equal(view.verified, false);
+  assert.equal(view.canVerify, true);
+  assert.equal(view.requester.mine, false);
+  const own = describeQueueItem(
+    queueItem({ requester: `${QUEUE_ME.issuer}#${QUEUE_ME.sub}` }),
+    QUEUE_ME,
+  );
+  assert.equal(own.requester.mine, true);
+  assert.equal(own.canVerify, false, "central refuses a verifier who is the requester");
+});
+
+test("findings keep who said what, and the evidence is text", () => {
+  const view = describeQueueItem(
+    queueItem({
+      admin_verified: true,
+      findings: [
+        {
+          finding_type: "requester_assertion",
+          conclusion: "confirmed_executed",
+          note: "I saw it run",
+          verifier: "http://kc/realms/x#svc-agent-1",
+          evidence: { operator: "alice" },
+          created_at: "2026-10-14T13:00:00+00:00",
+        },
+        {
+          finding_type: "admin_verified",
+          conclusion: null,
+          note: "",
+          verifier: `${QUEUE_ME.issuer}#${QUEUE_ME.sub}`,
+          evidence: null,
+          created_at: "2026-10-14T14:00:00+00:00",
+        },
+      ],
+    }),
+    QUEUE_ME,
+  );
+  assert.equal(view.verified, true);
+  assert.equal(view.findings.length, 2);
+  assert.equal(view.findings[0].conclusion, "confirmed_executed");
+  assert.match(view.findings[0].evidence, /"operator": "alice"/);
+  assert.equal(view.findings[1].conclusion, "no conclusion");
+  assert.equal(view.findings[1].evidence, "");
+  assert.equal(view.findings[1].verifier.mine, true);
+});
+
+test("a queue card renders hostile values as text and wires the verify button", () => {
+  const hostile = '<img src=x onerror="alert(1)">';
+  const calls = [];
+  const view = describeQueueItem(
+    queueItem({
+      tool_name: hostile,
+      action_summary: hostile,
+      findings: [
+        {
+          finding_type: "requester_assertion",
+          conclusion: "inconclusive",
+          note: hostile,
+          verifier: `i#${hostile}`,
+          evidence: { text: hostile },
+          created_at: "2026-10-14T13:00:00+00:00",
+        },
+      ],
+    }),
+    QUEUE_ME,
+  );
+  const li = renderQueueItem(fakeDocument(), view, (v, conclusion, note) =>
+    calls.push([v.id, conclusion, note]),
+  );
+  assert.ok(allText(li).includes(hostile));
+  const [button] = findNodes(li, "button");
+  assert.ok(button, "a verifier who is not the requester gets a button");
+  const [select] = findNodes(li, "select");
+  const [input] = findNodes(li, "input");
+  assert.deepEqual(
+    select.children.map((option) => option.value),
+    CONCLUSIONS.map(([value]) => value),
+  );
+  select.value = "confirmed_not_executed";
+  input.value = "checked";
+  button.listeners.click();
+  assert.deepEqual(calls, [[view.id, "confirmed_not_executed", "checked"]]);
+});
+
+test("my own request has no verify form, only the reason", () => {
+  const view = describeQueueItem(
+    queueItem({ requester: `${QUEUE_ME.issuer}#${QUEUE_ME.sub}` }),
+    QUEUE_ME,
+  );
+  const li = renderQueueItem(fakeDocument(), view, () => {
+    throw new Error("must not be callable");
+  });
+  assert.equal(findNodes(li, "button").length, 0);
+  assert.match(allText(li), /someone else has to verify it/);
+  assert.match(allText(li), /\(you\)/);
+});
+
+test("a verified row is marked and an unverified one is not", () => {
+  const done = renderQueueItem(
+    fakeDocument(),
+    describeQueueItem(queueItem({ admin_verified: true }), QUEUE_ME),
+    () => {},
+  );
+  assert.match(done.className, /verified/);
+  const open = renderQueueItem(
+    fakeDocument(),
+    describeQueueItem(queueItem(), QUEUE_ME),
+    () => {},
+  );
+  assert.doesNotMatch(open.className, /verified/);
 });

@@ -963,3 +963,97 @@ async def test_list_pending_rejects_out_of_range_limit(client, signing_key, limi
     resp = await _list_pending(client, _approver(signing_key), limit=limit)
 
     assert resp.status_code == 422
+
+
+# --- admin_verified must come from someone other than the requester --------
+
+
+async def test_admin_verified_by_the_requester_is_refused(
+    client, signing_key, db_session
+):
+    """alice made the request and also holds governance.admin: the role lets her
+    file an admin_verified finding on other people's requests, but not on her own."""
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    both = _sign(signing_key, sub="alice", roles=["agent.operator", "governance.admin"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "admin_verified", "conclusion": "confirmed_not_executed"},
+        headers=_auth(both, "self-verify-1"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "cannot_verify_own_request"
+    assert await _findings_for(db_session, approval_id) == []
+
+
+async def test_admin_verified_by_another_admin_is_accepted(
+    client, signing_key, db_session
+):
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    admin = _sign(signing_key, sub="dave", roles=["governance.admin"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "admin_verified", "conclusion": "confirmed_not_executed"},
+        headers=_auth(admin, "other-verify-1"),
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(await _findings_for(db_session, approval_id)) == 1
+
+
+async def test_the_self_verification_refusal_does_not_depend_on_the_status(
+    client, signing_key
+):
+    """On a pending record the same principal gets the self-verification answer, not
+    record_not_terminal: whether it is her own request does not depend on its state."""
+    created = await _create_approval(client, signing_key, sub="alice")
+    both = _sign(signing_key, sub="alice", roles=["agent.operator", "governance.admin"])
+    resp = await client.post(
+        f"/api/v1/approvals/{created['id']}/reconciliation-findings",
+        json={"finding_type": "admin_verified", "conclusion": "inconclusive"},
+        headers=_auth(both, "self-verify-2"),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "cannot_verify_own_request"
+
+
+async def test_the_requester_may_still_file_a_requester_assertion_while_admin(
+    client, signing_key, db_session
+):
+    """The rule is about the independent check only: the owner's own statement of
+    what happened is still welcome, whatever other roles she holds."""
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    both = _sign(signing_key, sub="alice", roles=["agent.operator", "governance.admin"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "requester_assertion", "note": "I never ran it"},
+        headers=_auth(both, "self-assert-1"),
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_the_same_subject_under_another_issuer_is_not_the_requester(
+    client, signing_key, db_session
+):
+    """The requester is an (issuer, subject) pair: the same subject name recorded
+    under a different issuer is a different principal, so her admin_verified counts."""
+    approval_id, _attempt_id = await _approval_failed_unknown(
+        client, signing_key, db_session
+    )
+    await db_session.execute(
+        update(PendingApprovalRecord)
+        .where(PendingApprovalRecord.id == uuid.UUID(approval_id))
+        .values(requester_issuer="https://other-issuer.example/realms/x")
+    )
+    await db_session.flush()
+    both = _sign(signing_key, sub="alice", roles=["agent.operator", "governance.admin"])
+    resp = await client.post(
+        f"/api/v1/approvals/{approval_id}/reconciliation-findings",
+        json={"finding_type": "admin_verified", "conclusion": "inconclusive"},
+        headers=_auth(both, "lookalike-1"),
+    )
+    assert resp.status_code == 201, resp.text

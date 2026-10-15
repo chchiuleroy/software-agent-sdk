@@ -132,6 +132,8 @@ UPDATE 的 0-row 分支）與新加的 `_commit_or_replay()` 併發回退路徑�
   1 筆判斷 `next_offset`；offset 分頁的「新資料進來時頁面會位移」限制仍在
   （稽核端點已於 2026-10-14 改用 cursor，這個端點沒改）。回傳含
   `revoked_at`／`revoked_by_subject`
+- `GET /api/v1/reconciliation-queue`（2026-10-15，1.10 的 `admin_verified` 入口）：**只有 `governance.admin`** 可讀（superadmin 不是超集，這個動作導向的 finding 也只授權給 admin）。唯讀，列出狀態為 `failed_unknown` 的核准（唯一需要人工對帳的狀態），每筆附既有的 findings（類型、結論、備註、誰填的、evidence）與 `admin_verified` 旗標；`admin_verified=true|false` 篩選已／未驗證。**finding 只是證據、不改 `status`，所以驗證後的紀錄仍留在清單裡**。keyset 分頁沿用稽核端點的游標，鍵是核准的 `(created_at, id)`（請求建立時間，不是變成 `failed_unknown` 的時間）；`offset` 回 400。`note` 與 `evidence` 是請求者或管理者寫的文字，顯示時一律當不可信文字
+- `POST /api/v1/approvals/{id}/reconciliation-findings` 的 `admin_verified` 新增規則（2026-10-15）：**驗證者與該核准的請求者是同一個 principal（issuer 與 sub 都相同）時回 409 `cannot_verify_own_request`**，不論記錄狀態；請求者自己的 `requester_assertion` 不受影響。注意既有的自我核准規則回 403（`cannot_decide_own_request`），這條依 Roy 的決定用 409
 - `GET /api/v1/audit-events`：`governance.admin` 與 `governance.superadmin`
   可讀（2026-10-14 起後者也可，供主控台 Audit 畫面；superadmin 在其他處仍不是
   admin 的超集）。支援 `event_type`／`approval_request_id` 篩選，**keyset 分頁**：
@@ -573,6 +575,8 @@ email 登入時這個呼叫就是把帳號綁定到部門的那一步**），再
 | 所有登入者 | Profile | 已有 |
 | `agent.approver` | Approvals（原核准收件匣） | 已有 |
 | `governance.superadmin` | Devices | 已有（2026-10-12，見下） |
+| `governance.admin` | Audit | 已有（2026-10-14；superadmin 也可） |
+| `governance.admin` | Reconciliation | 已有（2026-10-15，見下；只有 admin） |
 | `governance.superadmin` | Account requests、Departments、Tool permissions、Awaiting first sign-in | 只有灰色標示（coming soon），畫面尚未做 |
 
 角色**互不包含**：superadmin 看不到 Approvals，`governance.admin` 不會解鎖超管區。
@@ -591,6 +595,8 @@ email 登入時這個呼叫就是把帳號綁定到部門的那一步**），再
 驗證：`tests/js/inbox.test.mjs`（區塊可見性、深連結、身分卡、導覽、裝置清單；突變測試確認改錯
 角色會失敗）；瀏覽器端用測試用假 IdP（驗證 PKCE verifier 與 redirect_uri）逐一以五種
 身分登入檢查過。**尚未對真的 Keycloak 登入驗證**（需要先註冊 public client 並建立真人帳號）。
+
+**Reconciliation（admin 專屬，2026-10-15）**：列出 `failed_unknown` 的核准（`GET /api/v1/reconciliation-queue`），預設只看「需要驗證」（尚無 `admin_verified`），可切到「已驗證」或「全部」；每筆顯示請求內容、請求者自己的說法（`requester_assertion`、`late_report`）與已有的驗證。管理者選「確認沒執行／確認有執行／無法判斷」並寫備註後送出（`POST .../reconciliation-findings`，`finding_type=admin_verified`），確認對話框寫明工具、請求者與結論，並說明這只是證據、不改核准狀態。請求者是自己時不提供表單（中央會回 409）。同一筆可以再送第二個驗證（append-only）。驗證：Node 單元測試與 9 個突變、central 整合測試與突變、對真 central 的 e2e（SDK repo `governance/e2e/e2e_reconciliation_queue.py`），並用測試用假 IdP 以 `adm` 登入點過（以頁面文字確認，不是截圖）。**尚未對真的 Keycloak 登入驗證。**
 
 ## 裝置綁定 `CGA_DEVICE_BINDING_ENFORCED`（2026-10-02，gap #6）
 
