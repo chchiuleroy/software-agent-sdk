@@ -103,6 +103,15 @@ def test_a_schema_that_is_not_plain_json_cannot_be_fingerprinted():
         fp(schema={1, 2})  # type: ignore[arg-type]
 
 
+def test_a_non_string_key_is_refused_not_turned_into_a_string():
+    """json.dumps would give {1: 'x'} the same bytes as {'1': 'x'}."""
+    with pytest.raises(TypeError):
+        fp(schema={"properties": {1: {"type": "string"}}})  # type: ignore[dict-item]
+    with pytest.raises(TypeError):
+        fp(schema={"anyOf": [{2: "x"}]})  # type: ignore[dict-item]
+    assert fp(schema={"1": "x"})  # the string key is fine
+
+
 def test_what_is_hashed_is_the_tool_and_nothing_around_it():
     """The same three fields give the same fingerprint however the caller got them."""
     a = mcp_tool_fingerprint("t", "d", {"type": "object"})

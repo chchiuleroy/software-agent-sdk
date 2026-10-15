@@ -31,12 +31,26 @@ from typing import Any
 FINGERPRINT_PREFIX = "sha256:"
 
 
+def _require_plain_json(value: Any) -> None:
+    """``json.dumps`` quietly turns an integer key into a string, so ``{1: "x"}`` and
+    ``{"1": "x"}`` would share a fingerprint although only one can come from JSON."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"schema key {key!r} is not a string")
+            _require_plain_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            _require_plain_json(item)
+
+
 def mcp_tool_fingerprint(
     name: str, description: str | None, input_schema: dict[str, Any]
 ) -> str:
     """The fingerprint of one MCP tool. Raises ``TypeError``/``ValueError`` for a
     schema that is not plain JSON (a value JSON cannot hold, or NaN/infinity):
     such a tool cannot be fingerprinted and must not be treated as confirmed."""
+    _require_plain_json(input_schema)
     canonical = json.dumps(
         {"name": name, "description": description, "input_schema": input_schema},
         sort_keys=True,

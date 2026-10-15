@@ -29,6 +29,7 @@ import os
 import pathlib
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,7 @@ LOGDIR = pathlib.Path(tempfile.mkdtemp(prefix="mcp_logs_"))
 WORKSPACE = pathlib.Path(tempfile.mkdtemp(prefix="mcp_ws_"))
 (WORKSPACE / "hello.txt").write_text("hello from the workspace\n")
 NOTES = LOGDIR / "notes.txt"
+CALLS = LOGDIR / "mcp_calls.txt"
 LLM_CALLS: list[str] = []
 TOOLS_SEEN: set[str] = set()
 
@@ -215,7 +217,7 @@ def start_request(first_message: str) -> dict:
                 api_key=SecretStr("x"),
             ),
             tools=[Tool(name="terminal"), Tool(name="file_editor")],
-            mcp_config={"ohs_test": {"url": MCP_URL}},
+            mcp_config={"ohs_test": {"url": MCP_URL}},  # type: ignore[arg-type]  # coerced
         ),
         workspace=LocalWorkspace(working_dir=str(WORKSPACE)),
         initial_message=SendMessageRequest(
@@ -252,11 +254,31 @@ async def wait_outcome(ac: httpx.AsyncClient, cid: str, timeout=60.0):
     return status, events
 
 
+async def start_run(ac: httpx.AsyncClient, cid: str) -> None:
+    """Ask for a run. 409 means the conversation is already running (it starts by
+    itself once it has a message); any other failure stops the test."""
+    r = await ac.post(f"/api/conversations/{cid}/run")
+    if r.status_code not in (200, 201, 202, 409):
+        raise SystemExit(f"/run failed: {r.status_code} {r.text[:200]}")
+
+
+def mcp_calls() -> list[str]:
+    """Tool names the MCP server itself saw called, in order."""
+    return CALLS.read_text(encoding="utf-8").split() if CALLS.exists() else []
+
+
+def port_is_free(port: int) -> bool:
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", port)) != 0
+
+
 def start_mcp(suffix: str = "") -> subprocess.Popen:
     env = {
         **os.environ,
         "PYTHONUTF8": "1",
         "OHS_TEST_MCP_NOTES_FILE": str(NOTES),
+        "OHS_TEST_MCP_CALL_LOG": str(CALLS),
         "OHS_TEST_MCP_DESC_SUFFIX": suffix,
     }
     return subprocess.Popen(
@@ -300,11 +322,21 @@ async def wait_mcp(timeout=30.0) -> bool:
 def stop(proc: subprocess.Popen | None) -> None:
     if proc is None:
         return
-    proc.terminate()
+    if os.name == "nt":
+        # A venv's python.exe starts the real interpreter as a child; terminating
+        # only the parent can leave that child listening. Kill the whole tree.
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        proc.terminate()
     try:
         proc.wait(timeout=15)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait(timeout=15)
 
 
 def start_agent(agent_dir: str, extra_env: dict[str, str]) -> subprocess.Popen:
@@ -389,37 +421,38 @@ async def main():
         target=ThreadingHTTPServer(("127.0.0.1", LLM_PORT), _Llm).serve_forever,
         daemon=True,
     ).start()
-    subprocess.run([pg_tool("createdb"), *PG, DB], check=True)
-    cenv = {
-        **os.environ,
-        "PYTHONUTF8": "1",
-        "CGA_DATABASE_URL": f"postgresql+asyncpg://cga@127.0.0.1:54329/{DB}",
-        "CGA_OIDC_ISSUER": ISSUER,
-        "CGA_OIDC_JWKS_URL": f"http://127.0.0.1:{IDP_PORT}/certs",
-        "CGA_OIDC_AUDIENCE": AUDIENCE,
-        "CGA_OIDC_REQUIRE_HTTPS": "false",
-        "CGA_PORT": str(API_PORT),
-    }
-    subprocess.run(
-        [CPY, "-m", "alembic", "upgrade", "head"],
-        cwd=CENTRAL,
-        env=cenv,
-        check=True,
-        capture_output=True,
-    )
-    central = subprocess.Popen(
-        [CPY, "-c", "from central_governance_api.main import main; main()"],
-        cwd=CENTRAL,
-        env=cenv,
-        stdout=open(LOGDIR / "central.log", "w", encoding="utf-8"),
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-    )
     agent_dir = tempfile.mkdtemp(prefix="mcp_agent_")
     agent = None
     mcp = None
+    central = None
     try:
+        subprocess.run([pg_tool("createdb"), *PG, DB], check=True)
+        cenv = {
+            **os.environ,
+            "PYTHONUTF8": "1",
+            "CGA_DATABASE_URL": f"postgresql+asyncpg://cga@127.0.0.1:54329/{DB}",
+            "CGA_OIDC_ISSUER": ISSUER,
+            "CGA_OIDC_JWKS_URL": f"http://127.0.0.1:{IDP_PORT}/certs",
+            "CGA_OIDC_AUDIENCE": AUDIENCE,
+            "CGA_OIDC_REQUIRE_HTTPS": "false",
+            "CGA_PORT": str(API_PORT),
+        }
+        subprocess.run(
+            [CPY, "-m", "alembic", "upgrade", "head"],
+            cwd=CENTRAL,
+            env=cenv,
+            check=True,
+            capture_output=True,
+        )
+        central = subprocess.Popen(
+            [CPY, "-c", "from central_governance_api.main import main; main()"],
+            cwd=CENTRAL,
+            env=cenv,
+            stdout=open(LOGDIR / "central.log", "w", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+        )
         async with httpx.AsyncClient(
             base_url=f"http://127.0.0.1:{API_PORT}", timeout=20
         ) as c:
@@ -446,6 +479,18 @@ async def main():
             f"tools={sorted(first)}",
         )
 
+        # positive control: the call log really records a call the server executes
+        from fastmcp import Client
+
+        async with Client(MCP_URL) as client:
+            await client.call_tool("word_count", {"text": "one two three"})
+        check(
+            "control: the MCP server's call log records a call it executes",
+            mcp_calls() == ["word_count"],
+            f"calls={mcp_calls()}",
+        )
+        CALLS.unlink(missing_ok=True)
+
         # === Phase 1: default settings ================================================
         agent = start_agent(agent_dir, {})
         async with httpx.AsyncClient(
@@ -460,7 +505,7 @@ async def main():
                     print("start failed", r.status_code, r.text[:400])
                     return None, []
                 cid = r.json()["id"]
-                await ac.post(f"/api/conversations/{cid}/run")
+                await start_run(ac, cid)
                 return await wait_outcome(ac, cid)
 
             # control: a built-in tool is not refused
@@ -503,6 +548,11 @@ async def main():
                     f"refusals={len(refusals)} ran={len(ran)} status={status}",
                 )
                 check(
+                    f"{label}: the MCP server was never called",
+                    mcp_calls() == [],
+                    f"calls={mcp_calls()}",
+                )
+                check(
                     f"{label}: central holds no approval for it",
                     len(approvals()) == before,
                     f"approvals={len(approvals())}",
@@ -533,7 +583,7 @@ async def main():
                 "/api/conversations", json=start_request("USE_ADD_NOTE please do it")
             )
             cid = r.json()["id"]
-            await ac.post(f"/api/conversations/{cid}/run")
+            await start_run(ac, cid)
             rows: list = []
             for _ in range(60):
                 rows = [row for row in approvals() if row[0].endswith("add_note")]
@@ -548,15 +598,32 @@ async def main():
             if rows:
                 _, summary, payload = rows[0]
                 blob = summary + json.dumps(payload, ensure_ascii=False)
+                shown = {
+                    "kind",
+                    "arg_names",
+                    "args_size",
+                    "tool_name",
+                    "redactions",
+                    "redaction_version",
+                    "projection_version",
+                }
                 check(
                     "refusal off: the approver sees the tool name, the argument names "
                     "and a size, not the values",
-                    payload.get("kind") == "generic"
-                    and bool(payload.get("arg_names"))
+                    set(payload) == shown
+                    and payload["kind"] == "generic"
+                    and payload["tool_name"].endswith("add_note")
+                    and payload["arg_names"] == ["data"]
+                    and isinstance(payload["args_size"], int)
+                    and summary == f"{payload['tool_name']} (1 argument(s))"
                     and SECRET_NOTE not in blob,
                     f"summary={summary!r} payload={json.dumps(payload)[:200]}",
                 )
-            check("refusal off: nothing has run yet", not NOTES.exists())
+            check(
+                "refusal off: nothing has run yet",
+                not NOTES.exists() and mcp_calls() == [],
+                f"calls={mcp_calls()}",
+            )
 
         # === Phase 3 second half: a changed description changes the fingerprint =======
         stop(mcp)
@@ -567,12 +634,19 @@ async def main():
         differs = sorted(n for n in first if changed.get(n) != first[n])
         check(
             "fingerprint: a changed description changes that tool's fingerprint only",
-            differs == ["word_count"],
+            set(changed) == set(first) and differs == ["word_count"],
             f"changed={differs}",
         )
     finally:
         for proc in (agent, mcp, central):
             stop(proc)
+        busy = [API_PORT, AGENT_PORT, MCP_PORT]
+        for _ in range(20):
+            busy = [port for port in busy if not port_is_free(port)]
+            if not busy:
+                break
+            time.sleep(0.5)
+        check("cleanup: no test port is still listening", not busy, f"busy={busy}")
         outs = {
             n: (LOGDIR / f"{n}.log").read_text(encoding="utf-8", errors="replace")
             if (LOGDIR / f"{n}.log").exists()

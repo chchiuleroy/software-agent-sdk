@@ -20,6 +20,8 @@ Environment:
 
   OHS_TEST_MCP_NOTES_FILE   where ``add_note`` writes (default: a file in the system
                             temp dir)
+  OHS_TEST_MCP_CALL_LOG     if set, every tool call appends its tool name to this file
+                            before it runs (a test reads it to show what was NOT called)
   OHS_TEST_MCP_DESC_SUFFIX  appended to ``word_count``'s description; changing it
                             between runs is how a test makes the server describe a
                             tool differently from before (a "rug pull")
@@ -49,21 +51,31 @@ def notes_file() -> pathlib.Path:
     )
 
 
+def record_call(name: str) -> None:
+    path = os.environ.get("OHS_TEST_MCP_CALL_LOG")
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(name + "\n")
+
+
 def build_server(description_suffix: str = "") -> FastMCP:
     mcp = FastMCP("ohs_test")
 
     @mcp.tool
     def sum_numbers(a: float, b: float) -> float:
         """Add two numbers."""
+        record_call("sum_numbers")
         return a + b
 
     @mcp.tool(description=DESCRIPTION + description_suffix)
     def word_count(text: str) -> int:
+        record_call("word_count")
         return len(text.split())
 
     @mcp.tool
     def add_note(text: str) -> str:
         """Append one line to the test notes file."""
+        record_call("add_note")
         with notes_file().open("a", encoding="utf-8") as handle:
             handle.write(text.replace("\n", " ") + "\n")
         return "noted"
