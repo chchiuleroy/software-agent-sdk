@@ -645,3 +645,45 @@ def test_the_nested_transcripts_of_sub_agents_are_read_too(tmp_path):
         f.write_text("{}\n", encoding="utf-8")
     (project / "sess" / "tool-results" / "x.txt").write_text("not a transcript")
     assert replay.transcript_files(tmp_path) == sorted([top, nested])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls 2>&1",
+        "ls 2>/dev/null",
+        "ls > /dev/null",
+        "ls >/dev/null 2>&1",
+        "ls &>/dev/null",
+        "ls 2> /dev/null | head -3",
+        "cat x 2>nul",
+        "echo hi >&2",
+        "git status -sb 2>&1 | tail -4",
+    ],
+)
+def test_discarding_or_duplicating_output_is_not_a_write(command):
+    """The first version counted `2>&1` and `> /dev/null` as writes, and /dev/null as
+    a path outside the workspace: read-only commands then read as writes outside it."""
+    f = features(command)
+    assert f["redirect"] is False, f
+    assert "write" not in f["ops"], f
+    assert f["paths_outside_cwd"] == 0, f
+    assert f["redirect_outside_cwd"] is False and f["redirect_unresolved"] is False
+
+
+@pytest.mark.parametrize(
+    "command, outside",
+    [
+        ("ls > out.txt", False),
+        ("ls >> out.txt", False),
+        ("ls > out.txt 2>&1", False),
+        ("ls > /tmp/x.txt", True),
+        ("ls 2> /tmp/err.log", True),
+        ("ls > nullable.txt", False),
+        ("ls > nul.txt", False),
+    ],
+)
+def test_a_real_redirect_is_still_a_write(command, outside):
+    f = features(command)
+    assert f["redirect"] is True and "write" in f["ops"], f
+    assert f["redirect_outside_cwd"] is outside, f
