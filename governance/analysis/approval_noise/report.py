@@ -97,20 +97,24 @@ def _strata(
 
 
 def _share(
-    strata: dict[Any, dict[str, Any]], numerator: set[str], sessions: Counter | None
+    strata: dict[Any, dict[str, Any]],
+    numerator: set[str],
+    weights: dict[Any, Counter] | None,
 ) -> float | None:
-    """Weighted share of units whose label is in ``numerator``; with ``sessions`` the
-    units are those of the resampled sessions (with multiplicity)."""
+    """Weighted share (weights N_h/n_h) of units whose label is in ``numerator``.
+    ``weights`` maps a stratum to how many times each of its sessions was drawn in
+    one bootstrap replicate; None is the sample itself."""
     total = weighted = 0.0
-    for stratum in strata.values():
+    for key, stratum in strata.items():
+        drawn = None if weights is None else weights[key]
         hit = n = 0.0
         for sess, label in stratum["units"]:
-            weight = 1.0 if sessions is None else float(sessions.get(sess, 0))
+            weight = 1.0 if drawn is None else float(drawn.get(sess, 0))
             n += weight
             if label in numerator:
                 hit += weight
         if n == 0:
-            continue  # this stratum has no unit in the resample: leave it out
+            continue
         weighted += stratum["N"] * (hit / n)
         total += stratum["N"]
     return weighted / total if total else None
@@ -119,15 +123,29 @@ def _share(
 def _interval(
     strata: dict[Any, dict[str, Any]], numerator: set[str], seed: int
 ) -> tuple[float | None, tuple[float, float] | None]:
+    """The point estimate and a session-cluster bootstrap interval. Each replicate
+    redraws the sessions WITHIN each stratum (a stratum is sampled on its own), and a
+    stratum that was taken whole (N_h == n_h) is a census: it is not resampled."""
     point = _share(strata, numerator, None)
-    sessions = sorted({s for st in strata.values() for s, _ in st["units"]})
-    if point is None or len(sessions) < 2:
+    sessions = {
+        key: sorted({s for s, _ in st["units"]})
+        for key, st in strata.items()
+        if st["N"] > len(st["units"])
+    }
+    if point is None or not any(len(v) > 1 for v in sessions.values()):
         return point, None
     rng = random.Random(seed)
     draws: list[float] = []
     for _ in range(BOOTSTRAP):
-        picked = Counter(rng.choice(sessions) for _ in sessions)
-        value = _share(strata, numerator, picked)
+        weights = {
+            key: (
+                Counter(rng.choice(sessions[key]) for _ in sessions[key])
+                if key in sessions
+                else Counter({s: 1 for s, _ in strata[key]["units"]})
+            )
+            for key in strata
+        }
+        value = _share(strata, numerator, weights)
         if value is not None:
             draws.append(value)
     draws.sort()

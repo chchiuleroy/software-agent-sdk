@@ -198,3 +198,76 @@ def test_the_rendered_report_states_its_limits_and_the_coverage():
     ):
         assert needle in text, needle
     json.dumps(est)  # serialisable
+
+
+def test_the_bootstrap_redraws_sessions_within_each_stratum_and_keeps_every_stratum():
+    """A rare stratum with one session must not drop out of a replicate (the first
+    version drew from one pool of sessions and skipped a stratum that was missed)."""
+    key, labels = build(
+        [
+            (True, "terminal", "project", 1000, [U] * 20 + [N] * 20),  # 5 sessions
+            (True, "glob", "project", 1000, [U] * 3),  # one session, sampled
+        ]
+    )
+    asked = report._strata(key, labels, True)
+    point = report._share(asked, {"NOT_NECESSARY"}, None)
+    import collections
+
+    weights = {
+        stratum: collections.Counter({s: 1 for s, _ in asked[stratum]["units"]})
+        for stratum in asked
+    }
+    # with every session drawn once, the replicate is the sample: nothing is dropped
+    assert report._share(asked, {"NOT_NECESSARY"}, weights) == pytest.approx(point)
+    low, high = report._interval(asked, {"NOT_NECESSARY"}, 3)[1]
+    assert low <= point <= high and low < high
+
+
+def test_a_stratum_taken_whole_is_a_census_and_adds_no_spread():
+    key, labels = build([(True, "terminal", "project", 40, [U] * 20 + [N] * 20)])
+    asked = report._strata(key, labels, True)
+    assert asked[("terminal", "project")]["N"] == len(
+        asked[("terminal", "project")]["units"]
+    )
+    point, interval = report._interval(asked, {"NOT_NECESSARY"}, 3)
+    assert point == pytest.approx(0.5) and interval is None
+
+
+def test_a_census_stratum_keeps_its_full_weight_in_every_replicate():
+    """A is taken whole (every call in it was labelled, all not-necessary); B is
+    sampled (all necessary). However B's sessions are redrawn, A must count in full:
+    the estimate is N_A / (N_A + N_B) every time, so the interval has no width."""
+    key, labels = build(
+        [
+            (True, "terminal", "project", 40, [U] * 40),  # census
+            (True, "file_editor", "project", 40, [N] * 40),  # a census too...
+        ]
+    )
+    # ...so make B a real sample: more calls in the population than were labelled
+    for info in key.values():
+        if info["tool"] == "file_editor":
+            info["N"] = 400
+    asked = report._strata(key, labels, True)
+    point, interval = report._interval(asked, {"NOT_NECESSARY"}, 5)
+    assert point == pytest.approx(40 / 440)
+    assert interval is not None
+    assert interval == pytest.approx((40 / 440, 40 / 440))
+
+
+def test_sessions_are_redrawn_inside_a_stratum_not_from_one_pool():
+    """Two sampled strata with different sessions: A all not-necessary, B all
+    necessary. Drawing each stratum's sessions from its own, the estimate cannot move;
+    drawing from a shared pool would leave a stratum with no unit in some replicates."""
+    key, labels = build(
+        [
+            (True, "terminal", "project", 400, [U] * 40),
+            (True, "file_editor", "project", 400, [N] * 40),
+        ]
+    )
+    for info in key.values():
+        if info["tool"] == "file_editor":
+            info["sess"] = "b" + info["sess"]
+    asked = report._strata(key, labels, True)
+    point, interval = report._interval(asked, {"NOT_NECESSARY"}, 5)
+    assert point == pytest.approx(0.5)
+    assert interval == pytest.approx((0.5, 0.5))

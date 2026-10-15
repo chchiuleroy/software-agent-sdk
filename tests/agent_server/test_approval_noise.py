@@ -630,3 +630,18 @@ def test_an_unclassified_segment_still_says_so_among_classified_ones():
     assert "other" in features("cd x && export FOO=1")["ops"]
     assert "other" in features("ls && frobnicate --now")["ops"]
     assert "other" in features("export A=1 && ls")["ops"]
+
+
+def test_the_nested_transcripts_of_sub_agents_are_read_too(tmp_path):
+    """The first version read only <project>/*.jsonl and missed the sub-agents'
+    <project>/<session>/subagents/*.jsonl (found when a reviewer asked about
+    coverage)."""
+    project = tmp_path / "proj"
+    (project / "sess" / "subagents").mkdir(parents=True)
+    (project / "sess" / "tool-results").mkdir()
+    top = project / "a.jsonl"
+    nested = project / "sess" / "subagents" / "agent-1.jsonl"
+    for f in (top, nested):
+        f.write_text("{}\n", encoding="utf-8")
+    (project / "sess" / "tool-results" / "x.txt").write_text("not a transcript")
+    assert replay.transcript_files(tmp_path) == sorted([top, nested])

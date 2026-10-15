@@ -3,7 +3,7 @@ de-identified features (see mapping.md and standard.md in this directory).
 
 Run with the SDK's own Python (the one that can import ``openhands.sdk``):
 
-    python replay.py --projects C:/Users/roy/.claude/projects --days 30 --out out
+    python replay.py --projects ~/.claude/projects --days 30 --out out
 
 Nothing here writes a path, a command line, a pattern or any file content. The
 analyzer is called in this process on the real strings, and the features a labeller
@@ -480,6 +480,14 @@ def bash_features(command: str, cwd: str | None) -> dict[str, Any]:
     }
 
 
+def transcript_files(projects: Path) -> list[Path]:
+    """Every session transcript under the projects directory, including the nested
+    ones a sub-agent writes (``<project>/<session>/subagents/*.jsonl``). The first
+    version read only the top level and so missed those; a reviewer's question about
+    coverage found it."""
+    return sorted(p for p in projects.rglob("*.jsonl") if p.is_file())
+
+
 def iter_tool_uses(path: Path, counters: dict[str, int]) -> Iterator[dict[str, Any]]:
     """The tool calls in one transcript, with the record's own time and cwd."""
     with path.open(encoding="utf-8", errors="replace") as fh:
@@ -780,7 +788,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    files = sorted(Path(args.projects).glob("*/*.jsonl"))
+    files = transcript_files(Path(args.projects).expanduser())
     if args.limit_files:
         files = files[: args.limit_files]
     since = datetime.now(UTC) - timedelta(days=args.days)
@@ -793,6 +801,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     }  # fmt: skip
     counters["files"] = len(files)
+    root = Path(args.projects).expanduser()
+    counters["nested_files"] = sum(
+        1 for f in files if len(f.relative_to(root).parts) > 2
+    )
     replayer = Replayer()
     seen: set[str] = set()
     index = 0
