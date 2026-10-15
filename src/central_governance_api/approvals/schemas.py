@@ -265,6 +265,36 @@ class ReconciliationFindingRequest(RequestModel):
         return self
 
 
+class AttentionResolutionRequest(RequestModel):
+    """What an agent-server tells central after its operator dealt with a record that
+    needed attention (retry, dismiss, abandon). Evidence of an operator's own account:
+    ``operator`` is whatever name the operator typed, never authenticated, and central
+    stores it as such. No free text from the operator is sent (the resolution note
+    stays on the device)."""
+
+    action: Literal["retry", "dismiss", "abandon"]
+    reason: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    operator: str = Field(min_length=1, max_length=64)
+    outcome: (
+        Literal["confirmed_not_executed", "confirmed_executed", "inconclusive"] | None
+    ) = None
+
+    @model_validator(mode="after")
+    def _checked(self) -> AttentionResolutionRequest:
+        if not self.operator.isprintable() or self.operator != self.operator.strip():
+            raise ValueError("operator must be visible characters, no edge spaces")
+        if self.outcome is not None and self.action != "dismiss":
+            raise ValueError("an outcome only goes with a dismiss")
+        return self
+
+
+class AttentionResolutionResponse(BaseModel):
+    id: uuid.UUID
+    approval_request_id: uuid.UUID
+    event_type: str
+    occurred_at: datetime
+
+
 class ReconciliationFindingResponse(BaseModel):
     id: uuid.UUID
     approval_request_id: uuid.UUID

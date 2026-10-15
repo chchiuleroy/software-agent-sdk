@@ -102,6 +102,8 @@ from central_governance_api.approvals.schemas import (
     FINDING_EVIDENCE_MAX_CHARS,
     MAX_FINDINGS_PER_APPROVAL,
     ApprovalSummary,
+    AttentionResolutionRequest,
+    AttentionResolutionResponse,
     CancelResponse,
     ClaimRequest,
     ClaimResponse,
@@ -975,6 +977,95 @@ async def create_reconciliation_finding(
     )
     if replayed is not None:
         return ReconciliationFindingResponse.model_validate(replayed)
+    return response
+
+
+# --- ATTENTION RESOLUTION (audit only) ----------------------------------------
+
+_ATTENTION_ENDPOINT = "POST /approvals/{id}/attention-resolutions"
+
+
+@router.post(
+    "/{approval_id}/attention-resolutions",
+    response_model=AttentionResolutionResponse,
+    status_code=201,
+)
+async def record_attention_resolution(
+    approval_id: uuid.UUID,
+    body: AttentionResolutionRequest,
+    idempotency_key: IdempotencyKeyHeader,
+    principal: Principal = Depends(get_current_principal),
+    session: AsyncSession = Depends(get_db_session),
+) -> AttentionResolutionResponse:
+    """Audit only: writes one ``attention_resolved`` event saying what an operator did
+    on the owner's device with a record that needed attention. It changes nothing
+    about the approval, whatever its status, and the operator name is the operator's
+    own claim (``operator_self_declared`` is always true)."""
+    resource_id = str(approval_id)
+    fingerprint = fingerprint_request(body.model_dump(mode="json"))
+    replayed = await find_replayed_response(
+        session,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
+        endpoint=_ATTENTION_ENDPOINT,
+        resource_id=resource_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+    )
+    if replayed is not None:
+        return AttentionResolutionResponse.model_validate(replayed)
+
+    record = await _load_record(session, approval_id)
+    authorize_on_record(
+        principal, ApprovalAction.RECORD_ATTENTION_RESOLUTION, _ownership(record)
+    )
+
+    payload: dict[str, Any] = {
+        "action": body.action,
+        "reason": body.reason,
+        "operator": body.operator,
+        "operator_self_declared": True,
+    }
+    if body.outcome is not None:
+        payload["outcome"] = body.outcome
+    event = AdminAuditEvent(
+        event_type="attention_resolved",
+        actor_issuer=principal.issuer,
+        actor_sub=principal.sub,
+        origin_device_id=record.origin_device_id,
+        approval_request_id=approval_id,
+        payload=payload,
+    )
+    session.add(event)
+    await session.flush()  # populate event.id / occurred_at
+
+    response = AttentionResolutionResponse(
+        id=event.id,
+        approval_request_id=approval_id,
+        event_type=event.event_type,
+        occurred_at=event.occurred_at,
+    )
+    record_response(
+        session,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
+        endpoint=_ATTENTION_ENDPOINT,
+        resource_id=resource_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+        response=response.model_dump(mode="json"),
+    )
+    replayed = await commit_or_replay(
+        session,
+        principal_issuer=principal.issuer,
+        principal_sub=principal.sub,
+        endpoint=_ATTENTION_ENDPOINT,
+        resource_id=resource_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+    )
+    if replayed is not None:
+        return AttentionResolutionResponse.model_validate(replayed)
     return response
 
 

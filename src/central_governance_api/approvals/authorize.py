@@ -99,6 +99,7 @@ class ApprovalAction(StrEnum):
     RECONCILE_AS_REQUESTER = "reconcile_as_requester"
     RECONCILE_AS_ADMIN = "reconcile_as_admin"
     RECONCILE_LATE_REPORT = "reconcile_late_report"
+    RECORD_ATTENTION_RESOLUTION = "record_attention_resolution"
 
 
 class AuthorizationDeniedError(Exception):
@@ -273,6 +274,20 @@ def authorize_on_record(
             raise AuthorizationDeniedError(
                 action=action,
                 reason="requires role governance.admin or agent.operator",
+            )
+        if not is_owner:
+            raise AuthorizationDeniedError(
+                action=action, reason="not this request's owner"
+            )
+        return
+
+    if action is ApprovalAction.RECORD_ATTENTION_RESOLUTION:
+        # The agent-server of the request's owner tells central what its operator did
+        # with a record that needed attention. Same shape as CLAIM: the owner holding
+        # agent.operator, no admin bypass (an admin cannot speak for that device).
+        if "agent.operator" not in principal.roles:
+            raise AuthorizationDeniedError(
+                action=action, reason="requires role agent.operator"
             )
         if not is_owner:
             raise AuthorizationDeniedError(
