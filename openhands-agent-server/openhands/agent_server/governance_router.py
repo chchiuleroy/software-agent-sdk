@@ -51,6 +51,20 @@ class CentralApiStatus(BaseModel):
     checked_at: datetime
 
 
+class DeviceRegistrationInfo(BaseModel):
+    state: Literal["pending", "registered", "revoked", "failed", "not_configured"] = (
+        Field(
+            description="Whether this server's device id is registered with "
+            "central. 'not_configured': no device id is set, so nothing is "
+            "registered."
+        )
+    )
+    error_code: str | None = Field(
+        description="A central error_code or exception class name; never "
+        "a message or a credential."
+    )
+
+
 class GovernanceStatus(BaseModel):
     deployment_mode: Literal["personal", "team"]
     missing_settings: list[str] = Field(
@@ -59,6 +73,9 @@ class GovernanceStatus(BaseModel):
     )
     central_api: CentralApiStatus | None = Field(
         description="Present only in team mode."
+    )
+    device_registration: DeviceRegistrationInfo | None = Field(
+        default=None, description="Present only in team mode."
     )
 
 
@@ -97,10 +114,18 @@ async def get_governance_status(
             "credentials_ok": None,
             "error": f"status probe timed out after {_PROBE_TIMEOUT_SECONDS:g}s",
         }
+    registration = getattr(conversation_service, "device_registration", None)
     return GovernanceStatus(
         deployment_mode="team",
         missing_settings=missing_team_mode_settings(config),
         central_api=CentralApiStatus(**probe, checked_at=checked_at),
+        device_registration=(
+            DeviceRegistrationInfo(
+                state=registration.state, error_code=registration.error_code
+            )
+            if registration is not None
+            else None
+        ),
     )
 
 

@@ -63,6 +63,7 @@ def test_personal_mode_reports_personal_and_never_probes():
         "deployment_mode": "personal",
         "missing_settings": [],
         "central_api": None,
+        "device_registration": None,
     }
     assert fake.calls == 0
 

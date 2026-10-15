@@ -20,6 +20,7 @@ Secrets (`CGA_TEST_*_SECRET`) come from the environment and are never printed.
 | `e2e_cancel_on_delete.py` | cancelling an unclaimed approval when its conversation is deleted | **a central already running on 127.0.0.1:8898**, Keycloak |
 | `e2e_execution_commitment.py` | execution commitment over HTTP: claim/report mismatch, legacy flow, audit event (no agent-server) | throwaway Postgres |
 | `e2e_device_binding.py` | device binding enforced, with a real agent-server | throwaway Postgres |
+| `e2e_device_autoregister.py` | device auto-registration (1.8) against a real central with binding enforced: register, restart (real 409), revoke stays revoked (no agent-server process) | throwaway Postgres |
 | `e2e_device_list.py` | `GET /api/v1/devices` | throwaway Postgres, Keycloak |
 | `e2e_late_report.py` | late-report wiring | throwaway Postgres, Keycloak |
 | `e2e_real_conversation.py` | real conversation with tool permissions enforced | throwaway Postgres |
