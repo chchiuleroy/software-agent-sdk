@@ -12,8 +12,10 @@ team 模式下，agent-server 每個對話有一個治理 outbox 紀錄。某些
 
 ```bash
 python governance_attention_cli.py list
-python governance_attention_cli.py resolve <對話id> retry|abandon|dismiss [--request-id ID] [--note 文字]
+python governance_attention_cli.py resolve <對話id> retry|abandon|dismiss [--request-id ID] [--note 文字] [--operator 名字]
 ```
+
+`--operator` 是你宣告的操作者名字（預設為本機登入名），**不是經過驗證的身分**；見下方「已知限度」。
 
 設定（環境變數，或 `--url`）：
 
@@ -59,9 +61,12 @@ central **明確拒絕**（例如 `device_not_bound`）仍是 `claim_failed`：�
 
 ## 已知限度
 
-- **沒有操作者身分**：伺服器只認共用的 session API key，所以紀錄裡的 `--note` 是唯一「為什麼」的記錄，
-  記不到「誰」。central 也不會知道。
-- **降版風險**：處理後的紀錄含新狀態 `resolved_manually` 與新欄位；舊版程式讀不了。要退回舊版前，
+- **操作者是自我宣告，不是認證**：伺服器只認共用的 session API key，持有者可以寫任何名字。`operator`
+  是必填欄位（1～64 字、只能是可見字元），abandon／dismiss 時存進紀錄的 `resolved_by`，三種動作都會寫進
+  agent-server 的 log（名字以 repr 引用）。**retry 不留在紀錄裡**：retry 後紀錄回到流程中，沒有地方放，
+  只有 log 一行。central 不會得知。
+- **降版風險**：處理後的紀錄含新狀態 `resolved_manually` 與新欄位（`resolution_note`、`resolved_at`、
+  `resolved_by`）；舊版程式讀不了。要退回舊版前，
   先確認沒有這種 outbox 檔（`list` 對讀不動的檔會顯示 `unreadable_outbox`）。
 - 與「刪除對話」同時進行沒有處理。
 - `list` 沒有分頁；預期待處理的很少。

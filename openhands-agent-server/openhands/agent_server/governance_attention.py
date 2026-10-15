@@ -22,7 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from openhands.agent_server.governance_outbox import (
     OUTBOX_FILENAME,
@@ -34,6 +34,9 @@ from openhands.agent_server.governance_outbox import (
 
 # Far above any real outbox record. A larger file is reported, not parsed.
 MAX_OUTBOX_BYTES = 4 * 1024 * 1024
+
+# Longest operator name accepted (after stripping); see ResolveRequest.operator.
+MAX_OPERATOR_CHARS = 64
 
 # Not a NeedsAttentionReason: it is only ever produced by this scan, never stored.
 UNREADABLE_OUTBOX = "unreadable_outbox"
@@ -236,6 +239,26 @@ class ResolveRequest(BaseModel):
         max_length=1000,
         description="Why. Required for dismiss; stored with the record.",
     )
+    operator: str = Field(
+        max_length=MAX_OPERATOR_CHARS * 4,
+        description="Who is acting, as the operator declares it. Not authenticated: "
+        "the server only knows the shared session API key, so anyone holding it "
+        "can write any name. Stored with the record on abandon and dismiss, and "
+        "logged for every action.",
+    )
+
+    @field_validator("operator")
+    @classmethod
+    def _operator_is_a_plain_name(cls, value: str) -> str:
+        # Stripped first so padding cannot hide an empty name or push a real one
+        # past the limit. Printable only: a name goes into the log and the record,
+        # and a line break there could forge a log line.
+        value = value.strip()
+        if not value or len(value) > MAX_OPERATOR_CHARS:
+            raise ValueError(f"operator must be 1 to {MAX_OPERATOR_CHARS} characters")
+        if not value.isprintable():
+            raise ValueError("operator must not contain control characters")
+        return value
 
     @model_validator(mode="after")
     def _dismiss_needs_a_note(self) -> ResolveRequest:
@@ -341,9 +364,11 @@ def apply_close(
     action: AttentionAction,
     expected_request_id: str,
     note: str | None,
+    operator: str,
 ) -> OutboxRecord:
     """Ends a parked record: ``abandon`` -> CANCELLED, ``dismiss`` ->
-    RESOLVED_MANUALLY. The reason and error code stay as the history of why."""
+    RESOLVED_MANUALLY. The reason and error code stay as the history of why;
+    ``operator`` is recorded as declared (see ``ResolveRequest.operator``)."""
     if action is AttentionAction.RETRY:
         raise ValueError("retry does not close a record")
     check_resolvable(record, action, expected_request_id)
@@ -353,5 +378,6 @@ def apply_close(
         else OutboxState.RESOLVED_MANUALLY
     )
     record.resolution_note = note
+    record.resolved_by = operator
     record.resolved_at = datetime.now(UTC).isoformat()
     return record

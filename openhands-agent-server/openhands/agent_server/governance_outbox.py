@@ -137,7 +137,12 @@ TERMINAL_STATES = frozenset(
 
 
 # OutboxRecord fields added after the first release of the file format (see to_json).
-_OMITTED_WHEN_UNSET = ("resolution_note", "resolved_at", "claim_failures")
+_OMITTED_WHEN_UNSET = (
+    "resolution_note",
+    "resolved_at",
+    "resolved_by",
+    "claim_failures",
+)
 
 
 @dataclass
@@ -192,6 +197,9 @@ class OutboxRecord:
     # needs_attention_reason / last_error_code are kept as the history of why.
     resolution_note: str | None = None
     resolved_at: str | None = None
+    # Who closed it, as the operator typed it. Self-declared, not authenticated:
+    # the server only knows the shared session API key.
+    resolved_by: str | None = None
 
     def registered_commitment(self) -> str | None:
         """The commitment central holds for this record, or None if this

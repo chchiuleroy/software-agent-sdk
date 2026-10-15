@@ -2809,6 +2809,7 @@ class TestConversationServiceDeleteConversation:
                     AttentionAction.ABANDON,
                     expected_request_id="req-1",
                     note=None,
+                    operator="op",
                 )
             )
             await in_central.wait()
@@ -2860,6 +2861,7 @@ class TestConversationServiceDeleteConversation:
                     AttentionAction.ABANDON,
                     expected_request_id="req-1",
                     note=None,
+                    operator="op",
                 )
             )
             await in_work.wait()
@@ -2911,6 +2913,7 @@ class TestConversationServiceDeleteConversation:
                     AttentionAction.DISMISS,
                     expected_request_id="req-1",
                     note="why",
+                    operator="op",
                 )
             )
             await asyncio.sleep(0.05)
@@ -2940,6 +2943,7 @@ class TestConversationServiceDeleteConversation:
             AttentionAction.RETRY,
             expected_request_id="req-1",
             note=None,
+            operator="op",
         )
 
         assert result is None
@@ -2955,6 +2959,7 @@ class TestConversationServiceDeleteConversation:
                 AttentionAction.RETRY,
                 expected_request_id="req-1",
                 note=None,
+                operator="op",
             )
             is None
         )
@@ -2972,6 +2977,7 @@ class TestConversationServiceDeleteConversation:
                 AttentionAction.RETRY,
                 expected_request_id="req-1",
                 note=None,
+                operator="op",
             )
 
     @pytest.mark.asyncio
@@ -3004,6 +3010,7 @@ class TestConversationServiceDeleteConversation:
                     AttentionAction.ABANDON,
                     expected_request_id="req-1",
                     note=None,
+                    operator="op",
                 )
             )
             await in_central.wait()
@@ -3036,6 +3043,7 @@ class TestConversationServiceDeleteConversation:
                 AttentionAction.ABANDON,
                 expected_request_id="req-1",
                 note=None,
+                operator="op",
             )
         with patch("openhands.agent_server.conversation_service.safe_rmtree"):
             deleted = await asyncio.wait_for(

@@ -219,10 +219,12 @@ RESOLVE_URL = "/api/governance/attention/{}/resolve"
 class _FakeEventService:
     def __init__(self, error: ResolveError | None = None):
         self.error = error
-        self.calls: list[tuple[str, str, str | None]] = []
+        self.calls: list[tuple[str, str, str | None, str]] = []
 
-    async def resolve_needs_attention(self, action, *, expected_request_id, note):
-        self.calls.append((action.value, expected_request_id, note))
+    async def resolve_needs_attention(
+        self, action, *, expected_request_id, note, operator
+    ):
+        self.calls.append((action.value, expected_request_id, note, operator))
         if self.error is not None:
             raise self.error
         return ResolveResponse(
@@ -245,12 +247,15 @@ def _resolve_client(config: Config, event_service) -> tuple[TestClient, list]:
     flow fails these tests."""
     asked: list = []
 
-    async def _resolve(conversation_id, action, *, expected_request_id, note):
+    async def _resolve(conversation_id, action, *, expected_request_id, note, operator):
         asked.append(conversation_id)
         if event_service is None:
             return None
         return await event_service.resolve_needs_attention(
-            action, expected_request_id=expected_request_id, note=note
+            action,
+            expected_request_id=expected_request_id,
+            note=note,
+            operator=operator,
         )
 
     app = create_app(config)
@@ -261,7 +266,12 @@ def _resolve_client(config: Config, event_service) -> tuple[TestClient, list]:
 
 
 def _dismiss(**overrides):
-    body = {"action": "dismiss", "expected_request_id": "req-1", "note": "why"}
+    body = {
+        "action": "dismiss",
+        "expected_request_id": "req-1",
+        "note": "why",
+        "operator": "ada",
+    }
     body.update(overrides)
     return body
 
@@ -281,7 +291,8 @@ def test_resolve_passes_the_request_through_and_returns_the_outcome():
         "central_step": "not_applicable",
         "conversation_still_waiting": False,
     }
-    assert service.calls == [("dismiss", "req-1", "why")]
+    # the operator reaches the service as declared (stripped of padding)
+    assert service.calls == [("dismiss", "req-1", "why", "ada")]
     assert asked == [CONVERSATION_ID]
 
 
@@ -333,6 +344,9 @@ def test_resolve_error_codes_map_to_statuses(error_code, status):
         _dismiss(action="purge"),
         _dismiss(expected_request_id=""),
         {"action": "retry"},  # no expected_request_id
+        {"action": "retry", "expected_request_id": "req-1"},  # no operator
+        _dismiss(operator=""),
+        _dismiss(operator="ada\nforged log line"),
     ],
 )
 def test_resolve_rejects_a_malformed_request_before_touching_anything(body):
