@@ -164,6 +164,10 @@ _SECRET_PATH = re.compile(
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 MAX_HEADS = 4
+# Redirect targets that are not files being written.
+_DISCARD_SINKS = frozenset(
+    {"/dev/null", "nul", "/dev/stdout", "/dev/stderr", "/dev/tty"}
+)
 
 
 def scan_command(command: str) -> tuple[list[str], int, bool, bool, list[str]]:
@@ -218,14 +222,27 @@ def scan_command(command: str) -> tuple[list[str], int, bool, bool, list[str]]:
             segments.append("".join(current))
             current = []
         elif c == ">":
-            redirect = True
             j = i + 1
+            if command.startswith(">|", i):
+                j = i + 2  # `>|` (override noclobber) is one operator, not a pipe
             while j < n and command[j] in ">&":
                 j += 1
             m = re.match(r"\s*([^\s;|&]+)", command[j:])
-            if m and not m.group(1).lower().startswith(("&", "/dev/null", "nul")):
-                targets.append(m.group(1).strip("\"'"))
+            target = m.group(1).strip("\"'") if m else ""
+            duplicates_fd = "&" in command[i:j] and (target.isdigit() or target == "-")
+            if duplicates_fd or target.lower() in _DISCARD_SINKS:
+                # `2>&1`, `>/dev/null`, `2>nul`: no file is written. The first version
+                # counted these as writes (and `/dev/null` as a path outside the
+                # workspace), which made plain read-only commands look like writes
+                # outside it; the raw-command study showed it.
+                i = j + (m.end() if m else 0)
+                continue
+            redirect = True
+            if target:
+                targets.append(target)
             current.append(c)
+            i = j  # the whole operator (`>>`, `&>>`) is handled once
+            continue
         else:
             current.append(c)
         i += 1
@@ -714,6 +731,7 @@ def process_file(
     since: datetime,
     counters: dict[str, int],
     first_index: int,
+    raw_sink: Any = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for call in iter_tool_uses(path, counters):
@@ -770,6 +788,15 @@ def process_file(
                 if tool == "mcp_tool" and isinstance(call["name"], str)
                 else None,
             )
+        if raw_sink is not None and tool == "terminal" and record["confirm"] is True:
+            # local only (raw_view.py explains): the command the analyzer asked about
+            raw_sink.write(
+                json.dumps(
+                    {"i": record["i"], "command": fields["command"], "cwd": cwd},
+                    ensure_ascii=True,
+                )
+                + "\n"
+            )
         out.append(record)
     return out
 
@@ -783,6 +810,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="output directory (stay local)")
     parser.add_argument(
         "--limit-files", type=int, default=0, help="0 = all (for timing)"
+    )
+    parser.add_argument(
+        "--raw-bash",
+        default=None,
+        help="also write the raw command of every Bash call the analyzer asks "
+        "about, to this file (stays local; see raw_view.py)",
     )
     args = parser.parse_args(argv)
 
@@ -808,15 +841,18 @@ def main(argv: list[str] | None = None) -> int:
     replayer = Replayer()
     seen: set[str] = set()
     index = 0
+    raw_sink = open(args.raw_bash, "w", encoding="utf-8") if args.raw_bash else None
     with (out_dir / "actions.jsonl").open("w", encoding="utf-8") as sink:
         for n, file in enumerate(files, 1):
-            rows = process_file(file, replayer, seen, since, counters, index)
+            rows = process_file(file, replayer, seen, since, counters, index, raw_sink)
             index += len(rows)
             for row in rows:
                 sink.write(json.dumps(row, ensure_ascii=True) + "\n")
             if n % 50 == 0:
                 sink.flush()
                 print(f"{n}/{len(files)} files, {index} actions", file=sys.stderr)
+    if raw_sink is not None:
+        raw_sink.close()
     counters["window_days"] = args.days
     (out_dir / "summary.json").write_text(
         json.dumps(counters, indent=2), encoding="utf-8"
