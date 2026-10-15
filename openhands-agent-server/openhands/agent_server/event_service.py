@@ -2003,6 +2003,13 @@ class EventService:
         # should be surfaced back to the agent.
         state = self._conversation.state
         if state.execution_status == ConversationExecutionStatus.RUNNING:
+            # Do not add an ``await`` between this status flip and the paired
+            # ``AgentErrorEvent`` written below. Once the status is ERROR, run()
+            # no longer refuses on RUNNING; if another task could run in the gap,
+            # the interrupted tool call could execute a second time (at-most-once
+            # execution relies on this). Pinned by
+            # tests/agent_server/test_governance_crash_recovery.py; rationale in
+            # governance/recovery/design.md.
             state.execution_status = ConversationExecutionStatus.ERROR
             # Crash recovery scans the full log, not the active branch: the
             # process may have died between writing an event file and persisting
