@@ -37,7 +37,15 @@ _SPEC = importlib.util.spec_from_file_location(
 kc = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(kc)  # type: ignore[union-attr]
 
+_INBOX_SPEC = importlib.util.spec_from_file_location(
+    "kc_inbox_client",
+    pathlib.Path(__file__).with_name("keycloak_inbox_client_setup.py"),
+)
+ic = importlib.util.module_from_spec(_INBOX_SPEC)
+_INBOX_SPEC.loader.exec_module(ic)  # type: ignore[union-attr]
+
 TOKEN = secrets.token_urlsafe(24)
+ADMIN_ROLE = "governance.admin"
 SESSION_SECONDS = 20 * 60
 STATE: dict = {
     "username": None,
@@ -54,7 +62,14 @@ _lock = threading.Lock()
 OK_BOX = (
     "<label><input type='checkbox' name='ok' value='1' required> 我確認要執行</label> "
 )
-WRITE_ROUTES = {"create-role", "grant", "rotate", "lock-email", "create-user"}
+WRITE_ROUTES = {
+    "create-role",
+    "grant",
+    "rotate",
+    "lock-email",
+    "create-user",
+    "register-client",
+}
 _httpd: http.server.ThreadingHTTPServer | None = None
 
 
@@ -68,6 +83,23 @@ def _api() -> kc.AdminApi:
     api = kc.AdminApi(make_client(), STATE["server"], STATE["realm"])
     api.login(STATE["username"], STATE["password"])
     return api
+
+
+def create_user_problems(username: str, email: str, pw1: str, pw2: str) -> list[str]:
+    """What is wrong with the create-user form, one sentence each (never the
+    password itself): the first version only said that something was."""
+    problems = []
+    if not username:
+        problems.append("使用者名稱是空的")
+    if "@" not in email:
+        problems.append("EMAIL 沒有 @（或是空的）")
+    if not pw1:
+        problems.append("密碼是空的")
+    elif len(pw1) < 12:
+        problems.append(f"密碼只有 {len(pw1)} 個字元，至少要 12")
+    if pw1 != pw2:
+        problems.append("兩次輸入的密碼不一樣")
+    return problems
 
 
 def _collect(fn, *args) -> str:
@@ -125,12 +157,20 @@ def main_page(notice: str = "") -> bytes:
         + (f"<p class='ok'>{html.escape(notice)}</p>" if notice else "")
         + f"<h3>唯讀報告</h3><pre>{html.escape(STATE['report'])}</pre>"
         + (f"<h3>已執行的動作</h3><pre>{html.escape(log)}</pre>" if log else "")
-        + f"<fieldset><legend>1. 建立 realm role「{kc.ROLE_NAME}」</legend>"
+        + f"<fieldset><legend>0. 註冊瀏覽器登入用的 client「{ic.DEFAULT_CLIENT_ID}」"
+        "（OHS 主控台 /inbox 登入需要；public client、PKCE S256、不開密碼授權）</legend>"
+        f"<form method='post' action='/{TOKEN}/register-client'>"
+        "<label>central 的埠 <input name='port' value='8899' size='6' autocomplete='off'></label>"
+        + OK_BOX
+        + "<button>註冊（已存在則不動，只補缺的 mapper）</button></form></fieldset>"
+        f"<fieldset><legend>1. 建立 realm role「{kc.ROLE_NAME}」與「{ADMIN_ROLE}」</legend>"
         f"<form method='post' action='/{TOKEN}/create-role'>"
         + OK_BOX
         + "<button>建立（已存在則不動）</button></form></fieldset>"
-        f"<fieldset><legend>2. 把「{kc.ROLE_NAME}」授予一位使用者（高權限，只給負責批准帳號的人）</legend>"
+        "<fieldset><legend>2. 把 role 授予一位使用者（高權限，只給負責批准帳號的人）</legend>"
         f"<form method='post' action='/{TOKEN}/grant'>"
+        f"<select name='role'><option value='{kc.ROLE_NAME}'>{kc.ROLE_NAME}</option>"
+        f"<option value='{ADMIN_ROLE}'>{ADMIN_ROLE}（稽核、對帳畫面需要）</option></select> "
         f"<select name='username'><option value=''>（選擇）</option>{users}</select> "
         + OK_BOX
         + "<button>授予</button></form></fieldset>"
@@ -156,6 +196,7 @@ def main_page(notice: str = "") -> bytes:
         "<p>改完後請用新密碼登入 Keycloak 管理介面。</p>"
         + OK_BOX
         + "<button>改密碼</button></form></fieldset>"
+        f"<form method='post' action='/{TOKEN}/refresh'><button>重新讀取使用者清單</button></form>"
         f"<form method='post' action='/{TOKEN}/finish'><button>完成並清除密碼</button></form>"
     )
 
@@ -224,6 +265,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             api = _api()
         except (SystemExit, httpx.HTTPError) as exc:
             return main_page(f"重新登入失敗：{exc}")
+        # The user list was read at login: refresh it for every action, so a user
+        # created in Keycloak meanwhile can be picked.
+        listed = api.get("/users", max=100)
+        if listed.status_code == 200:
+            STATE["users"] = listed.json()
         if route in WRITE_ROUTES and form.get("ok") != "1":
             STATE["log"].append(f"{route}: 未勾選「我確認」，沒有執行")
             return main_page("未執行：請先勾選「我確認要執行」。")
@@ -231,10 +277,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             username = form.get("new_username", "").strip()
             email = form.get("new_email", "").strip().lower()
             pw1, pw2 = form.get("user_pw1", ""), form.get("user_pw2", "")
-            if not username or "@" not in email or pw1 != pw2 or len(pw1) < 12:
-                STATE["log"].append(
-                    "建立使用者未執行：缺欄位、EMAIL 格式不對、兩次密碼不一致或少於 12 字元"
-                )
+            problems = create_user_problems(username, email, pw1, pw2)
+            if problems:
+                STATE["log"].append("建立使用者未執行：" + "；".join(problems))
             else:
                 created = api.post(
                     "/users",
@@ -304,33 +349,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     STATE["log"].append(
                         f"限制 EMAIL 編輯為只有管理員: HTTP {done.status_code}"
                     )
-        elif route == "create-role":
-            response = api.get(f"/roles/{kc.ROLE_NAME}")
-            if response.status_code == 200:
-                STATE["log"].append(f"role {kc.ROLE_NAME}: 已存在，未改動")
+        elif route == "register-client":
+            raw_port = form.get("port", "").strip() or "8899"
+            if not raw_port.isdigit() or not 1 <= int(raw_port) <= 65535:
+                STATE["log"].append(f"註冊 client 未執行：埠「{raw_port[:10]}」不合法")
             else:
-                created = api.post(
-                    "/roles",
-                    {
-                        "name": kc.ROLE_NAME,
-                        "description": "OHS superadmin: approves accounts, edits departments and tool permissions. Not a superset of governance.admin.",
-                    },
+                lines: list[str] = []
+                yes = lambda _prompt: "y"  # noqa: E731  (the checkbox was the confirmation)
+                client = ic.ensure_client(
+                    api, ic.DEFAULT_CLIENT_ID, int(raw_port), yes, lines.append
                 )
-                STATE["log"].append(
-                    f"建立 role {kc.ROLE_NAME}: HTTP {created.status_code}"
-                )
+                if client is not None:
+                    ic.ensure_mappers(
+                        api, client, "central-governance-api", yes, lines.append
+                    )
+                    lines.append(
+                        f"下一步：在 central-governance-api/.env 加一行 CGA_INBOX_OIDC_CLIENT_ID={ic.DEFAULT_CLIENT_ID} ，"
+                        f"重啟 central，再開 http://localhost:{raw_port}/inbox"
+                    )
+                STATE["log"].extend(line for line in lines if line.strip())
+        elif route == "refresh":
+            STATE["log"].append(f"使用者清單已重新讀取（{len(STATE['users'])} 位）")
+        elif route == "create-role":
+            for name, description in (
+                (
+                    kc.ROLE_NAME,
+                    "OHS superadmin: approves accounts, edits departments and tool permissions. Not a superset of governance.admin.",
+                ),
+                (ADMIN_ROLE, "OHS admin: Audit and Reconciliation screens."),
+            ):
+                response = api.get(f"/roles/{name}")
+                if response.status_code == 200:
+                    STATE["log"].append(f"role {name}: 已存在，未改動")
+                else:
+                    created = api.post(
+                        "/roles", {"name": name, "description": description}
+                    )
+                    STATE["log"].append(
+                        f"建立 role {name}: HTTP {created.status_code}"
+                    )
         elif route == "grant":
             username = form.get("username", "")
             match = [u for u in STATE["users"] if u.get("username") == username]
-            role = api.get(f"/roles/{kc.ROLE_NAME}")
-            if not match or role.status_code != 200:
+            role_name = form.get("role", kc.ROLE_NAME)
+            if role_name not in (kc.ROLE_NAME, ADMIN_ROLE):
+                role_name = ""
+            role = api.get(f"/roles/{role_name}") if role_name else None
+            if not match or role is None or role.status_code != 200:
                 STATE["log"].append("授予失敗：找不到使用者或 role 尚未建立")
             else:
                 done = api.post(
                     f"/users/{match[0]['id']}/role-mappings/realm", [role.json()]
                 )
                 STATE["log"].append(
-                    f"授予 {kc.ROLE_NAME} 給 {username}: HTTP {done.status_code}"
+                    f"授予 {role_name} 給 {username}: HTTP {done.status_code}"
                 )
         elif route == "rotate":
             new1, new2 = form.get("new1", ""), form.get("new2", "")
