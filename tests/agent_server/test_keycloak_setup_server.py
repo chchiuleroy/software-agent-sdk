@@ -41,7 +41,8 @@ class FakeKeycloak:
         self.users: list[dict] = []
         self.created_users: list[dict] = []
         self.role: dict | None = None
-        self.admin_role = {"id": "r-2", "name": "governance.admin"}
+        self.admin_role: dict | None = {"id": "r-2", "name": "governance.admin"}
+        self.echo_password_in_error = False
         self.created_roles: list[str] = []
         self.granted: list[tuple[str, list]] = []
 
@@ -54,12 +55,20 @@ class FakeKeycloak:
         if request.method == "GET" and path == f"{base}/users":
             return httpx.Response(200, json=self.users)
         if request.method == "POST" and path == f"{base}/users":
-            self.created_users.append(json.loads(request.content))
+            body = json.loads(request.content)
+            self.created_users.append(body)
+            if self.echo_password_in_error:
+                pw = body["credentials"][0]["value"]
+                return httpx.Response(400, json={"errorMessage": f"bad value {pw}"})
             return httpx.Response(201)
         if request.method == "GET" and path.startswith(f"{base}/roles/"):
             name = path.rsplit("/", 1)[-1]
             if name == "governance.admin":
-                return httpx.Response(200, json=self.admin_role)
+                return (
+                    httpx.Response(200, json=self.admin_role)
+                    if self.admin_role
+                    else httpx.Response(404)
+                )
             return (
                 httpx.Response(200, json=self.role)
                 if self.role
@@ -307,3 +316,42 @@ def test_create_role_makes_both_roles_the_console_needs(keycloak):
     route("create-role", ok="1")
 
     assert fake.created_roles == ["governance.superadmin"]  # admin already exists
+
+
+def test_create_role_also_creates_a_missing_admin_role(keycloak):
+    fake = keycloak(FakeKeycloak())
+    fake.role = None
+    fake.admin_role = None
+
+    route("create-role", ok="1")
+
+    assert fake.created_roles == ["governance.superadmin", "governance.admin"]
+
+
+def test_a_server_that_echoes_the_new_password_in_its_error_is_not_shown_it(keycloak):
+    fake = keycloak(FakeKeycloak())
+    fake.echo_password_in_error = True
+    secret = "S3cret-pass-1234"
+
+    route(
+        "create-user",
+        new_username="bob",
+        new_email="b@example.com",
+        user_pw1=secret,
+        user_pw2=secret,
+        ok="1",
+    )
+
+    assert fake.created_users
+    log = " | ".join(page.STATE["log"])
+    assert "HTTP 400" in log and secret not in log and "***" in log
+
+
+@pytest.mark.parametrize("port", ["²", "٣", "0", "65536", "-1", "80a"])
+def test_a_port_that_is_not_plain_ascii_digits_in_range_is_refused(keycloak, port):
+    fake = keycloak(FakeKeycloak())
+
+    route("register-client", port=port, ok="1")
+
+    assert fake.created == []
+    assert any("不合法" in x for x in page.STATE["log"])
