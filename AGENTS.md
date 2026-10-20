@@ -192,12 +192,14 @@ mkdir -p .pr
 # Human-only PR description fields in PR template
 
 When opening a PR, use the repository's PR template for the description. The
-`HUMAN:` section in PR descriptions is reserved for human contributors only. AI
-agents MUST NOT edit, move, or remove this field, only set the placeholder. If
-the PR description CI fails because this field is missing
-or empty, stop and ask the human user to update it in their own words. If
-the field was already updated by a human, report the exact validator error rather
-than editing it yourself.
+`HUMAN:` section in PR descriptions is the human contributor's own note. By
+default AI agents MUST NOT edit, move, or remove this field, only set the
+placeholder, and should offer a draft in their reply. An AI agent may edit it only
+when the human author explicitly asks for that edit in the current session, and
+must then keep any wording the author supplied. If the PR description CI fails
+because this field is missing or empty, stop and ask the human user to update it
+(or to ask you to). If the field was already updated by a human, report the exact
+validator error rather than editing it yourself.
 </PR_DESCRIPTION_HUMAN_CHECK>
 
 
