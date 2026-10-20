@@ -67,14 +67,16 @@ class McpConfirmations:
                 raise ValueError(f"confirmation registry {path}: bad record for {key}")
         return data
 
-    def _save(self) -> None:
+    def _save(self, records: dict[str, dict[str, str]]) -> None:
+        """Write ``records`` to disk. The caller updates ``self._records`` only after
+        this returns, so a failed write changes nothing in memory either."""
         if self._path is None:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self._path.parent, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(self._records, handle, sort_keys=True, indent=2)
+                json.dump(records, handle, sort_keys=True, indent=2)
             os.replace(tmp, self._path)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
@@ -93,12 +95,14 @@ class McpConfirmations:
         if not confirmed_by.strip():
             raise ValueError("a confirmation needs the name of who confirmed it")
         fingerprint = mcp_tool_fingerprint(tool_name, description, input_schema)
-        self._records[self._key(server_id, tool_name)] = {
+        updated = dict(self._records)
+        updated[self._key(server_id, tool_name)] = {
             "fingerprint": fingerprint,
             "confirmed_by": confirmed_by,
             "confirmed_at": datetime.now(UTC).isoformat(),
         }
-        self._save()
+        self._save(updated)
+        self._records = updated
         return fingerprint
 
     def is_confirmed(
@@ -121,7 +125,10 @@ class McpConfirmations:
 
     def revoke(self, server_id: str, tool_name: str) -> bool:
         """Remove a confirmation; True if there was one."""
-        removed = self._records.pop(self._key(server_id, tool_name), None) is not None
-        if removed:
-            self._save()
-        return removed
+        key = self._key(server_id, tool_name)
+        if key not in self._records:
+            return False
+        updated = {k: v for k, v in self._records.items() if k != key}
+        self._save(updated)
+        self._records = updated
+        return True

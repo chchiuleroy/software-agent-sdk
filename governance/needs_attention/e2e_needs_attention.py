@@ -50,6 +50,7 @@ Takes about five minutes (the relay cycle is 30 seconds and one scenario waits f
 """
 
 import asyncio
+import codecs
 import getpass
 import json
 import os
@@ -279,7 +280,7 @@ class _Llm(BaseHTTPRequestHandler):
                         "function": {
                             "name": "terminal",
                             "arguments": json.dumps(
-                                {"command": f"echo ran > {marker}"}
+                                {"command": f"echo ran >> {marker}"}
                             ),
                         },
                     }
@@ -505,6 +506,17 @@ async def main():
 
     def marker(tag):
         return (WORKSPACE / f"ran_{tag}.marker").exists()
+
+    def runs(tag):
+        """How many times the tool ran: the tool appends one line per execution."""
+        path = WORKSPACE / f"ran_{tag}.marker"
+        if not path.exists():
+            return 0
+        data = path.read_bytes()
+        # a Windows PowerShell terminal writes redirected output as UTF-16
+        is_utf16 = data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+        text = data.decode("utf-16" if is_utf16 else "utf-8")
+        return len([line for line in text.splitlines() if line.strip()])
 
     try:
         if not await start_central(bind=False):
@@ -1433,7 +1445,9 @@ async def main():
                     f"state={state_of(cid_c)!r} after {waited:.0f}s",
                 )
                 info("C seconds from retry to result_reported", f"{waited:.0f}")
-                check("C the tool ran exactly once (its marker exists)", marker("c1"))
+                check(
+                    "C the tool ran exactly once", runs("c1") == 1, f"runs={runs('c1')}"
+                )
                 check(
                     "C central ends the approval as applied",
                     central_status(cid_c) == "applied",
@@ -1546,7 +1560,9 @@ async def main():
                     bool(done),
                     f"state={state_of(cid_f)!r}",
                 )
-                check("F the tool ran exactly once", marker("f1"))
+                check(
+                    "F the tool ran exactly once", runs("f1") == 1, f"runs={runs('f1')}"
+                )
                 check(
                     "F central ends the approval as applied",
                     central_status(cid_f) == "applied",
@@ -1593,10 +1609,13 @@ async def main():
                     "LOST the repeated claim is replayed by central and the result is "
                     "reported",
                     bool(done),
-                    f"state={state_of(cid_g)!r} "
-                    f"reason={reason_now!r}",
+                    f"state={state_of(cid_g)!r} reason={reason_now!r}",
                 )
-                check("LOST the tool ran exactly once", marker("l1"))
+                check(
+                    "LOST the tool ran exactly once",
+                    runs("l1") == 1,
+                    f"runs={runs('l1')}",
+                )
                 check(
                     "LOST central ends the approval as applied",
                     central_status(cid_g) == "applied",
