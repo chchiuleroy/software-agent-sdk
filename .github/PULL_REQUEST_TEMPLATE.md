@@ -1,7 +1,8 @@
 <!-- Keep this PR as draft until it is ready for review. -->
 
 <!-- AI/LLM agents:
-Do not edit the HUMAN section.
+Do not edit the HUMAN section, unless the human author explicitly asks you to
+edit it in the current session.
 -->
 
 HUMAN:
@@ -9,7 +10,8 @@ HUMAN:
 <!--
 Human author: please replace this comment with a short note (at least 20 visible
 characters) before marking ready for review.
-AI agents: you must not edit this section.
+AI agents: leave this section alone, and offer a draft in your reply, unless the
+human author explicitly asks you to edit it in the current session.
 -->
 
 ---
