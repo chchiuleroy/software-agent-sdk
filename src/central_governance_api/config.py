@@ -259,6 +259,46 @@ class Settings(BaseSettings):
         "device that cannot reach central.",
     )
 
+    # --- Admission registry (OHS_admission_design_gate2.md) ---
+    # Every number below is a proposal made without data, not a measured value:
+    # Roy has not yet set them (Gate 2 question 5). Tune them before relying on them.
+    admission_max_archive_bytes: int = Field(
+        default=2 * 1024 * 1024,
+        gt=0,
+        description="Largest accepted skill/plugin archive upload, in bytes.",
+    )
+    admission_max_uncompressed_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        gt=0,
+        description="Largest accepted total size of an archive once unpacked "
+        "(the zip-bomb limit).",
+    )
+    admission_max_files: int = Field(
+        default=500, gt=0, description="Most files accepted in one archive."
+    )
+    admission_max_tools: int = Field(
+        default=200, gt=0, description="Most tools accepted for one MCP server."
+    )
+    admission_max_open_per_user: int = Field(
+        default=5,
+        gt=0,
+        description="Most admission items one user may have waiting (pending, "
+        "checking or checked) at the same time.",
+    )
+    admission_max_submissions_per_hour: int = Field(
+        default=10,
+        gt=0,
+        description="Most NEW admission items one user may submit per hour.",
+    )
+    admission_max_age_seconds: int = Field(
+        default=60,
+        gt=0,
+        description="How long a device may rely on a fetched list of approved items "
+        "before it must treat every MCP tool, skill and plugin as not admitted. "
+        "Returned by GET /api/v1/me/admitted-items; it bounds how late a "
+        "revocation can reach a device that cannot reach central.",
+    )
+
     @model_validator(mode="after")
     def _check_account_requests(self) -> Self:
         if self.account_requests_enabled:

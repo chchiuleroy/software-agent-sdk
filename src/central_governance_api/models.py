@@ -33,6 +33,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -562,4 +563,120 @@ class DepartmentPrincipal(Base):
 
     __table_args__ = (
         UniqueConstraint("issuer", "sub", name="uq_department_principal_identity"),
+    )
+
+
+# --- Admission registry (OHS_admission_design_gate2.md, step C1) ----------
+
+ADMISSION_KINDS = ("mcp_server", "skill", "plugin")
+ADMISSION_STATUSES = (
+    "pending",
+    "checking",
+    "rejected",
+    "check_failed",
+    "checked",
+    "approved",
+    "revoked",
+)
+
+
+class AdmissionItem(Base):
+    """One MCP server (a set of tools), skill or plugin that someone asked to be
+    allowed, scoped to ONE department and tied to ONE content fingerprint. What is
+    approved is that exact fingerprint: any change to the content is a different
+    fingerprint and therefore a different item."""
+
+    __tablename__ = "admission_items"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    kind: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str] = mapped_column(String(200))
+    source: Mapped[str] = mapped_column(String(1024))
+    fingerprint: Mapped[str] = mapped_column(String(80))
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id")
+    )
+    submitted_by_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    submitted_by_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
+    status: Mapped[str] = mapped_column(String(16), server_default="pending")
+    status_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    decided_by_issuer: Mapped[str | None] = mapped_column(
+        String(_ISSUER_LEN), nullable=True
+    )
+    decided_by_sub: Mapped[str | None] = mapped_column(String(_SUB_LEN), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('mcp_server', 'skill', 'plugin')", name="ck_admission_kind"
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'checking', 'rejected', 'check_failed', "
+            "'checked', 'approved', 'revoked')",
+            name="ck_admission_status",
+        ),
+        UniqueConstraint(
+            "kind", "department_id", "fingerprint", name="uq_admission_content"
+        ),
+        Index("ix_admission_items_status", "status"),
+        Index(
+            "ix_admission_items_submitter",
+            "submitted_by_issuer",
+            "submitted_by_sub",
+            "created_at",
+        ),
+    )
+
+
+class AdmissionItemContent(Base):
+    """The submitted archive of a skill or plugin, kept so a reviewer sees the real
+    files and so an approval can re-check that it still hashes to the fingerprint.
+    UNTRUSTED data: never executed, never unpacked to disk."""
+
+    __tablename__ = "admission_item_contents"
+
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admission_items.id"), primary_key=True
+    )
+    content_type: Mapped[str] = mapped_column(String(32))
+    body: Mapped[bytes] = mapped_column(LargeBinary)
+
+
+class AdmissionItemTool(Base):
+    """One tool of a submitted MCP server, exactly as the submitter described it."""
+
+    __tablename__ = "admission_item_tools"
+
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admission_items.id"), primary_key=True
+    )
+    tool_name: Mapped[str] = mapped_column(String(200), primary_key=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_schema: Mapped[dict] = mapped_column(JSONB)
+    tool_fingerprint: Mapped[str] = mapped_column(String(80))
+
+
+class AdmissionFirstUse(Base):
+    """A device reporting the first time it loads an item (design section 6.3)."""
+
+    __tablename__ = "admission_first_uses"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admission_items.id"), index=True
+    )
+    device_issuer: Mapped[str] = mapped_column(String(_ISSUER_LEN))
+    device_sub: Mapped[str] = mapped_column(String(_SUB_LEN))
+    fingerprint: Mapped[str] = mapped_column(String(80))
+    result: Mapped[str] = mapped_column(String(16))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
