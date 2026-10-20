@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from openhands.agent_server.governance_outbox import (
+    _OMITTED_WHEN_UNSET,
     RETRIABLE_STATES,
     TERMINAL_STATES,
     UNRECOGNIZED_ERROR_CODE,
@@ -215,9 +216,15 @@ def test_a_record_nobody_resolved_is_written_in_the_original_format():
     reverting the change would strand every one of them."""
     written = set(json.loads(_record().to_json()))
 
-    assert written == {f.name for f in dataclasses.fields(OutboxRecord)} - {
+    # the fields the code itself says were added after the first format (a fourth,
+    # resolved_by, was missing from this list when it was added)
+    assert written == {f.name for f in dataclasses.fields(OutboxRecord)} - set(
+        _OMITTED_WHEN_UNSET
+    )
+    assert set(_OMITTED_WHEN_UNSET) == {
         "resolution_note",
         "resolved_at",
+        "resolved_by",
         "claim_failures",
     }
 

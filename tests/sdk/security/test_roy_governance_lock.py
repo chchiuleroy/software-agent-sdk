@@ -10,6 +10,8 @@ GUI request body, or ConversationSettings-derived payload) supplies.
 """
 
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -613,3 +615,54 @@ def test_a_copy_with_another_root_is_no_longer_marked(monkeypatch, tmp_path) -> 
     assert result is not moved
     assert result.workspace_root == new
     assert result.workspace_is_search_root is True
+
+
+def _link_dir(link, target) -> None:
+    """A directory link: a junction on Windows (no privilege needed), else a symlink."""
+    if os.name == "nt":
+        subprocess.run(
+            [
+                "cmd",
+                "/c",
+                "mklink",
+                "/J",
+                os.path.normpath(link),
+                os.path.normpath(target),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def _unlink_dir(link) -> None:
+    os.rmdir(link) if os.name == "nt" else os.unlink(link)
+
+
+def test_a_workspace_root_link_pointed_elsewhere_after_marking_is_no_longer_marked(
+    monkeypatch, tmp_path
+) -> None:
+    # Review finding (round 5): the mark used to remember only the path string, so a
+    # workspace root that is a symlink/junction and gets repointed afterwards kept
+    # its mark while the search tools would look somewhere else. The mark now
+    # remembers the resolved real directory and compares against it each time.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    root = tmp_path / "workspace_link"
+    _link_dir(root, first)
+    try:
+        analyzer = roy_governance_lock.apply_security_analyzer_lock(
+            RoyPathPayloadSecurityAnalyzer(workspace_root=str(root)),
+            workspace_root=str(root),
+        )
+        assert analyzer.workspace_is_search_root is True
+
+        _unlink_dir(root)
+        _link_dir(root, second)
+
+        assert analyzer.workspace_is_search_root is False
+    finally:
+        _unlink_dir(root)

@@ -2110,6 +2110,10 @@ class LocalConversation(BaseConversation):
                         self._state.execution_status = (
                             ConversationExecutionStatus.RUNNING
                         )
+                        # The approved action is about to execute inside this lock:
+                        # put RUNNING on disk first (see flush_base_state), so a crash
+                        # while it runs is found as an interrupted execution.
+                        self._state.flush_base_state()
                         if on_governed_start is not None:
                             _invoke_governance_callback(on_governed_start)
                         # Audit right at the transition, under the same lock,
@@ -2411,6 +2415,10 @@ class LocalConversation(BaseConversation):
                         self._state.execution_status = (
                             ConversationExecutionStatus.RUNNING
                         )
+                        # The approved action is about to execute inside this lock:
+                        # put RUNNING on disk first (see flush_base_state), so a crash
+                        # while it runs is found as an interrupted execution.
+                        self._state.flush_base_state()
                         if on_governed_start is not None:
                             _invoke_governance_callback(on_governed_start)
                         # Schedule the actual audit write onto the executor

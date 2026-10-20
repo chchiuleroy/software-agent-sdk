@@ -48,6 +48,10 @@ plan-gate 兩關 Roy 皆核可：1.16 原本的內容（在 central 或 digest �
 
 是**對話狀態 `RUNNING`**，不是 outbox。`LocalConversation.run()` 在 `check_action_binding` 通過後、`agent.step()` 執行工具之前，於同一個狀態鎖內賦值 `execution_status = RUNNING`；`ConversationState.__setattr__` 在 autosave 開啟時會把它寫盤。因此崩在工具開始之後，磁碟上一定是 `RUNNING`＋未配對的動作（C1／C2）；崩在開始之前，是 `WAITING_FOR_CONFIRMATION`（C0）。**限度**：「賦值就落盤」是讀 `state.py` 得到的，沒有測。
 
+**2026-10-20 更正（真實行程實測，這段原本的結論是錯的）**：`ConversationState` 在 `with state:` 區塊內把存檔**延後到離開區塊**才做（`__setattr__` 只標 dirty，`__exit__` 才寫），而 `run()` 正是在同一個區塊裡設 `RUNNING` 並執行工具，所以 `RUNNING` 要等工具跑完才落盤。用 `governance/e2e/e2e_kill_restart.py` 真的 `taskkill /T /F` 殺掉 agent-server：工具執行中，磁碟上 `base_state.json` 是 `waiting_for_confirmation`、outbox 是 `execution_started`；重啟後伺服器只啟動 catalog 狀態為 `RUNNING` 的對話，所以該對話**沒被載入、沒有 `AgentErrorEvent`、central 停在 `executing`**（到租約過期才會變 `failed_unknown`）。上面 C1／C2 的單元測試是直接把狀態設成 `RUNNING` 造現場，所以看不到。**修法**：`ConversationState.flush_base_state()`，在 `run()`／`arun()` 的確認轉換點，設 `RUNNING` 之後、通知 outbox `execution_started` 之前立刻強制落盤（測試 `test_running_is_on_disk_while_the_approved_tool_executes`：拿掉兩處 flush 就失敗）。真實行程驗證：磁碟是 `running`，重啟後寫入 `AgentErrorEvent`，central 收到 `failed_unknown`，工具沒再跑。
+
+**同一次實測的第二個發現（K3）**：核准還沒決定時殺掉重啟，之後才核准，工具**永遠不會執行**（central 停在 `accepted`）。原因是啟動時只載入 `RUNNING` 的對話，其餘延遲載入，而 outbox relay 與等決定的迴圈只在已載入的 `EventService` 裡跑。**修法**：團隊模式下，啟動時也載入治理 outbox 狀態不在終態的對話（`ConversationService._open_governance_outbox_ids_sync`；測試 `tests/agent_server/test_governance_boot_recovery.py`，拿掉團隊模式分支有 3 項失敗）。真實行程驗證：重啟後核准，工具恰好執行 1 次，central 結束為 `applied`。限度：`REJECTED_LOCALLY` 不在終態集合內，所以也會在啟動時被載入（無害，只是多載入一個對話）；本機一次執行，沒有多台或長時間運轉的驗證。
+
 ## 5. central 端
 
 `approvals/state_machine.py` 的 `_TRANSITIONS` 裡，`CLAIM` 只有一條：`ACCEPTED + CLAIM → EXECUTING`。`EXECUTING + EXPIRE → FAILED_UNKNOWN`（租約到期沒回報），之後只能用 `late_report`（見清單 1.10）補真相，沒有再次 claim。所以即使裝置想重放，central 也不會發第二個 `execution_attempt_id`。

@@ -131,15 +131,21 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
 
     @property
     def workspace_is_search_root(self) -> bool:
-        return (
-            self._search_root_marked_for is not None
-            and self._search_root_marked_for == self.workspace_root
+        """True only while the root is still the directory it was marked for. The
+        comparison is on resolved real paths, taken now and at marking time, so a
+        workspace root that is a symlink or junction and was pointed somewhere else
+        after the marking is no longer marked (a path-less search asks again). It
+        cannot see a retarget that happens between the tool resolving its own working
+        directory and the marking."""
+        marked_for = self._search_root_marked_for
+        return marked_for is not None and marked_for == os.path.realpath(
+            self.workspace_root
         )
 
     def marked_as_search_root(self) -> Self:
         """Say that the current ``workspace_root`` is the directory the search tools
         use when they get no path. Only the governance lock may call this."""
-        self._search_root_marked_for = self.workspace_root
+        self._search_root_marked_for = os.path.realpath(self.workspace_root)
         return self
 
     def _is_in_workspace(self, path: str, *, relative_to_workspace: bool) -> bool:

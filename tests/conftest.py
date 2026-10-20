@@ -235,3 +235,18 @@ def restore_observability_latch():
         yield
     finally:
         laminar._observability_enabled = previous
+
+
+@pytest.fixture(scope="session", autouse=True)
+def build_agent_server_schemas_before_any_test():
+    """Build the agent-server models' discriminated-union schemas before the first
+    test runs. They are built lazily, from the subclasses registered at that moment,
+    and a few tests define a subclass of a discriminated-union base INSIDE the test
+    (for example ``test_security_analyzer.py``). If the first build happens after
+    such a test, pydantic refuses with "Local classes not supported" and unrelated
+    tests that start a conversation fail, depending only on test order."""
+    try:
+        from openhands.agent_server.models import StoredConversation
+    except ImportError:  # a checkout without the agent-server package
+        return
+    StoredConversation.model_rebuild(force=True)
