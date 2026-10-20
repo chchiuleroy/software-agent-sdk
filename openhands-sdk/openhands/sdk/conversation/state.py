@@ -754,6 +754,22 @@ class ConversationState(OpenHandsModel):
         finally:
             self._lock.release()
 
+    def flush_base_state(self) -> None:
+        """Write the base state to disk NOW, even inside a ``with state:`` block.
+
+        Field assignments inside the block are only marked dirty and written when the
+        block exits. ``run()`` assigns RUNNING and then executes the tool inside one
+        such block, so without this call the RUNNING status reaches the disk only after
+        the tool has finished: a process killed while the tool runs leaves the previous
+        status (for example WAITING_FOR_CONFIRMATION) behind, and the restart does not
+        recognise an interrupted execution. Call it right after a status change that a
+        crash must be able to see. A no-op when autosave is off or there is no file
+        store."""
+        fs = getattr(self, "_fs", None)
+        if getattr(self, "_autosave_enabled", False) and fs is not None:
+            self._save_base_state(fs)
+            self._dirty = False
+
     def locked(self) -> bool:
         """
         Return True if the lock is currently held by any thread.

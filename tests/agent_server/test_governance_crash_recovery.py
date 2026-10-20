@@ -300,6 +300,39 @@ async def test_a_claim_without_a_started_run_is_executed_exactly_once(tmp_path):
         assert restarted.executed == ["call_1"]
 
 
+@pytest.mark.asyncio
+async def test_running_is_on_disk_while_the_approved_tool_executes(tmp_path):
+    """The status RUNNING must already be in base_state.json when the tool starts.
+
+    Everything in "the action had started: never again" below rests on a process that
+    dies mid-tool leaving RUNNING on disk (the restart finds it and writes the
+    AgentErrorEvent). run() assigns RUNNING and runs the tool inside one ``with
+    state:`` block, where saves are deferred until the block exits, so without an
+    explicit flush the disk said WAITING_FOR_CONFIRMATION for the whole execution
+    (found by killing a real agent-server process: governance/e2e/e2e_kill_restart.py).
+    The tool executor reads the file at the moment it is called."""
+    scene = await _build_scene(
+        tmp_path,
+        status=ConversationExecutionStatus.WAITING_FOR_CONFIRMATION,
+        outbox_state=OutboxState.CLAIMED,
+    )
+    seen: list[str] = []
+    original = Agent._execute_action_event
+
+    def reading_executor(self, conversation, action_event):
+        payload = json.loads((scene.conversation_dir / "base_state.json").read_text())
+        seen.append(payload["execution_status"])
+        return original(self, conversation, action_event)
+
+    with patch.object(Agent, "_execute_action_event", reading_executor):
+        async with _restart(scene) as restarted:
+            await _wait_until(lambda: bool(seen))
+            await asyncio.sleep(0.3)
+            assert restarted.executed == ["call_1"]
+
+    assert seen == [ConversationExecutionStatus.RUNNING.value]
+
+
 # --- the action had started: never again ---------------------------------------
 
 

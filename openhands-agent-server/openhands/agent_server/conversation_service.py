@@ -35,6 +35,11 @@ from openhands.agent_server.governance_attention import (
     ResolveResponse,
 )
 from openhands.agent_server.governance_client import GovernanceClient
+from openhands.agent_server.governance_outbox import (
+    OUTBOX_FILENAME,
+    TERMINAL_STATES,
+    OutboxState,
+)
 from openhands.agent_server.models import (
     ConversationInfo,
     ConversationPage,
@@ -767,6 +772,27 @@ class ConversationService:
     _credential_bindings: dict[UUID, dict[str, VersionedCredentialBinding]] = field(
         default_factory=dict, init=False
     )
+
+    def _open_governance_outbox_ids_sync(self) -> list[UUID]:
+        """Ids of conversations whose governance outbox record is not finished.
+
+        A record in a state outside TERMINAL_STATES still has work to do (create,
+        claim, execute, report). Unreadable or unknown records are skipped: one bad
+        file must not keep the server from starting."""
+        ids: list[UUID] = []
+        for conversation_dir in self.conversations_dir.iterdir():
+            outbox_file = conversation_dir / OUTBOX_FILENAME
+            if not outbox_file.is_file():
+                continue
+            try:
+                state = OutboxState(json.loads(outbox_file.read_text())["state"])
+                conversation_id = UUID(conversation_dir.name)
+            except (OSError, ValueError, KeyError, TypeError):
+                logger.warning("skipping unreadable governance outbox: %s", outbox_file)
+                continue
+            if state not in TERMINAL_STATES:
+                ids.append(conversation_id)
+        return ids
 
     def _load_catalog_sync(self) -> dict[UUID, _ConversationRecord]:
         records: dict[UUID, _ConversationRecord] = {}
@@ -2211,7 +2237,23 @@ class ConversationService:
             for conversation_id, record in self._conversation_records.items()
             if record.execution_status == ConversationExecutionStatus.RUNNING
         ]
-        for conversation_id in running_ids:
+        # Team mode: a conversation whose governance record is still open (waiting
+        # for a decision, a claim, a result report...) is also started now. Its
+        # outbox relay and decision wait only run inside its EventService, and a
+        # conversation nobody opens after a restart would otherwise sit there with
+        # an approved action that never runs (found by killing a real process:
+        # governance/e2e/e2e_kill_restart.py, case K3).
+        recover_ids = list(running_ids)
+        if self.governance_deployment_mode == "team":
+            for conversation_id in await asyncio.to_thread(
+                self._open_governance_outbox_ids_sync
+            ):
+                if (
+                    conversation_id in self._conversation_records
+                    and conversation_id not in recover_ids
+                ):
+                    recover_ids.append(conversation_id)
+        for conversation_id in recover_ids:
             try:
                 await self._get_or_load_event_service(conversation_id)
             except Exception:
