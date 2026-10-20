@@ -314,10 +314,7 @@ class ConversationConfig(BaseModel):
             and "workspace_root" not in analyzer.model_fields_set
         ):
             self.security_analyzer = analyzer.model_copy(
-                update={
-                    "workspace_root": self.workspace.working_dir,
-                    "workspace_is_search_root": True,
-                }
+                update={"workspace_root": self.workspace.working_dir}
             )
         return self
 

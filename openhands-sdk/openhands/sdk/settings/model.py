@@ -1161,8 +1161,7 @@ class ConversationSettings(BaseModel):
 
             if self.workspace is not None:
                 return RoyPathPayloadSecurityAnalyzer(
-                    workspace_root=self.workspace.working_dir,
-                    workspace_is_search_root=True,
+                    workspace_root=self.workspace.working_dir
                 )
             return RoyPathPayloadSecurityAnalyzer()
         return None

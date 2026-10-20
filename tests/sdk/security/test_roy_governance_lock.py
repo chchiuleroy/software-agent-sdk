@@ -492,9 +492,11 @@ def test_lock_does_not_trust_a_caller_supplied_search_root_mark(
     assert cfg.security_analyzer.workspace_root == str(tmp_path)
 
 
-def test_unlocked_config_marks_only_a_defaulted_root(monkeypatch, tmp_path) -> None:
-    # Without the lock, an analyzer whose root the caller set explicitly keeps it
-    # and is NOT marked (its root may differ from the workspace the tools search).
+def test_unlocked_config_never_marks_the_analyzer(monkeypatch, tmp_path) -> None:
+    # Only the lock is trusted to say "this root is the search root": it is
+    # re-applied with the real workspace on every creation, resume and setter. An
+    # unlocked config binds a defaulted root once and never again, so a mark there
+    # would go stale as soon as the workspace is replaced.
     monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
     workspace = LocalWorkspace(working_dir=str(tmp_path))
 
@@ -506,6 +508,38 @@ def test_unlocked_config_marks_only_a_defaulted_root(monkeypatch, tmp_path) -> N
         security_analyzer=RoyPathPayloadSecurityAnalyzer(workspace_root="/elsewhere"),
     )
 
-    assert defaulted.security_analyzer.workspace_is_search_root is True
+    assert defaulted.security_analyzer.workspace_root == str(tmp_path)
+    assert defaulted.security_analyzer.workspace_is_search_root is False
     assert explicit.security_analyzer.workspace_root == "/elsewhere"
     assert explicit.security_analyzer.workspace_is_search_root is False
+
+
+def test_a_replaced_workspace_never_leaves_a_stale_mark_without_the_lock(
+    monkeypatch, tmp_path
+) -> None:
+    # Review finding: the agent-server swaps the workspace for a worktree with
+    # model_copy after the config validators ran. Without the lock nothing is marked,
+    # so nothing can go stale.
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    source = LocalWorkspace(working_dir=str(tmp_path / "source"))
+    cfg = ConversationConfig(
+        workspace=source, security_analyzer=RoyPathPayloadSecurityAnalyzer()
+    )
+
+    moved = cfg.model_copy(
+        update={"workspace": LocalWorkspace(working_dir=str(tmp_path / "worktree"))}
+    )
+
+    assert moved.security_analyzer.workspace_is_search_root is False
+
+
+def test_locked_conversation_is_marked_for_its_actual_workspace(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+
+    conversation = _local_conversation(tmp_path)
+
+    analyzer = conversation.state.security_analyzer
+    assert analyzer.workspace_root == str(tmp_path)
+    assert analyzer.workspace_is_search_root is True

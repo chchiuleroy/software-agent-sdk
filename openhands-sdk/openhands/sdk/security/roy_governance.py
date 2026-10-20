@@ -114,12 +114,13 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
     """
 
     workspace_root: str = DEFAULT_WORKSPACE_ROOT
-    # True only where ``workspace_root`` is known to be the conversation workspace
-    # that grep/glob search when they get no path (the governance lock, the
-    # conversation config's rebinding, the settings factory). The analyzer cannot
-    # see the tool's own working directory, so an analyzer built any other way,
-    # with some other root, must not call a path-less search "inside the
-    # workspace": it keeps asking.
+    # True only when the governance lock built this analyzer for the conversation's
+    # actual workspace (roy_governance_lock). The analyzer cannot see the tool's own
+    # working directory, which grep/glob search when they get no path, and a mark set
+    # anywhere else would go stale when the workspace is replaced afterwards
+    # (``model_copy``, a resume): the lock is re-applied with the real workspace on
+    # every creation, resume and setter, so only its mark is trusted. Unmarked, a
+    # path-less search keeps asking.
     workspace_is_search_root: bool = False
 
     def _is_in_workspace(self, path: str, *, relative_to_workspace: bool) -> bool:
