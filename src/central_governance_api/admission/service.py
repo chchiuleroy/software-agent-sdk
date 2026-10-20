@@ -499,6 +499,12 @@ async def record_first_use(
 
     Every call writes an audit event, so one identity is limited per minute; the same
     report repeated (same device, fingerprint and answer) adds no second row."""
+    # One report at a time per identity until this transaction ends: the rate limit and
+    # the "already reported" check are both "count, then insert".
+    await session.execute(
+        text("select pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"admission-first-use:{principal.issuer}#{principal.sub}"},
+    )
     await _enforce_first_use_rate(session, principal, settings)
     department = (await tool_permissions_for(session, principal)).department_id
     item = (

@@ -8,10 +8,11 @@ Every test says why it matters.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from central_governance_api.admission import service
@@ -265,22 +266,21 @@ async def test_a_repeat_by_someone_else_reveals_where_it_stands_but_nothing_they
     assert again["name"] == "ada-private-name"  # the submitter still sees their own
 
 
-# --- the limits under real parallel requests ----------------------------------------
+# --- the limits under real parallel requests ------------------------------------------
 
 
-async def test_parallel_submissions_by_one_user_cannot_pass_the_waiting_limit(
-    signing_key,
-):
-    """Eight different contents at once, limit one waiting item.
+@contextlib.asynccontextmanager
+async def _real_connections(settings):
+    """Real, separate database connections for a race the shared test session cannot
+    make: a department, a device/user identity in it, and a pool opened up front (the
+    connections are otherwise made one after another, the first request finishes before
+    the others even have a connection, and nothing runs in parallel; found by removing
+    a lock and seeing the test still pass). Commits its own rows, removes them after.
 
-    Why: each limit is "count, then insert". Without something that makes one user's
-    submissions take turns, all eight see an empty queue and all eight are created.
-    This needs real, separate connections (the shared test session cannot make a real
-    conflict), so it commits its own rows and removes them again."""
+    Yields ``(sessions, principal, department_id)``."""
     engine = create_engine(_settings())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     sub = f"parallel-{uuid.uuid4().hex[:8]}"
-    settings = _settings(admission_max_open_per_user=1)
     principal = Principal(
         issuer=ISSUER,
         sub=sub,
@@ -307,37 +307,11 @@ async def test_parallel_submissions_by_one_user_cannot_pass_the_waiting_limit(
     except Exception as exc:  # no reachable test Postgres
         await engine.dispose()
         pytest.skip(f"no reachable test Postgres: {exc}")
-
-    # Open all the connections first and hand them back to the pool. Otherwise they are
-    # made one after another, the first request finishes before the others even have a
-    # connection, and nothing runs in parallel (found by removing the lock: the test
-    # still passed).
     warm = [await engine.connect() for _ in range(8)]
     for connection in warm:
         await connection.close()
-
-    async def one(i: int):
-        async with sessions() as session:
-            tool = service.ToolDescriptor(f"tool{i}", None, SCHEMA)
-            try:
-                result = await service.submit(
-                    session,
-                    principal,
-                    settings,
-                    kind="mcp_server",
-                    name=f"server{i}",
-                    source="https://mcp.example.test",
-                    department_id=None,
-                    tools=[tool],
-                    archive_b64=None,
-                )
-                return "created" if result.created else "existing"
-            except AdmissionRateLimitedError:
-                return "limited"
-
     try:
-        outcomes = await asyncio.gather(*(one(i) for i in range(8)))
-        assert sorted(outcomes) == ["created"] + ["limited"] * 7, outcomes
+        yield sessions, principal, department_id
     finally:
         async with sessions() as cleanup:
             item_ids = (
@@ -350,6 +324,9 @@ async def test_parallel_submissions_by_one_user_cannot_pass_the_waiting_limit(
                 )
                 .scalars()
                 .all()
+            )
+            await cleanup.execute(
+                delete(AdmissionFirstUse).where(AdmissionFirstUse.device_sub == sub)
             )
             if item_ids:
                 await cleanup.execute(
@@ -376,3 +353,109 @@ async def test_parallel_submissions_by_one_user_cannot_pass_the_waiting_limit(
             )
             await cleanup.commit()
         await engine.dispose()
+
+
+async def test_parallel_submissions_by_one_user_cannot_pass_the_waiting_limit():
+    """Eight different contents at once, limit one waiting item.
+
+    Why: each limit is "count, then insert". Without something that makes one user's
+    submissions take turns, all eight see an empty queue and all eight are created."""
+    settings = _settings(admission_max_open_per_user=1)
+    async with _real_connections(settings) as (sessions, principal, _):
+
+        async def one(i: int):
+            async with sessions() as session:
+                tool = service.ToolDescriptor(f"tool{i}", None, SCHEMA)
+                try:
+                    result = await service.submit(
+                        session,
+                        principal,
+                        settings,
+                        kind="mcp_server",
+                        name=f"server{i}",
+                        source="https://mcp.example.test",
+                        department_id=None,
+                        tools=[tool],
+                        archive_b64=None,
+                    )
+                    return "created" if result.created else "existing"
+                except AdmissionRateLimitedError:
+                    return "limited"
+
+        outcomes = await asyncio.gather(*(one(i) for i in range(8)))
+        assert sorted(outcomes) == ["created"] + ["limited"] * 7, outcomes
+
+
+async def test_parallel_first_use_reports_cannot_pass_the_rate_limit():
+    """Eight first-use reports at once, limit three a minute.
+
+    Why (review finding): the limit counts the identity's recent audit events and the
+    report adds its own afterwards; without the identity taking turns, all eight count
+    zero and all eight are accepted."""
+    settings = _settings(admission_first_use_per_minute=3)
+    async with _real_connections(settings) as (sessions, principal, _):
+
+        async def one(i: int):
+            async with sessions() as session:
+                try:
+                    return await service.record_first_use(
+                        session,
+                        principal,
+                        settings,
+                        kind="mcp_server",
+                        fingerprint="sha256:" + f"{i:064x}",
+                        local_fingerprint="sha256:" + f"{i:064x}",
+                    )
+                except AdmissionRateLimitedError:
+                    return "limited"
+
+        outcomes = await asyncio.gather(*(one(i) for i in range(8)))
+        assert sorted(outcomes) == ["limited"] * 5 + ["unknown"] * 3, outcomes
+
+
+async def test_parallel_identical_first_use_reports_add_one_row():
+    """Why (review finding): "already reported?" is a count followed by an insert, so
+    several identical reports at once would each find none and each add a row."""
+    settings = _settings(admission_first_use_per_minute=100)
+    async with _real_connections(settings) as (sessions, principal, _):
+        async with sessions() as session:
+            submitted = await service.submit(
+                session,
+                principal,
+                settings,
+                kind="mcp_server",
+                name="s",
+                source="https://mcp.example.test",
+                department_id=None,
+                tools=[service.ToolDescriptor("t", None, SCHEMA)],
+                archive_b64=None,
+            )
+            item = submitted.item
+            await session.execute(
+                update(AdmissionItem)
+                .where(AdmissionItem.id == item.id)
+                .values(status="approved")
+            )
+            await session.commit()
+            fingerprint = item.fingerprint
+
+        async def one(_: int):
+            async with sessions() as session:
+                return await service.record_first_use(
+                    session,
+                    principal,
+                    settings,
+                    kind="mcp_server",
+                    fingerprint=fingerprint,
+                    local_fingerprint=fingerprint,
+                )
+
+        answers = await asyncio.gather(*(one(i) for i in range(6)))
+        assert set(answers) == {"approved"}
+        async with sessions() as session:
+            rows = await session.scalar(
+                select(func.count())
+                .select_from(AdmissionFirstUse)
+                .where(AdmissionFirstUse.item_id == item.id)
+            )
+        assert rows == 1
