@@ -251,14 +251,18 @@ def test_what_the_real_analyzer_says_about_each_kind_of_call(replayer):
     assert replayer.verdict(
         "file_editor", {"command": "view", "path": outside_path}, ws
     ) == ("HIGH", True)
+    # The replayer's analyzer is built without the governance lock, so it carries no
+    # search-root mark and a path-less grep still asks here (it is LOW only under the
+    # lock, see test_builtin_tool_risk.py).
     assert replayer.verdict("grep", {"pattern": "x", "path": None}, ws) == (
         "UNKNOWN",
         True,
     )
     assert replayer.verdict("terminal", {"command": "ls"}, "C:/") == ("HIGH", True)
+    # Relaxed 2026-10-20 (Roy agreed): the built-in task tracker no longer asks.
     assert replayer.verdict("task_tracker", {"command": "view"}, "C:/") == (
-        "HIGH",
-        True,
+        "LOW",
+        False,
     )
     assert replayer.verdict("mcp_tool", {}, "C:/") == ("UNKNOWN", True)
 
