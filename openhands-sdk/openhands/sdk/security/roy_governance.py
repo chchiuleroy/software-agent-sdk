@@ -122,19 +122,24 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
     # directory, which grep/glob search when they get no path. A mark that could be
     # saved or sent in would go stale (a resume into another workspace, a REST
     # request that simply says true), so it is a private attribute: it is never
-    # serialized and no input can set it. The lock is re-applied with the real
-    # workspace on every creation, resume and setter and marks again each time.
-    # Unmarked, a path-less search keeps asking.
-    _search_root_marked: bool = PrivateAttr(default=False)
+    # serialized and no input can set it. It remembers WHICH root it was set for, so
+    # a copy that changes ``workspace_root`` (``model_copy(update=...)``) is no longer
+    # marked. The lock is re-applied with the real workspace on every creation,
+    # resume and setter and marks again each time. Unmarked, a path-less search keeps
+    # asking.
+    _search_root_marked_for: str | None = PrivateAttr(default=None)
 
     @property
     def workspace_is_search_root(self) -> bool:
-        return self._search_root_marked
+        return (
+            self._search_root_marked_for is not None
+            and self._search_root_marked_for == self.workspace_root
+        )
 
     def marked_as_search_root(self) -> Self:
-        """Say that ``workspace_root`` is the directory the search tools use when
-        they get no path. Only the governance lock may call this."""
-        self._search_root_marked = True
+        """Say that the current ``workspace_root`` is the directory the search tools
+        use when they get no path. Only the governance lock may call this."""
+        self._search_root_marked_for = self.workspace_root
         return self
 
     def _is_in_workspace(self, path: str, *, relative_to_workspace: bool) -> bool:

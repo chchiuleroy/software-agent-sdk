@@ -594,3 +594,22 @@ def test_a_resume_into_another_workspace_remarks_for_that_workspace(
         security_analyzer=restored,
     )
     assert unlocked.security_analyzer.workspace_is_search_root is False
+
+
+def test_a_copy_with_another_root_is_no_longer_marked(monkeypatch, tmp_path) -> None:
+    # Review finding: the mark survived model_copy(update={"workspace_root": ...}),
+    # so the lock's "return it as is" branch could accept a mark made for the old
+    # root. The mark belongs to the root it was set for.
+    old, new = str(tmp_path / "old"), str(tmp_path / "new")
+    marked = RoyPathPayloadSecurityAnalyzer(workspace_root=old).marked_as_search_root()
+
+    moved = marked.model_copy(update={"workspace_root": new})
+    assert moved.workspace_root == new
+    assert moved.workspace_is_search_root is False
+    assert marked.model_copy().workspace_is_search_root is True  # same root: kept
+
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    result = roy_governance_lock.apply_security_analyzer_lock(moved, workspace_root=new)
+    assert result is not moved
+    assert result.workspace_root == new
+    assert result.workspace_is_search_root is True
