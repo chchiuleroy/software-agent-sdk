@@ -10,6 +10,9 @@ from __future__ import annotations
 import os
 import re
 import sys
+from typing import Self
+
+from pydantic import PrivateAttr
 
 from openhands.sdk.event.llm_convertible import ActionEvent
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
@@ -114,14 +117,25 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
     """
 
     workspace_root: str = DEFAULT_WORKSPACE_ROOT
-    # True only when the governance lock built this analyzer for the conversation's
-    # actual workspace (roy_governance_lock). The analyzer cannot see the tool's own
-    # working directory, which grep/glob search when they get no path, and a mark set
-    # anywhere else would go stale when the workspace is replaced afterwards
-    # (``model_copy``, a resume): the lock is re-applied with the real workspace on
-    # every creation, resume and setter, so only its mark is trusted. Unmarked, a
-    # path-less search keeps asking.
-    workspace_is_search_root: bool = False
+    # Set only by the governance lock, for the conversation's actual workspace
+    # (roy_governance_lock). The analyzer cannot see the tool's own working
+    # directory, which grep/glob search when they get no path. A mark that could be
+    # saved or sent in would go stale (a resume into another workspace, a REST
+    # request that simply says true), so it is a private attribute: it is never
+    # serialized and no input can set it. The lock is re-applied with the real
+    # workspace on every creation, resume and setter and marks again each time.
+    # Unmarked, a path-less search keeps asking.
+    _search_root_marked: bool = PrivateAttr(default=False)
+
+    @property
+    def workspace_is_search_root(self) -> bool:
+        return self._search_root_marked
+
+    def marked_as_search_root(self) -> Self:
+        """Say that ``workspace_root`` is the directory the search tools use when
+        they get no path. Only the governance lock may call this."""
+        self._search_root_marked = True
+        return self
 
     def _is_in_workspace(self, path: str, *, relative_to_workspace: bool) -> bool:
         if relative_to_workspace and not os.path.isabs(path):

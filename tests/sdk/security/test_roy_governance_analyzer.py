@@ -78,8 +78,8 @@ def workspace(tmp_path, monkeypatch):
 @pytest.fixture
 def analyzer(workspace):
     return RoyPathPayloadSecurityAnalyzer(
-        workspace_root=str(workspace), workspace_is_search_root=True
-    )
+        workspace_root=str(workspace)
+    ).marked_as_search_root()
 
 
 def _risk(analyzer, tool_name: str, action: Action) -> SecurityRisk:

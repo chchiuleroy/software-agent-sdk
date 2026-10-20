@@ -140,6 +140,6 @@ def apply_security_analyzer_lock(
         ):
             return analyzer
         return RoyPathPayloadSecurityAnalyzer(
-            workspace_root=workspace_root, workspace_is_search_root=True
-        )
+            workspace_root=workspace_root
+        ).marked_as_search_root()
     return analyzer

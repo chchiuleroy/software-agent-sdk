@@ -425,8 +425,8 @@ def workspace(tmp_path, monkeypatch) -> Path:
 @pytest.fixture
 def analyzer(workspace) -> RoyPathPayloadSecurityAnalyzer:
     return RoyPathPayloadSecurityAnalyzer(
-        workspace_root=str(workspace), workspace_is_search_root=True
-    )
+        workspace_root=str(workspace)
+    ).marked_as_search_root()
 
 
 def _in_workspace(workspace: Path) -> Path:
