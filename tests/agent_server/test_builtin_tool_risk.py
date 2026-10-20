@@ -21,7 +21,9 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import os
 import pkgutil
+import subprocess
 import sys
 import textwrap
 from collections.abc import Callable
@@ -32,6 +34,7 @@ import pytest
 from litellm import ChatCompletionMessageToolCall
 from litellm.types.utils import Function
 
+import openhands.sdk.tool.builtins
 import openhands.tools
 from openhands.agent_server.governance_display import _PROJECTORS, _TOOL_ARGS
 from openhands.sdk.event import ActionEvent
@@ -392,13 +395,19 @@ def _defined_in_a_built_in_module(cls: type) -> bool:
 def _builtin_action_classes() -> set[type[Action]]:
     """Every Action class the built-in packages define.
 
-    Only the ``definition`` modules are imported: that is where the tools declare
-    their Action classes, and some sibling modules (a POSIX-only terminal backend)
-    cannot be imported everywhere.
+    Under ``openhands.tools`` only the ``definition`` modules are imported: that is
+    where the tools declare their Action classes, and some sibling modules (a
+    POSIX-only terminal backend) cannot be imported everywhere. Every module of
+    ``openhands.sdk.tool.builtins`` is imported: they are small and portable, and
+    this file's own imports of them must not be what decides which ones count.
     """
     for module in pkgutil.walk_packages(openhands.tools.__path__, "openhands.tools."):
         if module.name.endswith(".definition"):
             importlib.import_module(module.name)
+    for module in pkgutil.walk_packages(
+        openhands.sdk.tool.builtins.__path__, "openhands.sdk.tool.builtins."
+    ):
+        importlib.import_module(module.name)
 
     def subclasses(cls: type) -> set[type]:
         found: set[type] = set()
@@ -459,6 +468,55 @@ def test_a_class_that_only_claims_a_built_in_module_is_not_a_built_in_action():
 
     forged = _Forged  # alive for the whole test, not left to the collector
     assert forged not in _builtin_action_classes()
+
+
+def test_a_new_module_in_the_sdk_builtins_package_is_found_without_being_imported_here(
+    tmp_path,
+):
+    """The completeness test imports the ``openhands.tools`` definition modules
+    itself, but this file imports the ``openhands.sdk.tool.builtins`` modules by
+    hand. A new builtin module nobody imported here would then be missing from both
+    the discovered classes and the table, and the completeness test would still
+    pass. So discovery must import the builtins package too: prove it in a fresh
+    interpreter (a probe class left in this process would leak into other tests)
+    by adding a module to the package path that this file does not import."""
+    (tmp_path / "zz_probe_builtin.py").write_text(
+        "from openhands.sdk.tool.schema import Action\n"
+        "\n"
+        "\n"
+        "class ProbeAction(Action):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    script = textwrap.dedent(
+        """
+        import importlib.util
+        import sys
+
+        import openhands.sdk.tool.builtins as builtins_package
+
+        builtins_package.__path__.append(sys.argv[2])
+        spec = importlib.util.spec_from_file_location("risk_table_module", sys.argv[1])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["risk_table_module"] = module
+        spec.loader.exec_module(module)
+        found = {cls.__qualname__ for cls in module._builtin_action_classes()}
+        print("PROBE_FOUND=" + str("ProbeAction" in found))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, __file__, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        env={**os.environ, "OPENHANDS_SUPPRESS_BANNER": "1"},
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "PROBE_FOUND=True" in result.stdout, (
+        "a built-in Action class in a module this file does not import was not "
+        f"discovered; stdout={result.stdout[-500:]!r}"
+    )
 
 
 def test_the_display_tables_and_the_risk_table_name_the_same_tools():
