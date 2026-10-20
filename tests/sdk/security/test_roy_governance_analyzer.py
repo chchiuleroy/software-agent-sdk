@@ -77,7 +77,9 @@ def workspace(tmp_path, monkeypatch):
 
 @pytest.fixture
 def analyzer(workspace):
-    return RoyPathPayloadSecurityAnalyzer(workspace_root=str(workspace))
+    return RoyPathPayloadSecurityAnalyzer(
+        workspace_root=str(workspace), workspace_is_search_root=True
+    )
 
 
 def _risk(analyzer, tool_name: str, action: Action) -> SecurityRisk:
@@ -262,3 +264,12 @@ def test_built_in_action_under_another_tool_name_is_not_trusted(analyzer, worksp
     # built-in class is simply an unknown tool.
     action = ReadFileAction(file_path=str(workspace / "a.txt"))
     assert _risk(analyzer, "not_a_listed_tool", action) == SecurityRisk.UNKNOWN
+
+
+def test_pathless_search_still_asks_when_the_root_is_not_the_search_root(workspace):
+    # An analyzer whose root the caller set by hand may not be the directory the
+    # tool really searches, so a path-less grep/glob must not count as inside it.
+    unmarked = RoyPathPayloadSecurityAnalyzer(workspace_root=str(workspace))
+    assert unmarked.workspace_is_search_root is False
+    assert _risk(unmarked, "grep", GrepAction(pattern="x")) == SecurityRisk.UNKNOWN
+    assert _risk(unmarked, "glob", GlobAction(pattern="*.py")) == SecurityRisk.UNKNOWN

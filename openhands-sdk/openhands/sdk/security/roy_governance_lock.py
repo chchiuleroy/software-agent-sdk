@@ -136,7 +136,10 @@ def apply_security_analyzer_lock(
         if (
             isinstance(analyzer, RoyPathPayloadSecurityAnalyzer)
             and analyzer.workspace_root == workspace_root
+            and analyzer.workspace_is_search_root
         ):
             return analyzer
-        return RoyPathPayloadSecurityAnalyzer(workspace_root=workspace_root)
+        return RoyPathPayloadSecurityAnalyzer(
+            workspace_root=workspace_root, workspace_is_search_root=True
+        )
     return analyzer

@@ -114,6 +114,13 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
     """
 
     workspace_root: str = DEFAULT_WORKSPACE_ROOT
+    # True only where ``workspace_root`` is known to be the conversation workspace
+    # that grep/glob search when they get no path (the governance lock, the
+    # conversation config's rebinding, the settings factory). The analyzer cannot
+    # see the tool's own working directory, so an analyzer built any other way,
+    # with some other root, must not call a path-less search "inside the
+    # workspace": it keeps asking.
+    workspace_is_search_root: bool = False
 
     def _is_in_workspace(self, path: str, *, relative_to_workspace: bool) -> bool:
         if relative_to_workspace and not os.path.isabs(path):
@@ -150,7 +157,10 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
                     path, relative_to_workspace=relative_to_workspace
                 )
                 return SecurityRisk.LOW if in_workspace else SecurityRisk.HIGH
-            if action.tool_name in _SEARCHES_WORKSPACE_WHEN_PATHLESS:
+            if (
+                self.workspace_is_search_root
+                and action.tool_name in _SEARCHES_WORKSPACE_WHEN_PATHLESS
+            ):
                 return SecurityRisk.LOW
             return SecurityRisk.UNKNOWN
 

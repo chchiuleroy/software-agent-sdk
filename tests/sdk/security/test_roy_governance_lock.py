@@ -455,3 +455,57 @@ def test_fresh_conversation_without_lock_writes_no_admin_audit(
     _local_conversation(tmp_path)
 
     assert _read_admin_audit_records(audit_dir) == []
+
+
+def test_lock_marks_the_analyzer_as_searching_the_conversation_workspace(
+    monkeypatch, tmp_path
+) -> None:
+    # Path-less grep/glob are only treated as "inside the workspace" when the
+    # analyzer's root is known to be the workspace they search. An analyzer the
+    # caller built with the same root but without that mark is rebuilt with it.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    unmarked = RoyPathPayloadSecurityAnalyzer(workspace_root=str(tmp_path))
+    assert unmarked.workspace_is_search_root is False
+
+    cfg = ConversationConfig(
+        workspace=LocalWorkspace(working_dir=str(tmp_path)), security_analyzer=unmarked
+    )
+
+    assert cfg.security_analyzer.workspace_root == str(tmp_path)
+    assert cfg.security_analyzer.workspace_is_search_root is True
+
+
+def test_lock_does_not_trust_a_caller_supplied_search_root_mark(
+    monkeypatch, tmp_path
+) -> None:
+    # The mark claims "my root is the search root"; a caller cannot use it to keep
+    # a different root, because the lock rebuilds on any mismatch.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    forged = RoyPathPayloadSecurityAnalyzer(
+        workspace_root="/", workspace_is_search_root=True
+    )
+
+    cfg = ConversationConfig(
+        workspace=LocalWorkspace(working_dir=str(tmp_path)), security_analyzer=forged
+    )
+
+    assert cfg.security_analyzer.workspace_root == str(tmp_path)
+
+
+def test_unlocked_config_marks_only_a_defaulted_root(monkeypatch, tmp_path) -> None:
+    # Without the lock, an analyzer whose root the caller set explicitly keeps it
+    # and is NOT marked (its root may differ from the workspace the tools search).
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    workspace = LocalWorkspace(working_dir=str(tmp_path))
+
+    defaulted = ConversationConfig(
+        workspace=workspace, security_analyzer=RoyPathPayloadSecurityAnalyzer()
+    )
+    explicit = ConversationConfig(
+        workspace=workspace,
+        security_analyzer=RoyPathPayloadSecurityAnalyzer(workspace_root="/elsewhere"),
+    )
+
+    assert defaulted.security_analyzer.workspace_is_search_root is True
+    assert explicit.security_analyzer.workspace_root == "/elsewhere"
+    assert explicit.security_analyzer.workspace_is_search_root is False
