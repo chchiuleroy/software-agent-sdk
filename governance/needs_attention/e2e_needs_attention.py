@@ -24,6 +24,12 @@ Phase 2 (central restarted with device binding ON, then OFF)
   C  central restarted with binding OFF -> retry -> the relay (30 s cycle) repeats the
      claim with the original key -> the tool actually runs and the result is reported
 
+Phase 3 (temporary claim failures, through a fault proxy in front of central)
+  E  two 503s -> retry once -> superadmin; F  one 503 -> retry works
+  LOST  central handled and committed the claim but the answer was lost (the agent
+     sees 503): parked as claim_transient, central already shows `executing`, the
+     operator retry replays the claim and the tool runs exactly once
+
 Checks named SETUP-* mean the scenario itself did not run (inconclusive). A FAIL
 anywhere else is a real finding.
 
@@ -44,6 +50,7 @@ Takes about five minutes (the relay cycle is 30 seconds and one scenario waits f
 """
 
 import asyncio
+import codecs
 import getpass
 import json
 import os
@@ -190,6 +197,19 @@ class _FaultProxy(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if (
+            method == "POST"
+            and self.path.endswith("/claim")
+            and FAULT["claims_lost"] > 0
+        ):
+            # central has handled (and committed) the claim; the answer never arrives
+            FAULT["claims_lost"] -= 1
+            FAULT["refused"] += 1
+            FAULT["lost_status"] = r.status_code
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(r.status_code)
         self.send_header("Content-Type", r.headers.get("content-type", "text/plain"))
         self.send_header("Content-Length", str(len(r.content)))
@@ -206,7 +226,7 @@ class _FaultProxy(BaseHTTPRequestHandler):
         pass
 
 
-FAULT = {"claims": 0, "audits": 0, "refused": 0}
+FAULT = {"claims": 0, "claims_lost": 0, "audits": 0, "refused": 0, "lost_status": None}
 
 
 def _chat_response(message: dict) -> bytes:
@@ -260,7 +280,7 @@ class _Llm(BaseHTTPRequestHandler):
                         "function": {
                             "name": "terminal",
                             "arguments": json.dumps(
-                                {"command": f"echo ran > {marker}"}
+                                {"command": f"echo ran >> {marker}"}
                             ),
                         },
                     }
@@ -486,6 +506,17 @@ async def main():
 
     def marker(tag):
         return (WORKSPACE / f"ran_{tag}.marker").exists()
+
+    def runs(tag):
+        """How many times the tool ran: the tool appends one line per execution."""
+        path = WORKSPACE / f"ran_{tag}.marker"
+        if not path.exists():
+            return 0
+        data = path.read_bytes()
+        # a Windows PowerShell terminal writes redirected output as UTF-16
+        is_utf16 = data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+        text = data.decode("utf-16" if is_utf16 else "utf-8")
+        return len([line for line in text.splitlines() if line.strip()])
 
     try:
         if not await start_central(bind=False):
@@ -1414,7 +1445,9 @@ async def main():
                     f"state={state_of(cid_c)!r} after {waited:.0f}s",
                 )
                 info("C seconds from retry to result_reported", f"{waited:.0f}")
-                check("C the tool ran exactly once (its marker exists)", marker("c1"))
+                check(
+                    "C the tool ran exactly once", runs("c1") == 1, f"runs={runs('c1')}"
+                )
                 check(
                     "C central ends the approval as applied",
                     central_status(cid_c) == "applied",
@@ -1527,11 +1560,66 @@ async def main():
                     bool(done),
                     f"state={state_of(cid_f)!r}",
                 )
-                check("F the tool ran exactly once", marker("f1"))
+                check(
+                    "F the tool ran exactly once", runs("f1") == 1, f"runs={runs('f1')}"
+                )
                 check(
                     "F central ends the approval as applied",
                     central_status(cid_f) == "applied",
                     f"status={central_status(cid_f)!r}",
+                )
+
+                # ---- LOST: central claimed, but the answer was lost on the way back.
+                # The agent-server sees the same 503 as in F, yet central already
+                # holds an execution attempt for this approval.
+                FAULT["lost_status"] = None
+                FAULT["claims_lost"] = 1
+                cid_g = await start_and_run("l1")
+                if not await pending_approval(cid_g, 1):
+                    check("SETUP l1: approval pending", False, str(rows(cid_g)))
+                r = await decide_accept(cid_g)
+                check("SETUP l1: approver accepts", r.status_code == 200)
+                parked = await wait_for(
+                    lambda: state_of(cid_g) == "needs_attention", 60
+                )
+                ob = outbox_of(cid_g) or {}
+                check(
+                    "LOST central really did claim (proxy saw a 2xx) but the "
+                    "agent-server parked it as a temporary failure",
+                    bool(parked)
+                    and FAULT["lost_status"] is not None
+                    and 200 <= FAULT["lost_status"] < 300
+                    and ob.get("needs_attention_reason") == "claim_transient",
+                    f"lost_status={FAULT['lost_status']!r} "
+                    f"reason={ob.get('needs_attention_reason')!r}",
+                )
+                check(
+                    "LOST central already shows the approval as executing",
+                    central_status(cid_g) == "executing",
+                    f"status={central_status(cid_g)!r}",
+                )
+                check("LOST the tool did not run yet", not marker("l1"))
+                r = await resolve(cid_g, "retry", ob["request_id"])
+                check("LOST the operator retry is accepted", r.status_code == 200)
+                done = await wait_for(
+                    lambda: state_of(cid_g) == "result_reported", RELAY_WAIT_SECONDS
+                )
+                reason_now = (outbox_of(cid_g) or {}).get("needs_attention_reason")
+                check(
+                    "LOST the repeated claim is replayed by central and the result is "
+                    "reported",
+                    bool(done),
+                    f"state={state_of(cid_g)!r} reason={reason_now!r}",
+                )
+                check(
+                    "LOST the tool ran exactly once",
+                    runs("l1") == 1,
+                    f"runs={runs('l1')}",
+                )
+                check(
+                    "LOST central ends the approval as applied",
+                    central_status(cid_g) == "applied",
+                    f"status={central_status(cid_g)!r}",
                 )
 
             await scenario("PHASE 3: temporary claim failures", phase3())

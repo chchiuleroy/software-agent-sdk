@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -324,6 +326,45 @@ async def test_an_interrupted_execution_is_not_executed_again(tmp_path, outbox_s
         assert restarted.executed == []
         assert restarted.report_outcomes() == ["failure_unknown"]
         assert any(isinstance(e, AgentErrorEvent) for e in _events(restarted.service))
+
+
+# --- the one stretch that must not yield ----------------------------------------
+
+
+def _fake_service(status, on_event):
+    state = SimpleNamespace(events=[_pending_action()], execution_status=status)
+    conversation = SimpleNamespace(state=state, _on_event=on_event)
+    return SimpleNamespace(_conversation=conversation), state
+
+
+def test_the_status_flip_and_the_paired_error_cannot_be_separated_by_an_await():
+    """The recovery step is a plain function: Python does not let one ``await``, so no
+    other task can run between the status change and the AgentErrorEvent. This used to
+    be a comment on ``start()``; making it ``async`` again fails here."""
+    assert not inspect.iscoroutinefunction(EventService._fail_interrupted_tool_call)
+
+
+def test_the_error_is_written_before_the_status_leaves_running():
+    """If writing the AgentErrorEvent raises, the status must still be RUNNING: the next
+    start() tries again. The other order leaves ERROR with an unpaired action, which a
+    later run() could execute."""
+    seen: list = []
+
+    def record(event):
+        seen.append((type(event).__name__, state.execution_status))
+
+    service, state = _fake_service(ConversationExecutionStatus.RUNNING, record)
+    EventService._fail_interrupted_tool_call(service)
+    assert seen == [("AgentErrorEvent", ConversationExecutionStatus.RUNNING)]
+    assert state.execution_status == ConversationExecutionStatus.ERROR
+
+    def boom(event):
+        raise RuntimeError("disk full")
+
+    service, state = _fake_service(ConversationExecutionStatus.RUNNING, boom)
+    with pytest.raises(RuntimeError):
+        EventService._fail_interrupted_tool_call(service)
+    assert state.execution_status == ConversationExecutionStatus.RUNNING
 
 
 # --- the action had finished: report what really happened -----------------------
