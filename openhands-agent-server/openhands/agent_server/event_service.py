@@ -1804,6 +1804,64 @@ class EventService:
                 "Failed to initialize git repository at %s: %s", working_dir, e
             )
 
+    def _fail_interrupted_tool_call(self) -> None:
+        """Surface a tool call that a crash interrupted: pair it with an error, then
+        move the conversation out of RUNNING.
+
+        Deliberately a plain (non-async) method. At-most-once execution depends on
+        there being no point between "the status is no longer RUNNING" and "the
+        interrupted action has its ``AgentErrorEvent``" at which another task can
+        run: once the status is ERROR, run() no longer refuses on RUNNING, and an
+        action that still has no result could be executed a second time. A method
+        that cannot ``await`` makes that a property of the code, not of a comment.
+        The error event is written BEFORE the status changes, so if writing it
+        raises, the status is still RUNNING and the next start() tries again,
+        instead of leaving ERROR with an unpaired action. Pinned by
+        tests/agent_server/test_governance_crash_recovery.py; rationale in
+        governance/recovery/design.md.
+        """
+        conversation = self._conversation
+        assert conversation is not None
+        state = conversation.state
+        # Crash recovery scans the full log, not the active branch: the
+        # process may have died between writing an event file and persisting
+        # the advanced HEAD, so the leaf can lag the on-disk events. (Remote
+        # branching is unsupported — #3749 — so there are no abandoned
+        # branches to exclude here anyway.)
+        unmatched_actions = ConversationState.get_unmatched_actions(state.events)
+        if unmatched_actions:
+            first_action = unmatched_actions[0]
+            # Skip if any observation-like event already exists for this
+            # tool_call_id, to avoid duplicate observations when an
+            # observation matches by tool_call_id but not action_id.
+            already_observed = any(
+                isinstance(e, ObservationBaseEvent)
+                and e.tool_call_id == first_action.tool_call_id
+                for e in state.events
+            )
+            if not already_observed:
+                # The persisted HEAD can lag this action when the process
+                # dies after writing the event file but before autosaving
+                # leaf_event_id. Parent the recovery result to the action
+                # explicitly; otherwise normal tree stamping attaches it to
+                # the stale HEAD, making the action and result siblings and
+                # leaving an orphan tool result on the active branch.
+                error_event = AgentErrorEvent(
+                    parent_id=first_action.id,
+                    tool_name=first_action.tool_name,
+                    tool_call_id=first_action.tool_call_id,
+                    error=(
+                        "A restart occurred while this tool was in progress. "
+                        "This may indicate a fatal memory error or system crash. "
+                        "The tool execution was interrupted and did not complete."
+                    ),
+                    classification=ErrorClassification(
+                        kind=FailureKind.INTERNAL, retryable=False
+                    ),
+                )
+                conversation._on_event(error_event)
+        state.execution_status = ConversationExecutionStatus.ERROR
+
     async def start(self):
         # Store the main event loop for cross-thread communication
         self._main_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
@@ -2011,51 +2069,7 @@ class EventService:
         # should be surfaced back to the agent.
         state = self._conversation.state
         if state.execution_status == ConversationExecutionStatus.RUNNING:
-            # Do not add an ``await`` between this status flip and the paired
-            # ``AgentErrorEvent`` written below. Once the status is ERROR, run()
-            # no longer refuses on RUNNING; if another task could run in the gap,
-            # the interrupted tool call could execute a second time (at-most-once
-            # execution relies on this). Pinned by
-            # tests/agent_server/test_governance_crash_recovery.py; rationale in
-            # governance/recovery/design.md.
-            state.execution_status = ConversationExecutionStatus.ERROR
-            # Crash recovery scans the full log, not the active branch: the
-            # process may have died between writing an event file and persisting
-            # the advanced HEAD, so the leaf can lag the on-disk events. (Remote
-            # branching is unsupported — #3749 — so there are no abandoned
-            # branches to exclude here anyway.)
-            unmatched_actions = ConversationState.get_unmatched_actions(state.events)
-            if unmatched_actions:
-                first_action = unmatched_actions[0]
-                # Skip if any observation-like event already exists for this
-                # tool_call_id, to avoid duplicate observations when an
-                # observation matches by tool_call_id but not action_id.
-                already_observed = any(
-                    isinstance(e, ObservationBaseEvent)
-                    and e.tool_call_id == first_action.tool_call_id
-                    for e in state.events
-                )
-                if not already_observed:
-                    # The persisted HEAD can lag this action when the process
-                    # dies after writing the event file but before autosaving
-                    # leaf_event_id. Parent the recovery result to the action
-                    # explicitly; otherwise normal tree stamping attaches it to
-                    # the stale HEAD, making the action and result siblings and
-                    # leaving an orphan tool result on the active branch.
-                    error_event = AgentErrorEvent(
-                        parent_id=first_action.id,
-                        tool_name=first_action.tool_name,
-                        tool_call_id=first_action.tool_call_id,
-                        error=(
-                            "A restart occurred while this tool was in progress. "
-                            "This may indicate a fatal memory error or system crash. "
-                            "The tool execution was interrupted and did not complete."
-                        ),
-                        classification=ErrorClassification(
-                            kind=FailureKind.INTERNAL, retryable=False
-                        ),
-                    )
-                    self._conversation._on_event(error_event)
+            self._fail_interrupted_tool_call()
 
         # Crash-recovery counterpart to _run_and_publish()'s finally hook:
         # the synthetic AgentErrorEvent written above (if any) is exactly

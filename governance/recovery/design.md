@@ -1,6 +1,7 @@
 # 崩溃恢復與「至多執行一次」（OHS 1.16）
 
 日期：2026-10-14　狀態：**已實作（只有測試與本文件，產品碼零變更）**
+**2026-10-20 更新（方向 B 與 replay 解析規則，見第 2、6 節末的「2026-10-20」段）**：`start()` 的 RUNNING→ERROR 與 `AgentErrorEvent` 抽成同步方法 `_fail_interrupted_tool_call`（行為變更：先寫錯誤事件、後翻狀態）；新增純函式模組 `governance_replay_policy.py`（不接進任何執行路徑）。
 plan-gate 兩關 Roy 皆核可：1.16 原本的內容（在 central 或 digest 加 replay 類別欄位）**沒有做**，改成「先查完整恢復路徑、把現有的『至多執行一次』鎖住」。
 
 ## 0. 範圍與限度
@@ -30,6 +31,8 @@ plan-gate 兩關 Roy 皆核可：1.16 原本的內容（在 central 或 digest �
 
 **實測 P2 是承重的**：在 `start()` 的 `ERROR` 賦值與 `AgentErrorEvent` 之間人為插入 `await asyncio.sleep(0.5)`，測試 C1 立刻失敗——工具執行器被呼叫了一次，同時 central 還收到 `failure_unknown`（兩邊互相矛盾）。這是目前最脆弱的一點：它靠「兩步之間沒有 await」這個沒有被任何註解或型別保護的事實。
 
+**2026-10-20（方向 B 已做）**：這個「兩步之間沒有 await」現在由結構保證：兩步搬進同步方法 `EventService._fail_interrupted_tool_call`，Python 不允許同步函式 `await`；測試 `test_the_status_flip_and_the_paired_error_cannot_be_separated_by_an_await` 確認它不是協程函式。順序同時改了：**先寫 `AgentErrorEvent`、後把狀態改成 `ERROR`**。好處是寫事件若丟例外，狀態仍是 `RUNNING`，下次 `start()` 會重試，不會留下「`ERROR` 但動作未配對」（那會讓後面的 `run()` 有機會執行該動作）；測試 `test_the_error_is_written_before_the_status_leaves_running` 鎖住，突變（先翻狀態）會失敗。**限度**：上面的 C1 測試仍用真實 `EventService`、通過；舊的「在兩步之間插入 await」突變已不可能做出來（同步函式裡放不進 await），承重的證明改由結構測試與順序測試承擔；「寫事件失敗」只用假物件測，沒用真實磁碟寫入失敗；行為變更尚未在真實 agent-server 重啟情境手動驗證。
+
 ## 3. 崩潰現場表
 
 | 現場 | 磁碟上的狀態 | 重啟後 | central 看到 | 測試 |
@@ -56,6 +59,8 @@ plan-gate 兩關 Roy 皆核可：1.16 原本的內容（在 central 或 digest �
 2. 只存在 central 的 claim 紀錄、claim 時由 central 釘住，之後註冊表只能收緊不能放寬：代價是 central 需要 action class 對照表。
 
 不論哪個，至少要同時改：central 要能發第二個執行嘗試；裝置恢復時要對該類別**不**寫 `AgentErrorEvent`、改走重新執行；核准要涵蓋「允許重放」這件事；P1、P2、P3 對該類別要有明確的例外並各有測試。規則參考 Pi Durable `docs/spec.md` §7.3（來自 `todo.md` 當時讀原文的紀錄，本次沒有重讀）：儲存的政策與目前宣告**都**是 safe 才重跑；目前宣告 unsafe 可以否決；目前宣告 safe 不能升級已儲存的 unsafe；解析不到視為 unsafe。
+
+**2026-10-20（replay 解析規則已寫成程式與測試，沒有接線）**：`openhands/agent_server/governance_replay_policy.py` 只有純函式：`effective_replay_policy(stored, declared)`——**兩邊都恰好是字串 `replay_safe`** 才回 `REPLAY_SAFE`，其餘（目前宣告 `at_most_once` 的否決、目前宣告 `replay_safe` 也無法升級已儲存的 `at_most_once`、缺漏、未知字串、型別錯誤）一律 `AT_MOST_ONCE`。測試 `tests/agent_server/test_governance_replay_policy.py`（15 項；突變 `and`→`or` 讓 13 項失敗、放寬解析讓 4 項失敗）。**沒做**：沒有任何 action class 宣告 `replay_safe`，沒有欄位存進 central 或 digest（上面選項 1／2 仍未決定），恢復路徑不讀它；這一步只是把規則先釘住。這條規則的來源是本節上段對 Pi Durable §7.3 的轉述，本次沒有重讀原文。
 
 ## 7. 怎麼重跑
 
