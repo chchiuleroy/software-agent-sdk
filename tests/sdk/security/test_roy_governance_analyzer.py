@@ -77,7 +77,9 @@ def workspace(tmp_path, monkeypatch):
 
 @pytest.fixture
 def analyzer(workspace):
-    return RoyPathPayloadSecurityAnalyzer(workspace_root=str(workspace))
+    return RoyPathPayloadSecurityAnalyzer(
+        workspace_root=str(workspace)
+    ).marked_as_search_root()
 
 
 def _risk(analyzer, tool_name: str, action: Action) -> SecurityRisk:
@@ -169,11 +171,22 @@ def test_grep_and_glob_with_a_path_follow_it(analyzer, workspace):
     )
 
 
-def test_grep_and_glob_without_a_path_stay_gated(analyzer):
+def test_grep_and_glob_without_a_path_search_the_workspace(analyzer):
+    # Relaxed 2026-10-20 (Roy agreed): with no path the tool searches its own
+    # working directory, the workspace the analyzer is locked to.
+    assert _risk(analyzer, "grep", GrepAction(pattern="x")) == SecurityRisk.LOW
+    assert _risk(analyzer, "glob", GlobAction(pattern="*.py")) == SecurityRisk.LOW
+
+
+def test_glob_without_a_path_stays_gated_when_the_pattern_names_a_directory(
+    analyzer,
+):
     # glob can take its directory from the pattern ("/etc/**"), so "no path"
-    # does not prove "inside the workspace".
-    assert _risk(analyzer, "grep", GrepAction(pattern="x")) == SecurityRisk.UNKNOWN
+    # does not prove "inside the workspace" when the pattern leaves it.
     assert _risk(analyzer, "glob", GlobAction(pattern="/etc/**")) == (
+        SecurityRisk.UNKNOWN
+    )
+    assert _risk(analyzer, "glob", GlobAction(pattern="../x/*")) == (
         SecurityRisk.UNKNOWN
     )
 
@@ -251,3 +264,12 @@ def test_built_in_action_under_another_tool_name_is_not_trusted(analyzer, worksp
     # built-in class is simply an unknown tool.
     action = ReadFileAction(file_path=str(workspace / "a.txt"))
     assert _risk(analyzer, "not_a_listed_tool", action) == SecurityRisk.UNKNOWN
+
+
+def test_pathless_search_still_asks_when_the_root_is_not_the_search_root(workspace):
+    # An analyzer whose root the caller set by hand may not be the directory the
+    # tool really searches, so a path-less grep/glob must not count as inside it.
+    unmarked = RoyPathPayloadSecurityAnalyzer(workspace_root=str(workspace))
+    assert unmarked.workspace_is_search_root is False
+    assert _risk(unmarked, "grep", GrepAction(pattern="x")) == SecurityRisk.UNKNOWN
+    assert _risk(unmarked, "glob", GlobAction(pattern="*.py")) == SecurityRisk.UNKNOWN

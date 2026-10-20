@@ -455,3 +455,161 @@ def test_fresh_conversation_without_lock_writes_no_admin_audit(
     _local_conversation(tmp_path)
 
     assert _read_admin_audit_records(audit_dir) == []
+
+
+def test_lock_marks_the_analyzer_as_searching_the_conversation_workspace(
+    monkeypatch, tmp_path
+) -> None:
+    # Path-less grep/glob are only treated as "inside the workspace" when the
+    # analyzer's root is known to be the workspace they search. An analyzer the
+    # caller built with the same root but without that mark is rebuilt with it.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    unmarked = RoyPathPayloadSecurityAnalyzer(workspace_root=str(tmp_path))
+    assert unmarked.workspace_is_search_root is False
+
+    cfg = ConversationConfig(
+        workspace=LocalWorkspace(working_dir=str(tmp_path)), security_analyzer=unmarked
+    )
+
+    assert cfg.security_analyzer.workspace_root == str(tmp_path)
+    assert cfg.security_analyzer.workspace_is_search_root is True
+
+
+def test_lock_does_not_trust_a_caller_supplied_search_root_mark(
+    monkeypatch, tmp_path
+) -> None:
+    # The mark claims "my root is the search root"; a caller cannot use it to keep
+    # a different root, because the lock rebuilds on any mismatch.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    forged = RoyPathPayloadSecurityAnalyzer(workspace_root="/").marked_as_search_root()
+
+    cfg = ConversationConfig(
+        workspace=LocalWorkspace(working_dir=str(tmp_path)), security_analyzer=forged
+    )
+
+    assert cfg.security_analyzer.workspace_root == str(tmp_path)
+
+
+def test_unlocked_config_never_marks_the_analyzer(monkeypatch, tmp_path) -> None:
+    # Only the lock is trusted to say "this root is the search root": it is
+    # re-applied with the real workspace on every creation, resume and setter. An
+    # unlocked config binds a defaulted root once and never again, so a mark there
+    # would go stale as soon as the workspace is replaced.
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    workspace = LocalWorkspace(working_dir=str(tmp_path))
+
+    defaulted = ConversationConfig(
+        workspace=workspace, security_analyzer=RoyPathPayloadSecurityAnalyzer()
+    )
+    explicit = ConversationConfig(
+        workspace=workspace,
+        security_analyzer=RoyPathPayloadSecurityAnalyzer(workspace_root="/elsewhere"),
+    )
+
+    assert defaulted.security_analyzer.workspace_root == str(tmp_path)
+    assert defaulted.security_analyzer.workspace_is_search_root is False
+    assert explicit.security_analyzer.workspace_root == "/elsewhere"
+    assert explicit.security_analyzer.workspace_is_search_root is False
+
+
+def test_a_replaced_workspace_never_leaves_a_stale_mark_without_the_lock(
+    monkeypatch, tmp_path
+) -> None:
+    # Review finding: the agent-server swaps the workspace for a worktree with
+    # model_copy after the config validators ran. Without the lock nothing is marked,
+    # so nothing can go stale.
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", raising=False)
+    source = LocalWorkspace(working_dir=str(tmp_path / "source"))
+    cfg = ConversationConfig(
+        workspace=source, security_analyzer=RoyPathPayloadSecurityAnalyzer()
+    )
+
+    moved = cfg.model_copy(
+        update={"workspace": LocalWorkspace(working_dir=str(tmp_path / "worktree"))}
+    )
+
+    assert moved.security_analyzer.workspace_is_search_root is False
+
+
+def test_locked_conversation_is_marked_for_its_actual_workspace(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+
+    conversation = _local_conversation(tmp_path)
+
+    analyzer = conversation.state.security_analyzer
+    assert analyzer.workspace_root == str(tmp_path)
+    assert analyzer.workspace_is_search_root is True
+
+
+def test_the_mark_is_not_part_of_what_is_saved_or_sent_in(tmp_path) -> None:
+    # Review finding: a True saved with the conversation was trusted again by a later
+    # resume into another workspace once the lock was off, and a REST body could
+    # simply say true. The mark is a private attribute: it round-trips to False and
+    # no input can set it.
+    marked = RoyPathPayloadSecurityAnalyzer(
+        workspace_root=str(tmp_path)
+    ).marked_as_search_root()
+    assert marked.workspace_is_search_root is True
+    assert "workspace_is_search_root" not in marked.model_dump()
+
+    restored = RoyPathPayloadSecurityAnalyzer.model_validate_json(
+        marked.model_dump_json()
+    )
+    assert restored.workspace_is_search_root is False
+
+    try:
+        sent = RoyPathPayloadSecurityAnalyzer.model_validate(
+            {"workspace_root": str(tmp_path), "workspace_is_search_root": True}
+        )
+    except Exception:  # noqa: BLE001 - refusing the field outright is fine too
+        return
+    assert sent.workspace_is_search_root is False
+
+
+def test_a_resume_into_another_workspace_remarks_for_that_workspace(
+    monkeypatch, tmp_path
+) -> None:
+    # Saved while locked, restored (mark gone), re-applied by the lock for the new
+    # workspace: marked for the NEW root. With the lock off, nothing marks it.
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    saved = RoyPathPayloadSecurityAnalyzer(
+        workspace_root=str(tmp_path / "old")
+    ).marked_as_search_root()
+    restored = RoyPathPayloadSecurityAnalyzer.model_validate_json(
+        saved.model_dump_json()
+    )
+
+    locked = ConversationConfig(
+        workspace=LocalWorkspace(working_dir=str(tmp_path / "new")),
+        security_analyzer=restored,
+    )
+    assert locked.security_analyzer.workspace_root == str(tmp_path / "new")
+    assert locked.security_analyzer.workspace_is_search_root is True
+
+    monkeypatch.delenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER")
+    unlocked = ConversationConfig(
+        workspace=LocalWorkspace(working_dir=str(tmp_path / "new")),
+        security_analyzer=restored,
+    )
+    assert unlocked.security_analyzer.workspace_is_search_root is False
+
+
+def test_a_copy_with_another_root_is_no_longer_marked(monkeypatch, tmp_path) -> None:
+    # Review finding: the mark survived model_copy(update={"workspace_root": ...}),
+    # so the lock's "return it as is" branch could accept a mark made for the old
+    # root. The mark belongs to the root it was set for.
+    old, new = str(tmp_path / "old"), str(tmp_path / "new")
+    marked = RoyPathPayloadSecurityAnalyzer(workspace_root=old).marked_as_search_root()
+
+    moved = marked.model_copy(update={"workspace_root": new})
+    assert moved.workspace_root == new
+    assert moved.workspace_is_search_root is False
+    assert marked.model_copy().workspace_is_search_root is True  # same root: kept
+
+    monkeypatch.setenv("ROY_GOVERNANCE_LOCK_SECURITY_ANALYZER", "llm")
+    result = roy_governance_lock.apply_security_analyzer_lock(moved, workspace_root=new)
+    assert result is not moved
+    assert result.workspace_root == new
+    assert result.workspace_is_search_root is True

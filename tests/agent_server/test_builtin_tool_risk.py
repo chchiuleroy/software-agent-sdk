@@ -162,9 +162,9 @@ _TABLE: dict[str, _Row] = {
     "task_tracker": _Row(
         TaskTrackerAction,
         _no_args,
-        HIGH,
-        "has a command field (view/plan, defaults to view): HIGH by that rule, same "
-        "outcome as UNKNOWN (asks)",
+        LOW,
+        "built-in task tracker: only edits the agent's own task list (relaxed "
+        "2026-10-20, Roy agreed); before that its `command` field made it HIGH",
     ),
     "apply_patch": _Row(
         ApplyPatchAction,
@@ -287,14 +287,28 @@ _VARIANTS: dict[str, _Variant] = {
     "grep without a path": _Variant(
         "grep",
         lambda _ws: GrepAction(pattern="x"),
-        UNKNOWN,
-        "no path to judge: could search anywhere, so it asks",
+        LOW,
+        "no path: the tool searches its own working directory, which is the "
+        "workspace the analyzer is locked to (relaxed 2026-10-20, Roy agreed)",
     ),
     "glob without a path": _Variant(
         "glob",
         lambda _ws: GlobAction(pattern="*.py"),
+        LOW,
+        "no path: searches the working directory; the pattern stays below it "
+        "(relaxed 2026-10-20, Roy agreed)",
+    ),
+    "glob without a path, pattern that climbs out": _Variant(
+        "glob",
+        lambda _ws: GlobAction(pattern="../*"),
         UNKNOWN,
-        "no path to judge (the pattern may name a directory itself)",
+        "the pattern can name a directory itself, path or no path",
+    ),
+    "glob without a path, absolute pattern": _Variant(
+        "glob",
+        lambda _ws: GlobAction(pattern="/etc/*"),
+        UNKNOWN,
+        "an absolute pattern is evaluated as written, path or no path",
     ),
     "glob pattern that climbs out": _Variant(
         "glob",
@@ -410,7 +424,9 @@ def workspace(tmp_path, monkeypatch) -> Path:
 
 @pytest.fixture
 def analyzer(workspace) -> RoyPathPayloadSecurityAnalyzer:
-    return RoyPathPayloadSecurityAnalyzer(workspace_root=str(workspace))
+    return RoyPathPayloadSecurityAnalyzer(
+        workspace_root=str(workspace)
+    ).marked_as_search_root()
 
 
 def _in_workspace(workspace: Path) -> Path:
@@ -504,11 +520,12 @@ def test_other_call_shapes_of_a_tool_are_pinned_too(analyzer, workspace, label):
 def test_a_path_tool_asks_once_its_path_leaves_the_workspace(
     analyzer, workspace, tmp_path
 ):
-    """LOW in the table means "inside the workspace", nothing wider."""
+    """LOW in the table means "inside the workspace", nothing wider (for the rows
+    that are path tools; ``task_tracker`` is LOW for a different reason)."""
     outside = tmp_path / "outside.txt"
     outside.write_text("x")
     for name, row in _TABLE.items():
-        if row.expected is not LOW:
+        if row.expected is not LOW or row.reason != _PATH:
             continue
         args = {
             key: str(outside) if key in {"path", "file_path", "dir_path"} else value
@@ -591,3 +608,25 @@ def test_a_third_party_tool_cannot_borrow_a_built_in_tool_name(
     inside = str(_in_workspace(workspace))
     action = _ThirdParty(path=inside, file_path=inside, dir_path=str(workspace))
     assert analyzer.security_risk(_event(name, action)) is UNKNOWN
+
+
+class _ThirdPartyWithCommand(Action):
+    """A third-party tool that calls itself ``task_tracker`` and has the ``command``
+    field the built-in has."""
+
+    command: str = "view"
+
+
+def test_a_third_party_task_tracker_is_not_relaxed(analyzer):
+    """Only the built-in class earns LOW. A look-alike keeps the `command` rule."""
+    risk = analyzer.security_risk(_event("task_tracker", _ThirdPartyWithCommand()))
+    assert risk is HIGH
+
+
+def test_only_grep_and_glob_are_relaxed_when_they_have_no_path():
+    """A tool whose path is required cannot show this in a call, so the set itself
+    is pinned: adding a tool here means its path-less form searches the workspace,
+    and that has to be read in the tool's code first."""
+    from openhands.sdk.security.roy_governance import _SEARCHES_WORKSPACE_WHEN_PATHLESS
+
+    assert _SEARCHES_WORKSPACE_WHEN_PATHLESS == {"grep", "glob"}
