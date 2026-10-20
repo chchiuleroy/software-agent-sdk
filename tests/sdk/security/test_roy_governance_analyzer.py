@@ -169,11 +169,22 @@ def test_grep_and_glob_with_a_path_follow_it(analyzer, workspace):
     )
 
 
-def test_grep_and_glob_without_a_path_stay_gated(analyzer):
+def test_grep_and_glob_without_a_path_search_the_workspace(analyzer):
+    # Relaxed 2026-10-20 (Roy agreed): with no path the tool searches its own
+    # working directory, the workspace the analyzer is locked to.
+    assert _risk(analyzer, "grep", GrepAction(pattern="x")) == SecurityRisk.LOW
+    assert _risk(analyzer, "glob", GlobAction(pattern="*.py")) == SecurityRisk.LOW
+
+
+def test_glob_without_a_path_stays_gated_when_the_pattern_names_a_directory(
+    analyzer,
+):
     # glob can take its directory from the pattern ("/etc/**"), so "no path"
-    # does not prove "inside the workspace".
-    assert _risk(analyzer, "grep", GrepAction(pattern="x")) == SecurityRisk.UNKNOWN
+    # does not prove "inside the workspace" when the pattern leaves it.
     assert _risk(analyzer, "glob", GlobAction(pattern="/etc/**")) == (
+        SecurityRisk.UNKNOWN
+    )
+    assert _risk(analyzer, "glob", GlobAction(pattern="../x/*")) == (
         SecurityRisk.UNKNOWN
     )
 

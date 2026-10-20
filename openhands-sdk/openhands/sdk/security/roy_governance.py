@@ -19,7 +19,9 @@ from openhands.sdk.security.roy_tool_permissions import is_permitted
 
 DEFAULT_WORKSPACE_ROOT = os.environ.get(
     "ROY_GOVERNANCE_WORKSPACE_ROOT",
-    os.path.join(os.path.expanduser("~"), "openhands-governance", "poc", "test-workspace"),
+    os.path.join(
+        os.path.expanduser("~"), "openhands-governance", "poc", "test-workspace"
+    ),
 )
 
 # Built-in tools whose single path argument decides the risk, keyed by the tool's
@@ -31,8 +33,11 @@ DEFAULT_WORKSPACE_ROOT = os.environ.get(
 # the workspace root, while file_editor / grep / glob resolve it against the
 # server process's cwd (file_editor refuses a relative path outright).
 #
-# A path-less call (grep/glob without ``path``) is not listed as safe: glob
-# may take a directory out of its pattern, so it stays UNKNOWN (= approval).
+# A path-less call (grep/glob without ``path``) searches the tool's own working
+# directory, which in a governed conversation is the workspace this analyzer is
+# locked to (see roy_governance_lock). That is LOW, but only for glob when the
+# pattern cannot name a directory outside it (checked below, before this applies).
+_SEARCHES_WORKSPACE_WHEN_PATHLESS = frozenset({"grep", "glob"})
 _PATH_TOOLS: dict[str, tuple[str, bool]] = {
     "file_editor": ("path", False),
     "planning_file_editor": ("path", False),
@@ -96,8 +101,11 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
 
     - 內建檔案/搜尋工具(``_PATH_TOOLS``)的路徑在工作區內 -> LOW(免核准)
     - 同上,路徑在工作區外 -> HIGH(需核准)
-    - 同上,但沒給路徑(grep/glob 不帶 path)-> UNKNOWN(需核准)
+    - 同上,但沒給路徑(grep/glob 不帶 path)-> LOW:工具改搜自己的工作目錄,
+      也就是這個對話鎖定的 workspace(2026-10-20 Roy 同意放寬)
     - glob 的 pattern 可跳出 path(絕對路徑、``~``、磁碟機代號、``..``)-> UNKNOWN
+      (不論有沒有 path)
+    - 內建 task_tracker(只改自己的任務清單)-> LOW(2026-10-20 Roy 同意放寬)
     - 任何有 ``command`` 欄位的動作(TerminalAction 等)-> HIGH
       (比照 dsh bash/pwsh 一律問;只會更嚴格,所以不限工具身分)
     - 其餘一律 UNKNOWN(需核准),**包含第三方/MCP 工具**,不論它有沒有叫
@@ -142,7 +150,17 @@ class RoyPathPayloadSecurityAnalyzer(SecurityAnalyzerBase):
                     path, relative_to_workspace=relative_to_workspace
                 )
                 return SecurityRisk.LOW if in_workspace else SecurityRisk.HIGH
+            if action.tool_name in _SEARCHES_WORKSPACE_WHEN_PATHLESS:
+                return SecurityRisk.LOW
             return SecurityRisk.UNKNOWN
+
+        # The built-in task tracker only keeps the agent's own task list (a file in
+        # the conversation's persistence directory). It has a ``command`` field
+        # (view/plan), which the rule below would turn into HIGH. Only the built-in
+        # class counts: a third-party tool that is merely called ``task_tracker``
+        # still falls through to the rules below.
+        if action.tool_name == "task_tracker" and is_builtin_action(act):
+            return SecurityRisk.LOW
 
         if getattr(act, "command", None) is not None:
             return SecurityRisk.HIGH
