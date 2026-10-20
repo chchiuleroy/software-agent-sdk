@@ -79,6 +79,20 @@ class GovernanceStatus(BaseModel):
     )
 
 
+def _device_registration_info(
+    conversation_service: ConversationService,
+) -> DeviceRegistrationInfo | None:
+    """What the service knows about registering its device id, or None when it
+    has no such status. Read on every team-mode path: a server without a central
+    client may still say why nothing is registered (``not_configured``)."""
+    registration = getattr(conversation_service, "device_registration", None)
+    if registration is None:
+        return None
+    return DeviceRegistrationInfo(
+        state=registration.state, error_code=registration.error_code
+    )
+
+
 @governance_router.get("/status", response_model=GovernanceStatus)
 async def get_governance_status(
     request: Request,
@@ -102,6 +116,7 @@ async def get_governance_status(
                 error="central API client is not configured",
                 checked_at=checked_at,
             ),
+            device_registration=_device_registration_info(conversation_service),
         )
 
     try:
@@ -114,18 +129,11 @@ async def get_governance_status(
             "credentials_ok": None,
             "error": f"status probe timed out after {_PROBE_TIMEOUT_SECONDS:g}s",
         }
-    registration = getattr(conversation_service, "device_registration", None)
     return GovernanceStatus(
         deployment_mode="team",
         missing_settings=missing_team_mode_settings(config),
         central_api=CentralApiStatus(**probe, checked_at=checked_at),
-        device_registration=(
-            DeviceRegistrationInfo(
-                state=registration.state, error_code=registration.error_code
-            )
-            if registration is not None
-            else None
-        ),
+        device_registration=_device_registration_info(conversation_service),
     )
 
 

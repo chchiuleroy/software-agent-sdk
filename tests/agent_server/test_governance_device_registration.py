@@ -327,3 +327,27 @@ def test_status_shows_how_the_registration_went(state, code):
 def test_status_has_no_registration_in_personal_mode():
     body = _status(Config(), governance_client=None)
     assert body["device_registration"] is None
+
+
+@pytest.mark.parametrize(
+    "state, code", [("not_configured", None), ("failed", "http_401")]
+)
+def test_status_shows_the_registration_even_without_a_central_client(state, code):
+    # Why: a team server that lacks both its central settings and its device id is
+    # the one case where "not_configured" is the explanation, and the answer for a
+    # missing client returned before the registration was read, so the status said
+    # null (= "no registration data") instead of why nothing is registered.
+    body = _status(
+        Config(governance_deployment_mode="team"),
+        governance_client=None,
+        device_registration=registration.DeviceRegistrationStatus(state, code),
+    )
+    assert body["central_api"]["error"] == "central API client is not configured"
+    assert body["device_registration"] == {"state": state, "error_code": code}
+
+
+def test_status_without_a_client_or_registration_object_says_null():
+    # A service that never had a registration status (older wiring) stays null:
+    # the endpoint reports what exists, it does not invent a state.
+    body = _status(Config(governance_deployment_mode="team"), governance_client=None)
+    assert body["device_registration"] is None
