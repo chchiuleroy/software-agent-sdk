@@ -41,6 +41,16 @@ from central_governance_api.accounts.errors import (
     SelfApprovalNotAllowedError,
     ToolNotPermittedError,
 )
+from central_governance_api.admission.errors import (
+    AdmissionContentChangedError,
+    AdmissionContentInvalidError,
+    AdmissionContentTooLargeError,
+    AdmissionDepartmentNotAllowedError,
+    AdmissionInvalidTransitionError,
+    AdmissionItemNotFoundError,
+    AdmissionNoDepartmentError,
+    AdmissionRateLimitedError,
+)
 from central_governance_api.approvals.authorize import AuthorizationDeniedError
 from central_governance_api.approvals.errors import (
     ConcurrentModificationError,
@@ -68,6 +78,13 @@ from central_governance_api.routers.account_requests import (
 )
 from central_governance_api.routers.admin_accounts import (
     router as admin_accounts_router,
+)
+from central_governance_api.routers.admission import (
+    admin_router as admission_admin_router,
+)
+from central_governance_api.routers.admission import me_router as admission_me_router
+from central_governance_api.routers.admission import (
+    submit_router as admission_submit_router,
 )
 from central_governance_api.routers.approvals import router as approvals_router
 from central_governance_api.routers.audit import (
@@ -144,6 +161,14 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     PrincipalAlreadyAssignedError: (409, "principal_already_assigned"),
     PrincipalAssignmentNotFoundError: (404, "department_assignment_not_found"),
     ToolNotPermittedError: (403, "tool_not_permitted"),
+    AdmissionItemNotFoundError: (404, "admission_item_not_found"),
+    AdmissionInvalidTransitionError: (409, "admission_invalid_transition"),
+    AdmissionContentInvalidError: (422, "admission_content_invalid"),
+    AdmissionContentTooLargeError: (413, "admission_content_too_large"),
+    AdmissionRateLimitedError: (429, "admission_rate_limited"),
+    AdmissionNoDepartmentError: (409, "admission_no_department"),
+    AdmissionContentChangedError: (409, "admission_content_changed"),
+    AdmissionDepartmentNotAllowedError: (403, "admission_department_not_allowed"),
 }
 
 
@@ -233,6 +258,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(me_router)
     app.include_router(tool_permissions_admin_router)
     app.include_router(tool_permissions_me_router)
+    app.include_router(admission_submit_router)
+    app.include_router(admission_me_router)
+    app.include_router(admission_admin_router)
     _install_exception_handlers(app)
     return app
 

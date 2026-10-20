@@ -337,6 +337,13 @@ export function revokeConfirmText(view) {
 export const AUDIT_EVENT_TYPES = [
   "account_request_approved",
   "account_request_rejected",
+  "admission_approved",
+  "admission_check_requested",
+  "admission_first_use",
+  "admission_first_use_mismatch",
+  "admission_rejected",
+  "admission_revoked",
+  "admission_submitted",
   "approval_cancelled",
   "approval_claim_commitment_mismatch",
   "approval_executed_commitment_mismatch",
