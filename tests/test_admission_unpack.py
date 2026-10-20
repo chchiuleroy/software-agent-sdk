@@ -135,3 +135,43 @@ def test_an_encrypted_entry_is_refused():
         data[offset] |= 0x1
     with pytest.raises(AdmissionContentInvalidError):
         _unpack(bytes(data))
+
+
+def test_a_damaged_entry_is_the_submitters_error_not_a_server_error():
+    # Why (review finding): the zip reader raises BadZipFile when an entry is read, not
+    # only when the archive is opened. Stored (uncompressed) so a byte can be flipped.
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("SKILL.md", b"hello world")
+    damaged = buffer.getvalue().replace(b"hello world", b"hellX world")
+    with pytest.raises(AdmissionContentInvalidError):
+        _unpack(damaged)
+
+
+def test_an_archive_with_something_in_front_of_it_is_refused():
+    # Why (review finding): two archives joined end to end, or a stub in front. This
+    # library reads the LAST directory, so what central fingerprints could differ from
+    # what another unpacker extracts.
+    first = _zip({"SKILL.md": b"the first archive"})
+    second = _zip({"SKILL.md": b"the second archive"})
+    with pytest.raises(AdmissionContentInvalidError):
+        _unpack(first + second)
+    with pytest.raises(AdmissionContentInvalidError):
+        _unpack(b"#!/bin/sh\n" + second)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        {"a": b"x", "a/b": b"y"},
+        {"a/b/c": b"x", "a/b": b"y"},
+        {"Docs": b"x", "docs/readme.md": b"y"},
+        {"a/": b"", "a": b"x"},
+    ],
+    ids=["file+child", "deep", "case-folded", "dir+file"],
+)
+def test_a_path_that_is_both_a_file_and_a_folder_is_refused(entries):
+    # Why (review finding): unpackers differ on what happens (overwrite, skip, stop
+    # half way), so the installed content is not the checked content.
+    with pytest.raises(AdmissionContentInvalidError):
+        _unpack(_zip(entries))

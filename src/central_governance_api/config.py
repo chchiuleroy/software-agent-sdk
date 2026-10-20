@@ -299,6 +299,22 @@ class Settings(BaseSettings):
         "revocation can reach a device that cannot reach central.",
     )
 
+    admission_max_request_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        gt=0,
+        description="Largest accepted request BODY for POST /api/v1/admission/items, "
+        "checked while the body is read, before it is parsed. A proposal, like the "
+        "other admission numbers: it must hold the largest archive as base64 text "
+        "(admission_max_archive_bytes * 4/3) or the largest tool list.",
+    )
+    admission_first_use_per_minute: int = Field(
+        default=60,
+        gt=0,
+        description="Most first-use reports one device identity may send per minute. "
+        "A device sends one per item per device, so this is generous; it only stops "
+        "a loop from filling the audit table.",
+    )
+
     @model_validator(mode="after")
     def _check_account_requests(self) -> Self:
         if self.account_requests_enabled:

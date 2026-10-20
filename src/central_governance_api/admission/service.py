@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -241,6 +241,13 @@ async def submit(
         body = _archive_bytes(archive_b64, settings)
         fingerprint = archive_fingerprint(unpack_for(body, settings))
 
+    # One submission at a time per submitter, until this transaction ends: the two
+    # limits below are "count, then insert", which two parallel requests of one user
+    # would both pass. The lock is taken after the (CPU-heavy) unpacking, not before.
+    await session.execute(
+        text("select pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"admission-submit:{principal.issuer}#{principal.sub}"},
+    )
     found = await _existing(session, kind, department, fingerprint)
     if found is not None:
         return SubmitResult(found, created=False)
@@ -452,9 +459,30 @@ async def admitted_for(session: AsyncSession, principal: Principal) -> AdmittedS
     )
 
 
+_FIRST_USE_EVENTS = ("admission_first_use", "admission_first_use_mismatch")
+
+
+async def _enforce_first_use_rate(
+    session: AsyncSession, principal: Principal, settings: Settings
+) -> None:
+    recent = await session.scalar(
+        select(func.count())
+        .select_from(AdminAuditEvent)
+        .where(
+            AdminAuditEvent.event_type.in_(_FIRST_USE_EVENTS),
+            AdminAuditEvent.actor_issuer == principal.issuer,
+            AdminAuditEvent.actor_sub == principal.sub,
+            AdminAuditEvent.occurred_at >= now_utc() - timedelta(minutes=1),
+        )
+    )
+    if (recent or 0) >= settings.admission_first_use_per_minute:
+        raise AdmissionRateLimitedError()
+
+
 async def record_first_use(
     session: AsyncSession,
     principal: Principal,
+    settings: Settings,
     *,
     kind: str,
     fingerprint: str,
@@ -467,7 +495,11 @@ async def record_first_use(
     A mismatch (the device's own bytes hash to something else) does NOT change the
     item: it says something about that one device's copy, not about the approved
     content, and letting one device flag an item would let one compromised device block
-    everyone. It is recorded and audited so it can be looked at."""
+    everyone. It is recorded and audited so it can be looked at.
+
+    Every call writes an audit event, so one identity is limited per minute; the same
+    report repeated (same device, fingerprint and answer) adds no second row."""
+    await _enforce_first_use_rate(session, principal, settings)
     department = (await tool_permissions_for(session, principal)).department_id
     item = (
         await _existing(session, kind, department, fingerprint)
@@ -481,15 +513,27 @@ async def record_first_use(
     else:
         result = item.status
     if item is not None:
-        session.add(
-            AdmissionFirstUse(
-                item_id=item.id,
-                device_issuer=principal.issuer,
-                device_sub=principal.sub,
-                fingerprint=fingerprint,
-                result=result,
+        already = await session.scalar(
+            select(func.count())
+            .select_from(AdmissionFirstUse)
+            .where(
+                AdmissionFirstUse.item_id == item.id,
+                AdmissionFirstUse.device_issuer == principal.issuer,
+                AdmissionFirstUse.device_sub == principal.sub,
+                AdmissionFirstUse.fingerprint == fingerprint,
+                AdmissionFirstUse.result == result,
             )
         )
+        if not already:
+            session.add(
+                AdmissionFirstUse(
+                    item_id=item.id,
+                    device_issuer=principal.issuer,
+                    device_sub=principal.sub,
+                    fingerprint=fingerprint,
+                    result=result,
+                )
+            )
     payload = {
         "item_id": str(item.id) if item is not None else None,
         "kind": kind,

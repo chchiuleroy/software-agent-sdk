@@ -46,6 +46,9 @@ me_router = APIRouter(prefix="/api/v1/me", tags=["me"])
 admin_router = APIRouter(prefix="/api/v1/admin/admission", tags=["admission"])
 
 _require_superadmin = require_role("governance.superadmin")
+# What an agent-server's service account is: the two device endpoints below answer
+# only to it, not to every logged-in person.
+_require_operator = require_role("agent.operator")
 
 _MAX_LIMIT = 200
 _DEFAULT_LIMIT = 50
@@ -198,9 +201,18 @@ async def submit_item(
         ],
         archive_b64=body.archive_b64,
     )
+    summary = {**_summary(result.item), "created": result.created}
     if not result.created:
         response.status_code = 200
-    return {**_summary(result.item), "created": result.created}
+        if (result.item.submitted_by_issuer, result.item.submitted_by_sub) != (
+            principal.issuer,
+            principal.sub,
+        ):
+            # The same content was submitted by somebody else in this department:
+            # say it exists and where it stands, but not what they called it, where
+            # it came from, or why it was decided as it was.
+            summary.update(name=body.name, source=body.source, status_reason=None)
+    return summary
 
 
 @me_router.get("/admission/items", response_model=list[ItemSummary])
@@ -226,7 +238,7 @@ async def my_items(
 
 @me_router.get("/admitted-items", response_model=AdmittedItemsResponse)
 async def my_admitted_items(
-    principal: Principal = Depends(get_current_principal),
+    principal: Principal = Depends(_require_operator),
     session: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(get_settings_dependency),
 ) -> dict[str, Any]:
@@ -249,14 +261,16 @@ async def my_admitted_items(
 @me_router.post("/admission/first-use", response_model=FirstUseResponse)
 async def first_use(
     body: FirstUseRequest,
-    principal: Principal = Depends(get_current_principal),
+    principal: Principal = Depends(_require_operator),
     session: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings_dependency),
 ) -> dict[str, str]:
     """A device is about to load an item for the first time. Only ``approved`` lets
     it."""
     status = await service.record_first_use(
         session,
         principal,
+        settings,
         kind=body.kind,
         fingerprint=body.fingerprint,
         local_fingerprint=body.local_fingerprint,

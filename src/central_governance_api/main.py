@@ -70,6 +70,7 @@ from central_governance_api.approvals.idempotency import IdempotencyKeyReusedErr
 from central_governance_api.approvals.state_machine import IllegalTransitionError
 from central_governance_api.approvals.sweep import run_expiry_sweep_forever
 from central_governance_api.auth.oidc import OIDCPrincipalResolver
+from central_governance_api.body_limit import BodySizeLimitMiddleware
 from central_governance_api.config import Settings, get_settings
 from central_governance_api.db import create_engine, create_session_factory
 from central_governance_api.mailer import build_mailer
@@ -247,6 +248,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings or get_settings()
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        limits={
+            ("POST", "/api/v1/admission/items"): (
+                app.state.settings.admission_max_request_bytes
+            )
+        },
+    )
     app.include_router(health_router)
     app.include_router(approvals_router)
     app.include_router(devices_router)

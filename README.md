@@ -650,20 +650,20 @@ device id。它防的是「亂填 device id」與「已撤銷的裝置繼續用�
 
 | 路由 | 角色 | 說明 |
 |---|---|---|
-| `POST /api/v1/admission/items` | 已登入 | 提交 MCP server（`tools`：工具描述陣列）或 skill／plugin（`archive_b64`：zip）。部門取自呼叫者；只有 `governance.superadmin` 可以用 `department_id` 指定別的部門。**指紋由 central 自己算**，請求不能帶。同內容同部門只會有一筆（重複提交回 200、`created: false`，且不消耗額度） |
+| `POST /api/v1/admission/items` | 已登入 | 提交 MCP server（`tools`：工具描述陣列）或 skill／plugin（`archive_b64`：zip）。部門取自呼叫者；只有 `governance.superadmin` 可以用 `department_id` 指定別的部門。**指紋由 central 自己算**，請求不能帶。同內容同部門只會有一筆（重複提交回 200、`created: false`，且不消耗額度；**若原項目是別人提交的，回應只說它存在與狀態，名稱、來源、原因換成你自己送的／空**）。請求本文有大小上限（`BodySizeLimitMiddleware`，**在解析前就擋**，含沒有 `Content-Length` 的分塊上傳）；同一個人的並行提交以資料庫 advisory lock 排隊，兩個上限不會被並行請求繞過 |
 | `GET /api/v1/me/admission/items` | 已登入 | 自己的提交 |
-| `GET /api/v1/me/admitted-items` | 已登入（裝置的 service account） | 該部門**已核准**的項目（MCP：整組工具指紋；skill／plugin：整包指紋）、`revision`、`max_age_seconds`。沒有部門＝空清單 |
-| `POST /api/v1/me/admission/first-use` | 已登入（裝置） | 裝置第一次載入某指紋前線上確認：回 `approved`／`rejected`／`revoked`／`pending`…／`unknown`／`mismatch`；**只有 `approved` 可以載入**。裝置自己算的指紋與宣稱不同＝`mismatch`，只記錄與稽核，**不改項目狀態**（否則一台被入侵的裝置就能擋掉所有人） |
+| `GET /api/v1/me/admitted-items` | `agent.operator`（裝置的 service account；一般人員不行） | 該部門**已核准**的項目（MCP：整組工具指紋；skill／plugin：整包指紋）、`revision`、`max_age_seconds`。沒有部門＝空清單 |
+| `POST /api/v1/me/admission/first-use` | `agent.operator`（裝置）；每個身分每分鐘有上限，同一份回報不會重複寫列 | 裝置第一次載入某指紋前線上確認：回 `approved`／`rejected`／`revoked`／`pending`…／`unknown`／`mismatch`；**只有 `approved` 可以載入**。裝置自己算的指紋與宣稱不同＝`mismatch`，只記錄與稽核，**不改項目狀態**（否則一台被入侵的裝置就能擋掉所有人） |
 | `GET /api/v1/admin/admission/items`（`?status=&kind=&limit=`）、`GET …/{id}` | `governance.superadmin` | 審核清單與詳情（工具描述**未截斷**、檔案清單含雜湊）。**尚無分頁游標**（審核畫面 2.8 加） |
 | `POST …/items/{id}/approve｜reject｜revoke｜rerun-check` | `governance.superadmin` | 狀態轉移（見下）；每次寫稽核事件 |
 
 **指紋**：MCP 單一工具＝`name`、`description`、`input_schema` 的標準化 JSON 的 SHA-256（與裝置端 `governance_mcp_fingerprint` 完全相同，`tests/test_admission_fingerprint.py` 的 golden 值由裝置端實作產生）；MCP server＝排序後工具指紋的 SHA-256（核准的是那一組工具，不是伺服器位址）；skill／plugin＝所有檔案（**含隱藏檔與隱藏目錄**）的 `路徑<TAB>sha256` 清單的 SHA-256（路徑 NFC、`/`，不計權限、時間與空目錄）。
 
-**壓縮檔**（`admission/unpack.py`）：只在記憶體內讀、從不寫磁碟或執行；拒絕 `..`／絕對路徑／磁碟機代號／反斜線／NUL／控制字元、符號連結與其他非一般檔案、加密項目、正規化或只差大小寫後重複的路徑、太大／解壓後太大（zip 炸彈）／檔案太多。檢查看的是**原始儲存的檔名**（`orig_filename`），因為 Python 的 zipfile 會先清理 `filename`。
+**壓縮檔**（`admission/unpack.py`）：只在記憶體內讀、從不寫磁碟或執行；**第一個項目必須從位元組 0 開始**（串接的 zip 或前面有東西的 zip 一律拒絕，因為此函式庫讀最後一個目錄，別的解壓工具可能讀另一個）；**同一個路徑不能既是檔案又是別項的資料夾**；zip 函式庫在讀取時丟的例外（CRC 錯、截斷…）一律變成 422；拒絕 `..`／絕對路徑／磁碟機代號／反斜線／NUL／控制字元、符號連結與其他非一般檔案、加密項目、正規化或只差大小寫後重複的路徑、太大／解壓後太大（zip 炸彈）／檔案太多。檢查看的是**原始儲存的檔名**（`orig_filename`），因為 Python 的 zipfile 會先清理 `filename`。
 
 **狀態機**（`admission/state.py`，轉移表）：`pending → checking → rejected｜check_failed｜checked`；`checked → approved`（**只有這一條通往 approved**，且核准者不能是提交者、儲存的內容必須仍等於指紋）；`approved → revoked`；`rejected｜check_failed｜checked｜revoked → pending`（`rerun-check`）。`rejected`、`check_failed`、`revoked` **沒有人工覆蓋**。
 
-**設定**（`CGA_ADMISSION_*`；**預設值是沒有依據的提案，不是量測值**）：`MAX_ARCHIVE_BYTES`（2 MiB）、`MAX_UNCOMPRESSED_BYTES`（10 MiB）、`MAX_FILES`（500）、`MAX_TOOLS`（200）、`MAX_OPEN_PER_USER`（5，同時待審）、`MAX_SUBMISSIONS_PER_HOUR`（10）、`MAX_AGE_SECONDS`（60，裝置可依賴清單的時間）。
+**設定**（`CGA_ADMISSION_*`；**預設值是沒有依據的提案，不是量測值**）：`MAX_REQUEST_BYTES`（8 MiB，提交請求本文）、`FIRST_USE_PER_MINUTE`（60）、`MAX_ARCHIVE_BYTES`（2 MiB）、`MAX_UNCOMPRESSED_BYTES`（10 MiB）、`MAX_FILES`（500）、`MAX_TOOLS`（200）、`MAX_OPEN_PER_USER`（5，同時待審）、`MAX_SUBMISSIONS_PER_HOUR`（10）、`MAX_AGE_SECONDS`（60，裝置可依賴清單的時間）。
 
 **稽核事件**：`admission_submitted`、`admission_approved`、`admission_rejected`、`admission_revoked`、`admission_check_requested`、`admission_first_use`、`admission_first_use_mismatch`（已加進 `inbox.js` 的篩選清單，漂移測試涵蓋）。
 
