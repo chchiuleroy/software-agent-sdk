@@ -16,6 +16,7 @@ import httpx
 from pydantic import BaseModel
 
 from openhands.agent_server import (
+    governance_admission,
     governance_device_registration,
     governance_tool_permissions,
 )
@@ -743,6 +744,8 @@ class ConversationService:
     governance_refuse_unprojected_actions: bool = True
     governance_enforce_tool_permissions: bool = False
     _tool_permissions_started: bool = field(default=False, init=False)
+    governance_enforce_admission: bool = False
+    _admission_started: bool = field(default=False, init=False)
     # Whether this process's device id is registered with central (team mode).
     device_registration: governance_device_registration.DeviceRegistrationStatus = (
         field(default_factory=governance_device_registration.DeviceRegistrationStatus)
@@ -2280,6 +2283,13 @@ class ConversationService:
         ):
             governance_tool_permissions.start(self.governance_client)
             self._tool_permissions_started = True
+        if (
+            self.governance_deployment_mode == "team"
+            and self.governance_enforce_admission
+            and self.governance_client is not None
+        ):
+            governance_admission.start(self.governance_client)
+            self._admission_started = True
         # Also last, for the same reason. Never blocks startup: see
         # governance_device_registration. A placeholder id is not registered.
         if (
@@ -2395,6 +2405,10 @@ class ConversationService:
             with suppress(asyncio.CancelledError):
                 await self._device_registration_task
             self._device_registration_task = None
+
+        if self._admission_started:
+            self._admission_started = False
+            await governance_admission.stop()
 
         if self._tool_permissions_started:
             self._tool_permissions_started = False
@@ -2522,6 +2536,7 @@ class ConversationService:
             governance_enforce_tool_permissions=(
                 config.governance_enforce_tool_permissions
             ),
+            governance_enforce_admission=config.governance_enforce_admission,
         )
 
     async def _start_event_service(

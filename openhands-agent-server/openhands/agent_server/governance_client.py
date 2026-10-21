@@ -461,6 +461,13 @@ class GovernanceClient:
         response = await self._request("GET", "/api/v1/me/tool-permissions")
         return response.json()
 
+    async def admitted_items(self) -> dict[str, Any]:
+        """The MCP servers, skills and plugins this agent-server's department may use
+        (``GET /api/v1/me/admitted-items``): their content fingerprints, a revision,
+        and how long the answer may be relied on."""
+        response = await self._request("GET", "/api/v1/me/admitted-items")
+        return response.json()
+
     async def attention_resolution(
         self,
         approval_id: str,
