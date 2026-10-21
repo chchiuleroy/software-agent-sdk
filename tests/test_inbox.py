@@ -124,8 +124,9 @@ def test_audit_event_type_filter_matches_what_the_server_writes():
     starts writing but the list lacks is still shown under "All", but not
     filterable; this keeps the two from drifting apart unnoticed."""
     src = Path(__file__).resolve().parent.parent / "src" / "central_governance_api"
-    # Two ways the server names an event: event_type="..." on the model, and the
-    # admin_accounts helper _audit(principal, "...", payload).
+    # Three ways the server names an event: event_type="..." on the model, the
+    # helper _audit(principal, "...", payload), and the admission registry's
+    # table _AUDIT_NAME = {Event.X: "..."} that the one decision function reads.
     patterns = (r'event_type="([a-z_]+)"', r'_audit\(\s*\w+,\s*"([a-z_]+)"')
     written = {
         match
@@ -133,6 +134,11 @@ def test_audit_event_type_filter_matches_what_the_server_writes():
         for pattern in patterns
         for match in re.findall(pattern, path.read_text("utf-8"))
     }
+    for path in src.rglob("*.py"):
+        for table in re.findall(
+            r"_AUDIT_NAME\s*=\s*\{(.*?)\}", path.read_text("utf-8"), re.S
+        ):
+            written.update(re.findall(r'"([a-z_]+)"', table))
     script = (src / "inbox_static" / "inbox.js").read_text("utf-8")
     block = re.search(r"AUDIT_EVENT_TYPES = \[(.*?)\];", script, re.S)
     assert block, "AUDIT_EVENT_TYPES not found in inbox.js"
