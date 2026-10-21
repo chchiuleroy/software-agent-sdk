@@ -500,6 +500,21 @@ class Config(BaseModel):
         ),
     )
 
+    governance_enforce_admission: bool = Field(
+        default=False,
+        description=(
+            "Only used when governance_deployment_mode is 'team'. When true, this "
+            "agent-server fetches the list of MCP servers, skills and plugins its "
+            "department may use from central-governance-api (GET "
+            "/api/v1/me/admitted-items) and keeps it fresh; if it cannot, nothing "
+            "on the list is admitted any more. Default false: the list is not "
+            "fetched and nothing is refused. Turn it on only after every item "
+            "already in use has been submitted, checked and approved, because "
+            "there is no grace period. (This setting alone only fetches the list; "
+            "the gates that use it arrive in a later step.)"
+        ),
+    )
+
     @field_validator("governance_client_secret")
     @classmethod
     def _reject_blank_governance_client_secret(
