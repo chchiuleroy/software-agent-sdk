@@ -17,6 +17,7 @@ that load an MCP tool, a skill or a plugin come in the next step.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from contextlib import suppress
@@ -47,6 +48,8 @@ def _is_fingerprint(value: object) -> TypeGuard[str]:
 
 
 def _snapshot_from_answer(answer: dict) -> admission.AdmissionSnapshot:
+    if not isinstance(answer, dict):
+        raise ValueError("unexpected admitted-items answer from central")
     items = answer.get("items")
     max_age = answer.get("max_age_seconds")
     revision = answer.get("revision")
@@ -54,6 +57,8 @@ def _snapshot_from_answer(answer: dict) -> admission.AdmissionSnapshot:
         not isinstance(items, list)
         or not isinstance(max_age, int | float)
         or isinstance(max_age, bool)
+        # inf (JSON 1e309) would never expire; nan compares false with everything
+        or not math.isfinite(max_age)
         or max_age <= 0
         or not isinstance(revision, str)
     ):
@@ -65,6 +70,10 @@ def _snapshot_from_answer(answer: dict) -> admission.AdmissionSnapshot:
         if not isinstance(item, dict):
             raise ValueError("unexpected admitted-items answer from central")
         kind = item.get("kind")
+        if kind not in ("mcp_server", "skill", "plugin"):
+            # A kind this code does not know admits nothing and is not an error: a
+            # newer central may use fields this code has never seen.
+            continue
         fingerprint = item.get("fingerprint")
         tool_fingerprints = item.get("tool_fingerprints")
         if not _is_fingerprint(fingerprint) or not isinstance(tool_fingerprints, list):
@@ -77,7 +86,6 @@ def _snapshot_from_answer(answer: dict) -> admission.AdmissionSnapshot:
             skills.add(fingerprint)
         elif kind == "plugin":
             plugins.add(fingerprint)
-        # A kind this code does not know admits nothing: it is simply not listed.
     return admission.AdmissionSnapshot(
         mcp_tool_fingerprints=frozenset(mcp_tools),
         skill_fingerprints=frozenset(skills),

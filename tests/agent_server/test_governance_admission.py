@@ -85,13 +85,18 @@ async def test_a_good_answer_becomes_the_current_snapshot_kind_by_kind():
 
 async def test_an_item_of_a_kind_this_code_does_not_know_admits_nothing():
     # Why: a newer central must not make an older device admit something by accident.
+    # The unknown item uses a different shape (no fingerprint, no tool_fingerprints):
+    # a newer central may do that, and it must not make the whole list unusable.
     answer = _answer(
-        items=[{"kind": "robot", "fingerprint": SKILL, "tool_fingerprints": [TOOL_A]}]
+        items=[
+            {"kind": "robot", "digest": "x", "parts": [1]},
+            {"kind": "skill", "fingerprint": SKILL, "tool_fingerprints": []},
+        ]
     )
     admission.set_enforcing(True)
     assert await refresher.refresh_once(_client(answer)) is True
     assert admission.is_mcp_tool_admitted(TOOL_A) is False
-    assert admission.is_skill_admitted(SKILL) is False
+    assert admission.is_skill_admitted(SKILL) is True
 
 
 @pytest.mark.parametrize(
@@ -115,15 +120,29 @@ async def test_an_item_of_a_kind_this_code_does_not_know_admits_nothing():
         {"max_age_seconds": -5},
         {"max_age_seconds": True},
         {"max_age_seconds": "60"},
+        {"max_age_seconds": float("inf")},  # what JSON 1e309 decodes to
+        {"max_age_seconds": float("-inf")},
+        {"max_age_seconds": float("nan")},
         {"revision": None},
     ],
 )
 async def test_a_malformed_answer_is_ignored_not_trusted(bad):
-    # Why: a half-understood answer must not become a snapshot. A zero or boolean max
-    # age would otherwise mean "never expires", and a half-read item list could admit
-    # more than central said.
+    # Why: a half-understood answer must not become a snapshot. A zero, boolean or
+    # infinite max age would otherwise mean "never expires", and a half-read item list
+    # could admit more than central said.
     admission.set_enforcing(True)
     assert await refresher.refresh_once(_client(_answer(**bad))) is False
+    assert admission.get_snapshot() is None
+
+
+@pytest.mark.parametrize("not_a_dict", [[], [_answer()], "ok", None, 5])
+async def test_an_answer_that_is_not_a_json_object_is_ignored(not_a_dict):
+    # Why: the client returns whatever JSON came back; a non-object must be refused
+    # like any malformed answer, not raise out of the refresher.
+    client = MagicMock()
+    client.admitted_items = AsyncMock(return_value=not_a_dict)
+    admission.set_enforcing(True)
+    assert await refresher.refresh_once(client) is False
     assert admission.get_snapshot() is None
 
 
@@ -173,6 +192,20 @@ async def test_start_turns_enforcement_on_and_fetches_then_stop_turns_it_off():
         await refresher.stop()
     assert admission.is_enforcing() is False
     assert admission.get_snapshot() is None
+
+
+async def test_one_malformed_answer_does_not_stop_the_refresh_loop(monkeypatch):
+    # Why: if the loop died on a bad answer, every later refresh would stop and an
+    # enforcing device would refuse everything until a restart.
+    monkeypatch.setattr(refresher, "RETRY_INTERVAL_SECONDS", 0.01)
+    client = MagicMock()
+    client.admitted_items = AsyncMock(side_effect=[["bad"], _answer()])
+    refresher.start(client)
+    try:
+        await _eventually(lambda: admission.get_snapshot() is not None)
+    finally:
+        await refresher.stop()
+    assert client.admitted_items.await_count == 2
 
 
 async def test_holds_are_counted_so_one_stop_does_not_switch_it_off_for_the_other():
